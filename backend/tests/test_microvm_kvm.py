@@ -7,7 +7,9 @@ selftest 是部署脚本用的：真起一台 VM，起得来才把 /dev/kvm 交�
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -22,6 +24,8 @@ from app.sandbox.local_sandbox import LocalSandbox
 def linux(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """在 Linux 上、运行时已装好、镜像已缓存；返回假的 /dev/kvm 路径，默认不存在。"""
     kvm = tmp_path / "kvm"
+    # 此组模拟运行时已经就绪，SDK 是否安装不应影响 KVM 分支的测试。
+    monkeypatch.setitem(sys.modules, "microsandbox", ModuleType("microsandbox"))
     monkeypatch.setattr(mv, "_on_linux", lambda: True)
     monkeypatch.setattr(mv, "_KVM_DEVICE", kvm)
     monkeypatch.setattr(mv.MicroVMSandbox, "_runtime_installed", staticmethod(lambda: True))
@@ -33,6 +37,12 @@ def test_no_kvm_device_means_unavailable(linux: Path) -> None:
     assert mv.MicroVMSandbox.available() is False
     reason = mv.MicroVMSandbox.unavailable_reason()
     assert "/dev/kvm" in reason and "挂进容器" in reason
+
+
+def test_missing_sdk_returns_a_result_without_import_crashing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "microsandbox", None)
+    result = asyncio.run(mv.MicroVMSandbox().run("print(1)"))
+    assert not result.ok and "未安装 microsandbox" in result.error
 
 
 def test_kvm_without_permission_means_unavailable(linux: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -135,6 +135,33 @@ def test_metric_ids_are_unique_and_entry_fields_are_normalized():
     assert plan["entry_fields"][0]["required"] is True
 
 
+def test_document_drafting_fields_are_kept_and_normalized():
+    """文档起草里的粒度、时间字段、分子分母、维度、过滤条件不能在校验时丢掉：草稿页要逐行展示。"""
+    metric = {**METRIC, "grain": " 日 ", "time_field": " 支付时间 ", "numerator": "退款订单数",
+              "denominator": "已支付订单数", "dimensions": ["门店", "", 3, " 区域 "],
+              "filters": ["只算已支付", " ", None]}
+    plan, problems = draftplan.normalize_plan(raw(metrics=[metric]), CHUNKS, allowed_tables=TABLES)
+    got = plan["metrics"][0]
+    assert got["grain"] == "日" and got["time_field"] == "支付时间"
+    assert got["numerator"] == "退款订单数" and got["denominator"] == "已支付订单数"
+    assert got["dimensions"] == ["门店", "区域"] and got["filters"] == ["只算已支付"]
+    # METRIC_FIELDS 要列全：校验后的指标带着这些业务字段（前端按它画）
+    assert set(draftplan.METRIC_FIELDS) >= {"grain", "time_field", "numerator", "denominator",
+                                            "dimensions", "filters"}
+    assert set(got) >= set(draftplan.METRIC_FIELDS)
+    assert not [p for p in problems if p["name"] == "销售额"]
+
+
+def test_empty_document_drafting_fields_do_not_leave_empty_string_keys():
+    """没写的业务字段不留空字符串：没有内容就没有这个键（dimensions、filters 里的空项也丢掉）。"""
+    metric = {**METRIC, "grain": "  ", "time_field": "", "numerator": None, "denominator": [],
+              "dimensions": ["", "  "], "filters": []}
+    plan, _problems = draftplan.normalize_plan(raw(metrics=[metric]), CHUNKS, allowed_tables=TABLES)
+    got = plan["metrics"][0]
+    assert not [key for key in ("grain", "time_field", "numerator", "denominator", "dimensions", "filters")
+                if key in got]
+
+
 # ==========================================================================
 # build_graph
 # ==========================================================================

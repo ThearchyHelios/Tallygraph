@@ -145,25 +145,9 @@ def card_inputs(graph: dict[str, Any], card_id: str) -> tuple[list[dict[str, Any
 
 
 def _metric_paths(metric: Any) -> list[str] | None:
-    """一个指标读的取值路径：公式的表达式、规则各输入、评估各维度。外部常量没有输入。认不出为 None。"""
-    if not isinstance(metric, dict):
-        return None
-    paths: list[str] = []
-    if metric.get("expression"):
-        paths.append(str(metric["expression"]))
-    rule = metric.get("rule")
-    if isinstance(rule, dict):
-        inputs = rule.get("inputs")
-        if not isinstance(inputs, dict):
-            return None
-        paths.extend(str(path) for path in inputs.values())
-    assessment = metric.get("assessment")
-    if isinstance(assessment, dict):
-        dimensions = assessment.get("dimensions")
-        if not isinstance(dimensions, list):
-            return None
-        paths.extend(str(d.get("input")) for d in dimensions if isinstance(d, dict) and d.get("input"))
-    return paths
+    from app.engine.metric_spec import metric_expressions
+
+    return metric_expressions(metric)
 
 
 def definition_text(definition: Any) -> str:

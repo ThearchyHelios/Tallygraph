@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 import json
 import math
 import re
@@ -96,6 +97,51 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     snapshots: dict[str, Any] = {}
     #: 可比性检查：同一对查询快照只查一次（几个指标都用本周、上周两份快照时），和做检查要用的几样（_Comparing）
     comparing = _Comparing()
+
+    async def quality(inputs: list[dict[str, Any]], paths: list[str], use: TruncatedUse) -> dict[str, Any]:
+        """所有取数型指标共用的质量检查；换一种计算方式不能丢掉来源查询的缺口。"""
+        carried = [m for item in inputs if (m := _copied_metric(item, tctx)) is not None]
+        truncated = list(use.sources.values())
+        for source in (s for m in carried if m.get("incomplete") for s in m.get("truncated_sources") or []):
+            if isinstance(source, dict) and source not in truncated:
+                truncated.append(source)
+        flags: dict[str, Any] = {}
+        if truncated:
+            flags.update(incomplete=True, incomplete_reason=_incomplete_reason(truncated),
+                         truncated_sources=truncated)
+        copied_checks = [str(c.get("artifact")) for m in carried for c in m.get("sql_check_sources") or []
+                         if isinstance(c, dict) and c.get("artifact")]
+        if failed := _failed_queries(inputs, truncated, paths, tctx, checked, extra=copied_checks):
+            flags.update(sql_check_failed=True, sql_check_reason=_sql_check_reason(failed),
+                         sql_check_sources=[{"artifact": artifact, "codes": list(dict.fromkeys(
+                             code for p in found for code in p.codes))} for artifact, found in failed])
+            failed_by[metric_id] = [p for _, found in failed for p in found]
+        if lacking := _no_data_inputs(inputs, carried, snapshots):
+            flags.update(no_data=True, no_data_reason=_no_data_reason(lacking), no_data_sources=lacking)
+        comparable = await _comparability(metric_id, str(definition.get("name") or metric_id), inputs, ctx,
+                                          comparing, snapshots)
+        if comparable:
+            flags["comparability"] = comparable
+        artifacts = {item.get("artifact") for item in inputs if item.get("artifact")}
+        if any(set(pair) <= artifacts for pair in comparing.skipped):
+            flags["comparability_skipped"] = True
+        if any(m.get("comparability_skipped") for m in carried):
+            flags["comparability_skipped"] = True
+        if any(m.get("semantic_unverified") for m in carried):
+            flags["semantic_unverified"] = True
+        flags["contract_findings"] = list(dict.fromkeys(str(f) for m in carried for f in m.get("contract_findings") or []))
+        inherited = [m["comparability"] for m in carried if isinstance(m.get("comparability"), dict)
+                     and m["comparability"].get("verdict") != "comparable"]
+        if inherited:
+            worst = next((c for c in inherited if c.get("verdict") == "incomparable"), inherited[0])
+            if flags.get("comparability", {}).get("verdict") != "incomparable":
+                flags["comparability"] = worst
+        return flags
+
+    def input_refs(expressions: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+        paths = list(dict.fromkeys(path for expr in expressions for path in leaf_refs(parse_expression(expr)[0])))
+        return paths, [_input_of(path, _value_of(path, tctx), state, ctx, tctx) for path in paths]
+
     for definition in definitions:
         metric_id = str(definition.get("id") or "").strip()
         if not metric_id:
@@ -105,13 +151,14 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         if problem:
             errors.append(f"指标「{metric_id}」：{problem}")
             continue
+        use = TruncatedUse(edge=lambda path: _truncated_field(path, state, ctx))
         if str(definition.get("kind") or "formula") == "assessment":
             assessment, problem = _assessment_of(definition)
             if problem:
                 errors.append(f"指标「{metric_id}」：{problem}")
                 continue
             dimensions = assessment["dimensions"]
-            values_by_name = {str(d["name"]): _value_of(str(d["input"]), tctx) for d in dimensions}
+            values_by_name = {str(d["name"]): _value_of(str(d["input"]), tctx, track=use) for d in dimensions}
             missing = [name for name, value in values_by_name.items() if value is None]
             if missing and on_missing != "null":
                 errors.append(f"指标「{metric_id}」：" + _missing_reason([str(d["input"]) for d in dimensions
@@ -132,6 +179,9 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     except (TypeError, ValueError):
                         bad = f"维度「{d['name']}」的输入不是数（{values_by_name[str(d['name'])]!r}）"
                         break
+                    if not math.isfinite(raw) or isinstance(values_by_name[str(d["name"])], bool):
+                        bad = f"维度「{d['name']}」的输入必须是有限数值"
+                        break
                     normalized = max(0.0, min(100.0, (raw - low) / (high - low) * 100))
                     weight = float(d.get("weight", 1))
                     points += normalized * weight
@@ -145,8 +195,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 raw_score = points / total
                 value = round_metric(raw_score, display["decimals"])
                 level = next((str(l["name"]) for l in assessment["levels"] if raw_score >= float(l["min"])), None)
-            inputs = [_input_of(str(d["input"]), values_by_name[str(d["name"])], state, ctx, tctx)
-                      for d in dimensions]
+            paths, inputs = input_refs([str(d["input"]) for d in dimensions])
             metrics.append({
                 "id": metric_id,
                 "name": definition.get("name") or metric_id,
@@ -166,6 +215,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                                **({"missing": missing} if missing else {}),
                                **({"out_of_range": out_of_range} if out_of_range else {}),
                                **({"unlevelled": True} if value is not None and level is None else {})},
+                **await quality(inputs, paths, use),
             })
             continue
         if str(definition.get("kind") or "formula") == "rule":
@@ -174,7 +224,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 errors.append(f"指标「{metric_id}」：{problem}")
                 continue
             inputs_cfg = {str(name): str(path) for name, path in (rule.get("inputs") or {}).items()}
-            values_by_name = {name: _value_of(path, tctx) for name, path in inputs_cfg.items()}
+            values_by_name = {name: _value_of(path, tctx, track=use) for name, path in inputs_cfg.items()}
             missing = [name for name, value in values_by_name.items() if value is None]
             if missing and on_missing != "null":
                 errors.append(f"指标「{metric_id}」：" + _missing_reason([inputs_cfg[name] for name in missing]))
@@ -184,7 +234,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 value = rule.get("then", 1) if _rule_matches(values_by_name, rule) else rule.get("else", 0)
             decimals = display["decimals"]
             value = round_metric(value, decimals)
-            inputs = [_input_of(path, values_by_name[name], state, ctx, tctx) for name, path in inputs_cfg.items()]
+            paths, inputs = input_refs(list(inputs_cfg.values()))
             metrics.append({
                 "id": metric_id,
                 "name": definition.get("name") or metric_id,
@@ -200,6 +250,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 "recompute_reason": "这个指标不按表达式复算",
                 "status": "ok" if value is not None else "missing_input",
                 "rule": rule,
+                **await quality(inputs, paths, use),
             })
             continue
         if str(definition.get("kind") or "formula") == "external":
@@ -240,7 +291,6 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         missing = [path for path in paths if values[path] is None]
 
         value: Any = None
-        use = TruncatedUse(edge=lambda path: _truncated_field(path, state, ctx))
         try:
             value = eval_expression(expr, tctx, track=use)
         except ExpressionError as e:
@@ -271,17 +321,6 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         value = round_metric(value, decimals)
         substituted = substitute(tree, values)
         inputs = [_input_of(path, values[path], state, ctx, tctx) for path in paths]
-        # 转抄另一张口径卡的指标：那个指标不完整、所依据的查询没通过 SQL 检查的，这一个照样不完整、存疑（出处是跨卡追下去
-        # 的，判档也按追到底的结果，见 engine/lineage.metric_copy）
-        carried = [m for item in inputs if (m := _copied_metric(item, tctx)) is not None]
-        truncated = list(use.sources.values())
-        for source in (s for m in carried if m.get("incomplete") for s in m.get("truncated_sources") or []):
-            if isinstance(source, dict) and source not in truncated:
-                truncated.append(source)
-        incomplete: dict[str, Any] = {}
-        if truncated:
-            incomplete = {"incomplete": True, "incomplete_reason": _incomplete_reason(truncated),
-                          "truncated_sources": truncated}
         for path, item in zip(paths, inputs):
             # 容器型的 vars.* 输入（列表、字典）另存一份完整值：卡里只记了「[12 项]」这样的大概，事后推演
             # （engine/recompute.py）要拿完整的值重算。nodes.*、input.* 的完整值在那个节点封存的产出工件里，
@@ -289,22 +328,6 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             # 只能在这一刻存下。只给这种输入多一个键：没有容器型 vars 输入的卡和以前逐字节相同
             if _container_var(path, values[path]) and (stored := await _store_value(path, values[path], ctx)):
                 item["value_artifact"] = stored
-        sql_check: dict[str, Any] = {}
-        copied_checks = [str(c.get("artifact")) for m in carried for c in m.get("sql_check_sources") or []
-                         if isinstance(c, dict) and c.get("artifact")]
-        if failed := _failed_queries(inputs, truncated, paths, tctx, checked, extra=copied_checks):
-            sql_check = {"sql_check_failed": True, "sql_check_reason": _sql_check_reason(failed),
-                         "sql_check_sources": [{"artifact": artifact, "codes": list(dict.fromkeys(
-                             code for p in found for code in p.codes))} for artifact, found in failed]}
-            failed_by[metric_id] = [p for _, found in failed for p in found]
-        # 输入取自「查询区间里这张表没有数据」的列（查询快照的 no_data，data/coverage.py）：值照算，标 no_data 并写明原因，
-        # 出具契约据此降档（issuance.no_data_gaps）。按输入的快照 id + 列认：同一条查询里有数的列不受影响。转抄的指标
-        # 那张卡标了的，这一个照样标
-        no_data: dict[str, Any] = {}
-        if lacking := _no_data_inputs(inputs, carried, snapshots):
-            no_data = {"no_data": True, "no_data_reason": _no_data_reason(lacking), "no_data_sources": lacking}
-        comparability = await _comparability(metric_id, str(definition.get("name") or metric_id), inputs, ctx,
-                                             comparing, snapshots)
         metrics.append(
             {
                 "id": metric_id,
@@ -324,20 +347,39 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 # 输入都齐、是计算式自己交回的空值（分母为 0 时写的 … if 分母 else None）：算不出来，不是缺输入。状态照旧是
                 # missing_input（证据面板、推演、运行对比按状态认的地方不受影响），只多这一个键；有值的指标和以前一字不差
                 **({"undefined": True} if value is None and not missing else {}),
-                # 只在不完整时出现：完整的指标和以前一字不差，老运行复核时目录也对得上
-                **incomplete,
-                # 只在来源查询没通过 SQL 检查时出现，同上
-                **sql_check,
-                # 只在输入取自「查询区间里这张表没有数据」的列时出现，同上
-                **no_data,
-                # 只在输入落在两份同形、只差字面量的查询快照上、可比性检查做成了时出现（contract.MetricComparability）
-                **({"comparability": comparability} if comparability else {}),
+                **await quality(inputs, paths, use),
             }
         )
 
     if errors:
         # 口径卡是固定层：任何一个指标算不出来都是模板缺陷，不能带病出具
         raise NodeError(ctx.node.id, "口径卡计算失败：" + "；".join(errors))
+
+    from app.engine.metric_spec import contract_findings
+    from app.engine.validation import metric_quality
+    from app.data.caliber_identity import semantic_hash
+
+    definitions_by_id = {str(d.get("id")): d for d in definitions}
+    for metric in metrics:
+        definition = definitions_by_id[metric["id"]]
+        sources = []
+        for item in metric.get("inputs") or []:
+            artifact = (item.get("origin") or {}).get("artifact") if isinstance(item.get("origin"), dict) else None
+            artifact = artifact or item.get("query_artifact") or item.get("artifact") or _result_artifact(str(item.get("path") or ""), tctx)
+            if artifact:
+                try:
+                    snap = snapshots.get(artifact) or artifact_store.load(artifact)
+                except (ValueError, OSError):
+                    snap = None
+                if isinstance(snap, dict) and isinstance(snap.get("rows"), list):
+                    sources.append(snap)
+        metric["contract_findings"] = list(dict.fromkeys([*(metric.get("contract_findings") or []),
+                                                        *contract_findings(definition, metric, sources)]))
+        # 描述文字不会被静默当作已执行的 SQL 约束。
+        if any(definition.get(key) for key in ("grain", "time_field", "numerator", "denominator", "dimensions", "filters", "params")):
+            metric["semantic_unverified"] = True
+        metric["quality"] = metric_quality(metric)
+    semantic_fingerprint = semantic_hash(ctx.run.spec.model_dump(mode="json"), ctx.node.id)
 
     # text 是给叙述节点 prompt 用的清单——它是叙述层唯一的数字来源
     lines = [
@@ -363,9 +405,11 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                  message="指标" + "".join(f"「{m['name']}」" for m in lacking) + lacking[0]["no_data_reason"])
     card = {
         "kind": "metric_set",
+        "validation_version": 1,
         "caliber": caliber,
         "caliber_version": caliber_version,
         "definition_hash": definition_hash,
+        "semantic_hash": semantic_fingerprint,
         "metrics": metrics,
     }
     if source:
@@ -393,6 +437,7 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             "caliber": caliber,
             "version": caliber_version,
             "definition_hash": definition_hash,
+            "semantic_hash": semantic_fingerprint,
             "metrics": [m["id"] for m in metrics],
             **({"source": source} if source else {}),
         }]
@@ -520,10 +565,22 @@ def rename_expression(expression: str, rename: dict[str, str]) -> str:
 
 
 def rename_definition(definition: Any, rename: dict[str, str]) -> Any:
-    """一个指标定义按映射改写式子（别的项原样）。不是对象的原样交回，后面照常报「指标定义不完整」。"""
-    if not isinstance(definition, dict) or not isinstance(definition.get("expression"), str):
+    """改写公式、规则输入和评分维度里的节点引用，不修改被固定的源定义。"""
+    if not isinstance(definition, dict):
         return definition
-    return {**definition, "expression": rename_expression(definition["expression"], rename)}
+    result = copy.deepcopy(definition)
+    if isinstance(result.get("expression"), str):
+        result["expression"] = rename_expression(result["expression"], rename)
+    rule = result.get("rule")
+    if isinstance(rule, dict) and isinstance(rule.get("inputs"), dict):
+        rule["inputs"] = {name: rename_expression(path, rename) if isinstance(path, str) else path
+                          for name, path in rule["inputs"].items()}
+    assessment = result.get("assessment")
+    if isinstance(assessment, dict):
+        for dimension in assessment.get("dimensions") or []:
+            if isinstance(dimension, dict) and isinstance(dimension.get("input"), str):
+                dimension["input"] = rename_expression(dimension["input"], rename)
+    return result
 
 
 def source_expression(expression: str, source: Any) -> str:
@@ -549,8 +606,8 @@ def _external_of(definition: dict[str, Any]) -> tuple[Any, dict[str, Any], str |
     if not isinstance(external, dict):
         return None, {}, "外部常量指标需要 external 对象（value / source / as_of / stale_after_days）"
     value = external.get("value")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None, {}, "external.value 需要是数"
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None, {}, "external.value 需要是有限数值"
     source = str(external.get("source") or "").strip()
     if not source:
         return None, {}, "external.source 需要写明来源"
@@ -579,8 +636,12 @@ def _assessment_of(definition: dict[str, Any]) -> tuple[dict[str, Any], str | No
                 or not isinstance(dimension.get("input"), str) \
                 or isinstance(dimension.get("weight", 1), bool) \
                 or not isinstance(dimension.get("weight", 1), (int, float)) \
+                or not math.isfinite(dimension.get("weight", 1)) \
                 or float(dimension.get("weight", 1)) <= 0:
             return {}, "评估维度需要 name、input 和正的 weight"
+        low, high = dimension.get("min", 0), dimension.get("max", 100)
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in (low, high)) or low >= high:
+            return {}, "评估维度的 min / max 必须是递增的有限数值"
     levels = assessment.get("levels")
     if not isinstance(levels, list) or not levels:
         return {}, "评估需要至少一个等级"
@@ -737,6 +798,7 @@ class _Comparing:
     def __init__(self) -> None:
         self.done: dict[tuple[str, str], dict[str, Any] | None] = {}
         self.kinds: dict[str, str | None] = {}
+        self.skipped: set[tuple[str, str]] = set()
 
 
 async def _comparability(metric_id: str, name: str, inputs: list[dict[str, Any]], ctx: NodeContext,
@@ -768,6 +830,7 @@ async def _comparability(metric_id: str, name: str, inputs: list[dict[str, Any]]
     except _NotPeriods:
         found = None
     except Exception as e:  # noqa: BLE001 - 检查是附加的，不能挡住口径卡
+        comparing.skipped.add(key)
         why = e.message if isinstance(e, _Skipped) else describe_exception(e)
         ctx.emit(EventType.LOG, level="warn", code=COMPARABILITY_SKIPPED, metric=metric_id, metric_name=name,
                  reason=why, message=COMPARABILITY_SKIPPED_TEXT.format(name=name, why=why))
@@ -981,10 +1044,10 @@ def _listed(metric: dict[str, Any]) -> str:
     return rendered
 
 
-def _value_of(path: str, tctx: dict[str, Any]) -> Any:
+def _value_of(path: str, tctx: dict[str, Any], *, track: TruncatedUse | None = None) -> Any:
     """单独取一个引用的值。取不到（或取值本身出错）一律当作没有值。"""
     try:
-        return eval_expression(path, tctx)
+        return eval_expression(path, tctx, track=track)
     except Exception:  # noqa: BLE001
         return None
 
@@ -1522,7 +1585,8 @@ async def _store(card: dict[str, Any], caliber: str, version: str, ctx: NodeCont
     try:
         return await put_json(card, kind="metric_set", run_id=ctx.run.run_id, node_id=ctx.node.id,
                               meta={"caliber": caliber, "version": version,
-                                    "definition_hash": str(card.get("definition_hash") or "")})
+                                    "definition_hash": str(card.get("definition_hash") or ""),
+                                    "semantic_hash": str(card.get("semantic_hash") or "")})
     except Exception as e:  # noqa: BLE001
         ctx.emit(EventType.LOG, level="warn", code="evidence_store_failed",
                  message=f"口径卡的指标保存失败（{describe_exception(e)}），报告将无法引用这些指标")

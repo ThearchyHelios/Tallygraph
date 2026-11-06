@@ -8,8 +8,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.db.models import Workflow, WorkflowVersion
 from app.db.models_apps import App, AppVersion
@@ -19,6 +20,30 @@ from app.db.models_process import ActionRecord
 RETIRE_CURRENT = "version_retire_current"
 RETIRE_UNPUBLISHED = "version_retire_unpublished"
 RETIRE_ALREADY = "version_retire_already"
+
+
+class WorkflowChanged(ValueError):
+    """保存期间另一处已经提交了新版本，需要重新读取后再编辑。"""
+
+
+async def save_graph(session: AsyncSession, workflow: Workflow, graph: dict[str, Any], *,
+                     note: str | None = None) -> bool:
+    """画布与口径草稿共用的保存：只新增快照，不改任何旧版本；由调用方提交事务。"""
+    from app.core.artifact_store import graph_hash
+
+    if graph == workflow.graph:
+        return False
+    previous = workflow.version
+    result = await session.execute(update(Workflow).where(
+        Workflow.id == workflow.id, Workflow.version == previous,
+    ).values(graph=graph, version=previous + 1, status="draft").execution_options(synchronize_session=False))
+    if result.rowcount != 1:
+        raise WorkflowChanged("工作流已有新的修改，请刷新后再保存")
+    for key, value in (("graph", graph), ("version", previous + 1), ("status", "draft")):
+        set_committed_value(workflow, key, value)
+    session.add(WorkflowVersion(workflow_id=workflow.id, version=workflow.version, graph=graph,
+                                graph_hash=graph_hash(graph), note=note or ""))
+    return True
 
 
 class RetireRefused(Exception):
@@ -228,9 +253,12 @@ async def formal_run_count(session: AsyncSession, workflow_id: str, version: int
 
 async def usage(session: AsyncSession, workflow_id: str, version: int) -> dict[str, Any]:
     """{apps, effects, formal_runs}：版本详情、账本接口、退役确认给的同一份。"""
+    from app.apps.impact import dependents
+
     return {"apps": await pinning_apps(session, workflow_id, version),
             "effects": await effect_count(session, workflow_id, version),
-            "formal_runs": await formal_run_count(session, workflow_id, version)}
+            "formal_runs": await formal_run_count(session, workflow_id, version),
+            **await dependents(session, workflow_id, version)}
 
 
 # --------------------------------------------------------------------------
@@ -260,15 +288,18 @@ async def retire_version(session: AsyncSession, workflow_id: str, version: int, 
                             RETIRE_CURRENT)
     if not is_published(row, current=workflow.published_version):
         raise RetireRefused(409, f"v{version} 没有发布过，不需要退役", RETIRE_UNPUBLISHED)
+    from app.apps.impact import dependents
+
     affected = await pinning_apps(session, workflow_id, version)
+    impact = await dependents(session, workflow_id, version)
     row.retired_at = utcnow()
     row.retired_by = actor
     row.retire_note = (note or "").strip() or None
     await record(session, action="workflow_version.retire", subject_kind="workflow_version",
                  subject_id=f"{workflow_id}:{version}", actor=actor,
                  data={"workflow_id": workflow_id, "workflow_name": workflow.name, "version": version,
-                       "note": row.retire_note, "affected_apps": affected})
+                       "note": row.retire_note, "affected_apps": affected, "impact": impact})
     await session.commit()
     return {"retired": {"workflow_id": workflow_id, "version": version, "retired_at": row.retired_at,
                         "retired_by": actor, "retire_note": row.retire_note},
-            "affected_apps": affected}
+            "affected_apps": affected, "impact": impact}

@@ -131,6 +131,7 @@ export function cellText(v: unknown): string {
 
 /** 一个期望是从哪里取什么：「「gmv」第 1 行」「指标「gmv」」「按「地区」配对的多行」…… */
 export function expectationText(e: EvalExpectation): string {
+  if (e.kind === 'investigation') return `${e.status === 'partial' ? '明确保留调查缺口' : '完成调查'}${e.minimum_depth != null ? `，至少下钻 ${e.minimum_depth} 层` : ''}${e.max_queries != null ? `，最多查询 ${e.max_queries} 次` : ''}`
   const E = T.expectation
   let text: string
   switch (e.kind) {

@@ -140,7 +140,7 @@ async def test_the_phrase_opens_judgment_method_calculation_inputs_recompute_and
     assert judged["hypothesis"] == "华东拖累" and judged["hypothesis_label"] == "分析卡上写的『在验证什么』"
     assert judged["hypothesis_note"].startswith("分析卡上写的『在验证什么』")
     assert {c["code"] for c in judged["caveats"]} == {"measure_unlabeled", "headline_basis", "comparability"}
-    assert method["method"] == "decompose.additive@1" and method["method_label"] == "变化拆解（可加）"
+    assert method["method"] == "decompose.additive@2" and method["method_label"] == "变化拆解（可加）"
     assert {s["key"]: s["label"] for s in method["settings"]}["main_share"] == "「主要来源」的占比"
     assert {s["key"] for s in method["settings"]} >= {"main_share", "concentration", "table_top_k"}
     assert "k_warn" not in {s["key"] for s in method["settings"]}
@@ -154,7 +154,7 @@ async def test_the_phrase_opens_judgment_method_calculation_inputs_recompute_and
     assert query["alias"] == "Q1" and query["input_of"] == "A1" and query["total_rows"] == 8
     assert query["highlight"]["cols"] == ["region", "week", "gmv"]
     # 真的复算：按 sha256 取回封存的输入快照，逐字段和封存的比
-    assert again == {"step": "analysis_recompute", "alias": "A1", "status": "same", "method": "decompose.additive@1",
+    assert again == {"step": "analysis_recompute", "alias": "A1", "status": "same", "method": "decompose.additive@2",
                      "text": "复算一致：按封存的输入重新计算，结论逐项相同"}
     assert seal["sealed"] is True and seal["ledger"] is True and seal["hash_ok"] is True
     assert body["seal"]["covered"] is True
@@ -260,11 +260,11 @@ async def test_an_input_outside_the_sealed_scope_is_not_recomputed_from(client):
 
 async def test_an_upgraded_method_names_both_versions(client, monkeypatch):
     made = await sealed_run(TEXT)
-    monkeypatch.setitem(contract.METHODS, ("decompose", "additive"), "decompose.additive@2")
+    monkeypatch.setitem(contract.METHODS, ("decompose", "additive"), "decompose.additive@3")
     body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'a:A1')}")).json()
     again = next(s for s in body["chain"] if s["step"] == "analysis_recompute")
-    assert again["method"] == "decompose.additive@1" and again["method_now"] == "decompose.additive@2"
-    assert again["text"] == "运行时用的是 decompose.additive@1，现在是 decompose.additive@2，复算结果相同"
+    assert again["method"] == "decompose.additive@2" and again["method_now"] == "decompose.additive@3"
+    assert again["text"] == "运行时用的是 decompose.additive@2，现在是 decompose.additive@3，复算结果相同"
 
 
 async def test_recompute_errors_do_not_break_the_panel(client, monkeypatch):
@@ -436,7 +436,7 @@ async def test_the_metric_step_opens_the_comparability_result(client):
     body = (await client.get(f"/api/runs/{made['run']}/evidence/segments/{seg_id(made['doc'], 'm:wow')}")).json()
     view = body["chain"][0]["comparability"]
     assert view["verdict"] == result["verdict"]["code"] and view["phrase"] == result["phrase"]
-    assert view["sealed"] is True and view["hash_ok"] is True and view["method"] == "comparable@1"
+    assert view["sealed"] is True and view["hash_ok"] is True and view["method"] == "comparable@2"
     steps = view["steps"]
     assert [s["step"] for s in steps] == ["analysis", "analysis_method", "analysis_calc", "analysis_input",
                                           "analysis_input", "analysis_recompute", "analysis_seal"]
@@ -565,7 +565,7 @@ async def test_the_export_recomputes_each_conclusion_once(client, monkeypatch):
             "[[table:A1 cols=region,delta,share rows=0-3]]")
     made = await sealed_run(text, doc_extra=SCOPE)
     data = data_block((await client.get(f"/api/runs/{made['run']}/report.html")).text)
-    assert calls == ["decompose.additive@1"]
+    assert calls == ["decompose.additive@2"]
     cells = [s["id"] for s in iter_segments(made["doc"]) if str(s.get("ref") or "").startswith("v:A1.")]
     assert len(cells) == 12
     keys = {data["refs"][sid] for sid in [*cells, seg_id(made["doc"], "a:A1"), seg_id(made["doc"], "a:A1.top_share|pct")]}

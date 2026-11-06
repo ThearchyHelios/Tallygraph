@@ -117,7 +117,7 @@ _CFG_KEYS: dict[str, frozenset[str]] = {
     "transform": frozenset({"mode", "expression", "template", "assign_to"}),
     "llm": _MODEL_KEYS | {"system", "skills", "use_history", "prompt", "output_schema", "emit_message", "assign_to"},
     "agent": _MODEL_KEYS | {"system", "skills", "use_history", "prompt", "output_schema", "cite_fields", "tools",
-                            "memory_scope", "collection", "parallel_tools", "max_steps", "budget_tokens",
+                            "memory_scope", "collection", "parallel_tools", "max_steps", "budget_tokens", "investigation",
                             "budget_usd", "approval", "emit_message", "assign_to"},
     "supervisor": frozenset({"agents", "max_rounds", "on_exhausted", "goal", "provider", "model", "max_tokens",
                              "max_parallel", "approval", "emit_message", "assign_to"}),

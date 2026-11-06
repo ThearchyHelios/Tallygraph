@@ -38,6 +38,26 @@ def graph_hash(graph: dict[str, Any]) -> str:
     return content_hash(canonical_json(slim))
 
 
+def execution_content(graph: dict[str, Any]) -> dict[str, Any]:
+    """执行定义的规范形式。历史 graph_hash 保持原算法，以便复验已封存证据。"""
+    from app.engine.schema import GraphSpec
+
+    spec = GraphSpec.model_validate(graph)
+    return {
+        "schema_version": 1,
+        "defaults": spec.defaults,
+        "nodes": sorted([{"id": n.id, "type": n.type.value, "data": n.data.model_dump()}
+                         for n in spec.nodes], key=lambda n: n["id"]),
+        "edges": sorted([{"source": e.source, "target": e.target, "sourceHandle": e.sourceHandle,
+                          "targetHandle": e.targetHandle} for e in spec.edges], key=canonical_json),
+    }
+
+
+def execution_hash(graph: dict[str, Any]) -> str:
+    """布局、选中态和边的显示标签不改变执行身份。"""
+    return content_hash(canonical_json(execution_content(graph)))
+
+
 def _path_of(artifact_id: str) -> Path:
     # 按前两位分桶，避免单目录塞几万个文件
     return settings.data_dir / "artifacts" / artifact_id[:2] / f"{artifact_id}.json"

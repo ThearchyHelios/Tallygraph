@@ -29,7 +29,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
+import re
 from typing import Any
 
 from datetime import datetime
@@ -44,6 +46,10 @@ from app.db.models import CaliberDraft, Chunk, DataSource, Document, Run, Workfl
 from app.db.models_process import ActionRecord
 
 logger = logging.getLogger(__name__)
+
+from app.ledger.authoring import (
+    _can_repair, _columns_digest, _draft_payload, _entry_notes, _focus_tables, _fresh_metrics, _merge_questions, _merged_fields, _problems_text, _published_metrics, _question_count, _question_key, _schema_material, _source_tables, _status_for
+)
 
 router = APIRouter(prefix="/api/ledger", tags=["ledger"])
 #: 口径账本里按运行读的那几个（一个答案里每个数的口径标签等，docs/design/next-round/02-口径账本.md）：挂在
@@ -334,6 +340,7 @@ async def trial_caliber(workflow_id: str, version: int, node_id: str, payload: T
     from app.apps.forms import input_schema, validate_form
     from app.engine.runner import run_manager
     from app.ledger.derive import NotDerivable, caliber_probe, load_pinned
+    from app.tools.datasource import READ_ONLY_OPTION
 
     try:
         pinned = await load_pinned(session, workflow_id, int(version), node_id)
@@ -357,30 +364,24 @@ async def trial_caliber(workflow_id: str, version: int, node_id: str, payload: T
         graph=graph, input_payload=values, run_class="exploratory", origin_kind="caliber_trial",
         origin={"kind": "caliber_trial", "workflow_id": workflow_id, "version": int(version),
                 "node_id": node_id, "card": pinned.node_id},
+        options={READ_ONLY_OPTION: True},
         started_by=principal.username)
     row = None
     for _ in range(300):
         async with SessionLocal() as poll:
             row = await poll.get(Run, run.id)
-        if row is None or row.status in ("succeeded", "failed", "cancelled"):
+        if row is None or row.status in TERMINAL_RUN_STATUSES:
             break
         await asyncio.sleep(0.1)
 
     out: dict[str, Any] = {"run_id": run.id, "status": row.status if row is not None else "unknown",
-                           "output": row.output if row is not None else None,
-                           "error": row.error if row is not None else None, "metrics": []}
+                           "output": None,
+                           "error": row.error if row is not None else None, "metrics": [],
+                           "queries": []}
     if row is not None and row.status == "succeeded":
-        from app.api.evidence import _sealed, _sealed_cards
-
-        sealed = await _sealed(run.id)
-        cards = {nid: card for nid, _, card in _sealed_cards(sealed)}
-        card = cards.get(pinned.node_id) or next(iter(cards.values()), None)
-        if card is not None:
-            out["metrics"] = [
-                {k: m.get(k) for k in ("id", "name", "unit", "value", "rendered", "decimals", "format")
-                 if m.get(k) is not None}
-                for m in card.get("metrics") or [] if isinstance(m, dict) and m.get("id")
-            ]
+        out["metrics"] = await _trial_metrics(run.id)
+        out["queries"] = await _trial_queries(run.id)
+    out["validation"] = await _trial_validation(run.id, str(out["status"]), out["metrics"])
     return out
 
 
@@ -393,34 +394,12 @@ DRAFT_DISMISS_ACTION = "ledger.docdraft.dismiss"
 DRAFT_SUBJECT_KIND = "ledger_draft"
 
 
-def _question_count(payload: dict[str, Any]) -> int:
-    """未决问题数：跨指标的 open_questions + 各指标自己的。status 就按它算，PATCH 之后重算也用它。"""
-    def count(items: Any) -> int:
-        return len([q for q in items if isinstance(q, str) and q.strip()]) if isinstance(items, list) else 0
-
-    total = count(payload.get("open_questions"))
-    metrics = payload.get("metrics")
-    for metric in metrics if isinstance(metrics, list) else []:
-        if isinstance(metric, dict):
-            total += count(metric.get("open_questions"))
-    return total
-
-
-def _status_for(payload: dict[str, Any]) -> str:
-    """还有问题 → questions_open；没有问题且有图 → ready；没有图的老草稿 → path_pending。
-
-    questions_open 现在也有图和数，只是问题还没清完，不阻断试跑；path_pending 只留给这次改版之前起草、还没有取数路径的草稿。
-    """
-    if _question_count(payload):
-        return "questions_open"
-    if payload.get("workflow_id") and payload.get("sql"):
-        return "ready"
-    return "path_pending"
-
-
 #: 试跑最多等多久（秒）和轮询间隔：和 trial_caliber 的 300 × 0.1 一致
 TRIAL_TIMEOUT_S = 30
 TRIAL_POLL_S = 0.1
+#: 试跑结果集最多给几个查询、每个查询前几行：一次试跑只取数不写报告，主要就是验证这几条 SQL
+TRIAL_QUERY_LIMIT = 5
+TRIAL_QUERY_ROWS = 20
 #: 运行到这里就是终态了（interrupted 归到 failed，接口契约只有三种状态）
 TERMINAL_RUN_STATUSES = ("succeeded", "failed", "cancelled", "interrupted")
 
@@ -434,96 +413,74 @@ def _run_status(status: Any) -> str:
     return "running"
 
 
-def _source_tables(source: DataSource) -> dict[str, Any]:
-    cache = source.schema_cache if isinstance(source.schema_cache, dict) else {}
-    tables = cache.get("tables")
-    return tables if isinstance(tables, dict) else {}
+def _trial_binding(version: int, graph: dict[str, Any], values: dict[str, Any]) -> dict[str, Any]:
+    from app.core.artifact_store import canonical_json, content_hash, execution_hash, graph_hash
+
+    return {"version": version, "graph_hash": graph_hash(graph), "execution_hash": execution_hash(graph),
+            "inputs_hash": content_hash(canonical_json(values))}
 
 
-def _focus_tables(tables: list[str], text: str, limit: int = 8) -> list[str]:
-    """文档里点到的表优先展开：按它在原文里第一次出现的位置排，没点到的按目录顺序补几张。
-
-    目录动辄十万字符，全塞给模型会把文档和别的表挤掉。先给全量列名（见 _columns_digest），再把文档点到的
-    那几张表展开注释和目录——写 SQL 需要的列名一个不少，细节只给用得上的。
-    """
-    lowered = (text or "").lower()
-    hit: list[tuple[int, str]] = []
-    for table in tables:
-        name = str(table).lower()
-        short = name.split(".")[-1]
-        at = lowered.find(name)
-        if at < 0:
-            at = lowered.find(short)
-        if at >= 0:
-            hit.append((at, table))
-    hit.sort(key=lambda pair: pair[0])
-    picked = [table for _, table in hit][:limit]
-    for table in tables:
-        if len(picked) >= min(limit, 5):
-            break
-        if table not in picked:
-            picked.append(table)
-    return picked
+def _doc_draft_workflow(workflow: Workflow | None) -> bool:
+    return workflow is not None and isinstance(workflow.origin, dict) and workflow.origin.get("kind") == "doc_draft"
 
 
-def _columns_digest(source: DataSource, tables: list[str]) -> str:
-    """每张表的列名清单（只给名字）：要写 SQL，先得知道有哪些列。注释和目录留给下面展开的那几张。"""
-    from app.data import introspect
+async def _trial_view(session: AsyncSession, trial: dict[str, Any], *, version: int,
+                      graph: dict[str, Any]) -> dict[str, Any]:
+    """历史试跑只能证明当时的版本和输入；运行超时返回 running 后，读时从 Run 刷新终态。"""
+    from app.core.artifact_store import canonical_json, content_hash, execution_hash, graph_hash
 
-    lines = ["各表的列（只列名字；下面展开的表另有类型、注释和数据目录）："]
-    for table in tables:
-        meta = introspect.find_table(source, table)
-        columns = [str(c.get("name")) for c in (meta or {}).get("columns") or [] if c.get("name")]
-        if columns:
-            lines.append(f"{table}: {', '.join(columns)}")
-    return "\n".join(lines)
-
-
-async def _schema_material(session: AsyncSession, source: DataSource, focus_text: str = ""
-                           ) -> tuple[str, set[str]]:
-    """这个数据源给模型看的表结构 + 数据目录文本，以及 SQL 允许出现的表名集合。
-
-    文本按「概览 → 全量表索引 → 全量列名 → 文档点到的表展开」的顺序排：预算不够时先丢的是最后那一段，
-    列名不会丢。表名一律照目录原文，模型照着抄。
-    """
-    from app.data import catalog, schema_view
-
-    cache = source.schema_cache if isinstance(source.schema_cache, dict) else {}
-    tables = _source_tables(source)
-    if not tables:
-        return "", set()
-    entries = await catalog.read_catalog(session, source.id)
-    notes = {table: entry.notes for table, entry in entries.items()}
-    lines = [schema_view.overview_line(source, catalog_tables=sum(
-        1 for entry in entries.values() if catalog.visible_notes(entry.notes)))]
-    lines.append(schema_view.table_index(source, notes))
-    lines.append(_columns_digest(source, tables))
-    for table in _focus_tables(tables, focus_text):
-        lines.append(schema_view.table_detail(source, table, catalog_notes=notes))
-    schema = cache.get("schema")
-    allowed: set[str] = set()
-    for table in tables:
-        allowed.add(str(table))
-        if isinstance(schema, str) and schema:
-            allowed.add(f"{schema}.{table}")
-    return "\n\n".join(line for line in lines if line), allowed
+    if not trial:
+        return {}
+    run = await session.get(Run, trial["run_id"]) if trial.get("run_id") else None
+    same_graph = (trial.get("execution_hash") == execution_hash(graph) if trial.get("execution_hash")
+                  else trial.get("version") == version and trial.get("graph_hash") == graph_hash(graph))
+    if (not same_graph
+            or (run is not None and trial.get("inputs_hash") != content_hash(canonical_json(run.input or {})))):
+        return {**trial, "status": "stale", "error": "口径已修改或试运行缺少版本记录，请重新试运行"}
+    if trial.get("run_id") and run is None:
+        return {**trial, "status": "stale", "error": "试运行记录已不存在，请重新试运行"}
+    if run is not None:
+        return {**trial, "status": _run_status(run.status), "error": str(run.error or "")}
+    return trial
 
 
-async def _save_trial(draft_id: str, trial: dict[str, str]) -> None:
-    """把试跑状态写进 draft.payload["trial"]（用新会话：后台这一段和起草那段不是同一个事务）。"""
+async def _save_trial(draft_id: str, trial: dict[str, Any], *, replace: bool = False) -> bool:
+    """旧版本或较早的试跑晚结束时，不能覆盖新的验证结果。"""
     async with SessionLocal() as fresh:
-        row = await fresh.get(CaliberDraft, draft_id)
+        row = await fresh.scalar(select(CaliberDraft).where(CaliberDraft.id == draft_id).with_for_update())
         if row is None or not isinstance(row.payload, dict):
-            return
+            return False
+        workflow = await fresh.get(Workflow, row.workflow_id) if row.workflow_id else None
+        if _doc_draft_workflow(workflow):
+            from app.core.artifact_store import execution_hash, graph_hash
+
+            same_graph = (trial.get("execution_hash") == execution_hash(workflow.graph) if trial.get("execution_hash")
+                          else trial.get("version") == workflow.version and trial.get("graph_hash") == graph_hash(workflow.graph))
+            if not same_graph:
+                return False
         body = dict(row.payload)
+        current = body.get("trial") or {}
+        if not replace and current.get("trial_id") and current.get("trial_id") != trial.get("trial_id"):
+            return False
+        if not replace and current.get("run_id") and current.get("run_id") != trial.get("run_id"):
+            return False
         body["trial"] = trial
-        row.payload = body
+        # SQLite 忽略 FOR UPDATE；加上读时的修订时间，避免并发完成或编辑覆盖刚写入的新内容。
+        from sqlalchemy import update
+
+        saved = await fresh.execute(update(CaliberDraft).where(
+            CaliberDraft.id == draft_id, CaliberDraft.updated_at == row.updated_at,
+        ).values(payload=body).execution_options(synchronize_session=False))
+        if saved.rowcount != 1:
+            await fresh.rollback()
+            return False
         await fresh.commit()
+        return True
 
 
 async def _run_trial(*, draft_id: str, workflow_id: str, graph: dict[str, Any], values: dict[str, Any],
-                     started_by: str | None,
-                     entry_fields: list[dict[str, Any]] | tuple[dict[str, Any], ...] = ()) -> dict[str, str]:
+                     started_by: str | None, version: int = 1,
+                     entry_fields: list[dict[str, Any]] | tuple[dict[str, Any], ...] = ()) -> dict[str, Any]:
     """后台试跑草稿的取数与口径卡，返回 payload["trial"] 的形状（run_id / status / error）。
 
     必填入口没有值时不跑：试跑是为了「看数对不对」，拿系统编的日期跑出来的数没有意义。这时状态记 needs_input，
@@ -537,34 +494,47 @@ async def _run_trial(*, draft_id: str, workflow_id: str, graph: dict[str, Any], 
     """
     from app.engine.runner import run_manager
     from app.ledger.derive import NotDerivable, caliber_probe, load_pinned
+    from app.tools.datasource import READ_ONLY_OPTION
+    from uuid import uuid4
+
+    binding = {**_trial_binding(version, graph, values), "trial_id": uuid4().hex}
+
+    async def failed(status: str, error: str, *, reserve: bool = False) -> dict[str, Any]:
+        trial = {**binding, "run_id": "", "status": status, "error": error}
+        await _save_trial(draft_id, trial, replace=reserve)
+        return trial
 
     missing = [str(field.get("name")) for field in entry_fields
                if field.get("required") and values.get(str(field.get("name"))) in (None, "")]
     if missing:
-        return {"run_id": "", "status": "needs_input",
-                "error": f"缺少必填输入：{'、'.join(missing)}"}
+        return await failed("needs_input", f"缺少必填输入：{'、'.join(missing)}", reserve=True)
+
+    pending = {**binding, "run_id": "", "status": "running", "error": ""}
+    if not await _save_trial(draft_id, pending, replace=True):
+        return {**pending, "status": "stale", "error": "口径已修改，请重新试运行"}
 
     card_id = next((n.get("id") for n in graph.get("nodes") or []
                     if isinstance(n, dict) and n.get("type") == "metrics"), None)
     if not card_id:
-        return {"run_id": "", "status": "failed", "error": "这份草稿没有口径卡，没有可试运行的指标"}
+        return await failed("failed", "这份草稿没有口径卡，没有可试运行的指标")
     try:
         async with SessionLocal() as read:
-            pinned = await load_pinned(read, workflow_id, 1, str(card_id))
+            pinned = await load_pinned(read, workflow_id, version, str(card_id))
         target = caliber_probe(pinned).graph
     except NotDerivable as e:
-        return {"run_id": "", "status": "failed", "error": f"口径卡不能派生探针：{e.message}"}
+        return await failed("failed", f"口径卡不能派生探针：{e.message}")
 
     try:
         run = await run_manager.start(
             graph=target, input_payload=values, run_class="exploratory", origin_kind="caliber_trial",
-            origin={"kind": "caliber_trial", "draft_id": draft_id, "workflow_id": workflow_id, "version": 1,
+            origin={**binding, "kind": "caliber_trial", "draft_id": draft_id, "workflow_id": workflow_id,
                     "node_id": str(card_id)},
+            options={READ_ONLY_OPTION: True},
             started_by=started_by)
     except Exception as e:  # noqa: BLE001 - 试跑发起失败不该把已经生成的草稿弄没
         logger.exception("草稿 %s 的试运行没有发起", draft_id)
-        return {"run_id": "", "status": "failed", "error": f"试运行没有发起：{e}"}
-    await _save_trial(draft_id, {"run_id": run.id, "status": "running", "error": ""})
+        return await failed("failed", f"试运行没有发起：{e}")
+    await _save_trial(draft_id, {**binding, "run_id": run.id, "status": "running", "error": ""})
     row: Run | None = None
     for _ in range(int(TRIAL_TIMEOUT_S / TRIAL_POLL_S)):
         async with SessionLocal() as poll:
@@ -574,45 +544,327 @@ async def _run_trial(*, draft_id: str, workflow_id: str, graph: dict[str, Any], 
         await asyncio.sleep(TRIAL_POLL_S)
     status = _run_status(row.status if row is not None else "running")
     error = str(row.error or "") if row is not None and status == "failed" else ""
-    return {"run_id": run.id, "status": status, "error": error}
+    return {**binding, "run_id": run.id, "status": status, "error": error}
 
 
 async def _trial_metrics(run_id: str) -> list[dict[str, Any]]:
-    """试跑运行里口径卡上的指标值：复用证据接口读封存的现成函数，不另写指标集解析。"""
-    from app.api.evidence import _sealed, _sealed_cards
+    """试运行和证据面板共享封存核验、遮罩和质量判定。"""
+    from app.engine.evidence_reader import read_sealed, metric_cards
+    from app.engine.validation import metric_quality
+    from app.api.evidence import _Masks, _metric_masks
 
     try:
-        sealed = await _sealed(run_id)
-        cards = {node_id: card for node_id, _, card in _sealed_cards(sealed)}
-    except Exception:  # noqa: BLE001 - 证据读不出来就只给状态，不编造指标值
-        logger.exception("试跑 %s 的指标值读不出来", run_id)
+        sealed = await read_sealed(run_id)
+        if not sealed.trusted:
+            return []
+        masks = _Masks(sealed)
+        out = []
+        for node_id, artifact, card in metric_cards(sealed):
+            for metric in card.get("metrics") or []:
+                if not isinstance(metric, dict) or not metric.get("id"):
+                    continue
+                _, hidden = await _metric_masks(metric, node_id, artifact, sealed, masks, card=card)
+                projected = {k: metric[k] for k in ("id", "name", "unit", "value", "rendered", "decimals", "format", "status")
+                             if metric.get(k) is not None}
+                if hidden:
+                    projected.pop("value", None)
+                    projected.update(rendered=hidden, masked=True, quality={"status": "unknown", "checks": [
+                        {"code": "masked", "status": "unknown", "detail": "指标值已隐藏，不能在此验证"}]})
+                else:
+                    projected["quality"] = metric_quality(metric)
+                    if card.get("validation_version") != 1:
+                        projected["quality"]["checks"].append({"code": "legacy_validation", "status": "unknown",
+                                                               "detail": "历史结果缺少完整质量记录，请重新试运行"})
+                        if projected["quality"]["status"] == "pass":
+                            projected["quality"]["status"] = "unknown"
+                out.append(projected)
+        return out
+    except Exception:
+        logger.exception("试运行 %s 的指标证据无法验证", run_id)
         return []
-    card = cards.get("card") or next(iter(cards.values()), None)
-    if not isinstance(card, dict):
-        return []
-    return [{k: m.get(k) for k in ("id", "name", "rendered", "value") if m.get(k) is not None}
-            for m in card.get("metrics") or [] if isinstance(m, dict) and m.get("id")]
 
 
-def _draft_summary(draft: CaliberDraft) -> dict[str, Any]:
+async def _trial_validation(run_id: str, status: str, metrics: list[dict[str, Any]]) -> dict[str, Any]:
+    from app.engine.evidence_reader import read_sealed
+    from app.engine.validation import validation_report
+
+    trusted = False
+    if run_id:
+        try:
+            trusted = (await read_sealed(run_id)).trusted
+        except (LookupError, ValueError, OSError):
+            pass
+    return validation_report(metrics, execution=status, trusted=trusted)
+
+
+async def _trial_queries(run_id: str) -> list[dict[str, Any]]:
+    """试跑运行里取数节点交回的查询快照：页面据此直接看「这条 SQL 查回来什么」。
+
+    只读封存范围内的查询快照（sealed.queries，和证据接口同一份认法），最多 TRIAL_QUERY_LIMIT 个、每个前 TRIAL_QUERY_ROWS
+    行。遮罩列按 _Masks.sets(...).hidden 处理（数据源现在设的加查询当时记下的），格子换成「已遮罩」；masked 列出被遮的
+    列名。**不返回 SQL**：SQL 里可能写着遮罩值，试跑页面只需要列和行。
+
+    返回的每一项是 {node_id, tool, source, columns, rows, total_rows, truncated, masked}；读不出来的快照跳过，整个读不出
+    封存时就照实给空数组，不编造数据。import 放在函数里：api/evidence 与 api/ledger 互相引用，模块顶层导入会成环。
+    """
+    from app.api.evidence import MASKED, _Masks
+    from app.engine.evidence_reader import read_sealed
+    from app.core.artifact_store import load
+
+    try:
+        sealed = await read_sealed(run_id)
+        if not sealed.trusted:
+            return []
+        masks = _Masks(sealed)
+    except Exception:  # noqa: BLE001 - 证据读不出来就只给状态，不编造结果集
+        logger.exception("试跑 %s 的结果集读不出来", run_id)
+        return []
+    out: list[dict[str, Any]] = []
+    for artifact, info in list(sealed.queries.items())[:TRIAL_QUERY_LIMIT]:
+        try:
+            snap = load(artifact)
+            if not isinstance(snap, dict) or not isinstance(snap.get("rows"), list):
+                continue
+            source = (info or {}).get("source") or snap.get("source")
+            columns = [str(column) for column in snap.get("columns") or []]
+            if any(not isinstance(row, list) or len(row) != len(columns) for row in snap["rows"]):
+                raise ValueError("查询行与列定义不一致，不能安全展示")
+            hidden = (await masks.sets(artifact, source, snap)).hidden
+            masked = {position for position, column in enumerate(columns) if column.lower() in hidden}
+            # 只给前 TRIAL_QUERY_ROWS 行：查询本身被工具截断、或者这里只展示了前几行，都要在 truncated 里说清
+            rows = [[MASKED if position in masked else value for position, value in enumerate(row)]
+                    if isinstance(row, list) else row
+                    for row in snap["rows"][:TRIAL_QUERY_ROWS]]
+        except Exception:  # noqa: BLE001 - 这一份快照读不出来、认不出遮罩，跳过它，不影响别的查询
+            logger.warning("试跑 %s 的查询快照 %s 读不出来", run_id, artifact, exc_info=True)
+            continue
+        out.append({
+            "node_id": (info or {}).get("node_id"),
+            "tool": (info or {}).get("tool"),
+            "source": source,
+            "columns": columns,
+            "rows": rows,
+            "total_rows": len(snap["rows"]),
+            "truncated": bool(snap.get("truncated")) or len(snap["rows"]) > TRIAL_QUERY_ROWS,
+            "source_truncated": bool(snap.get("truncated")),
+            "preview_truncated": len(snap["rows"]) > TRIAL_QUERY_ROWS,
+            "masked": [columns[position] for position in sorted(masked)],
+        })
+    return out
+
+
+def _draft_summary(draft: CaliberDraft, *, graph: dict[str, Any] | None = None) -> dict[str, Any]:
+    """列表和详情共用的一份摘要：细状态照实给，另给界面用的四阶段 stage。"""
+    from app.ledger import docdraft
+
     payload = draft.payload if isinstance(draft.payload, dict) else {}
+    if graph is not None:
+        from app.apps.tree import node_map
+
+        card = next((node for node in node_map(graph).values() if node.get("type") == "metrics"
+                     and not (node.get("config") or {}).get("caliber_from")), None)
+        payload = {**payload, "metrics": ((card or {}).get("config") or {}).get("metrics") or []}
     metrics = payload.get("metrics")
     return {"id": draft.id, "title": draft.title, "status": draft.status,
+            "stage": docdraft.stage_of(draft.status),
             "metric_count": len(metrics) if isinstance(metrics, list) else 0,
             "question_count": _question_count(payload), "workflow_id": draft.workflow_id,
             "created_at": draft.created_at.isoformat() if draft.created_at else None, "error": draft.error}
 
 
 async def _draft_view(session: AsyncSession, draft: CaliberDraft) -> dict[str, Any]:
-    """一份草稿的完整样子：payload 摊平在上层（界面直接读 metrics / open_questions），另加状态和关联工作流名。"""
+    """一份草稿的完整样子：payload 摊平在上层（界面直接读 metrics / open_questions），另加状态和关联工作流名。
+
+    文档起草建了工作流和 v1 之后，图是唯一真相：画布上改过指标或取数 SQL，这里从图里取最新的那几项覆盖 payload
+    里的起草快照。接上一次运行（docattach）的草稿仍看 payload。
+    """
     payload = draft.payload if isinstance(draft.payload, dict) else {}
     workflow = await session.get(Workflow, draft.workflow_id) if draft.workflow_id else None
-    return {**payload, **_draft_summary(draft),
+    view = {**payload, **_draft_summary(draft),
             "collection": draft.collection, "datasource_id": draft.datasource_id,
             "origin": draft.origin if isinstance(draft.origin, dict) else {},
             "model_id": draft.model_id or payload.get("model_id"), "created_by": draft.created_by,
             "updated_at": draft.updated_at.isoformat() if draft.updated_at else None,
             "workflow_name": workflow.name if workflow is not None else None}
+    if _doc_draft_workflow(workflow):
+        live = await _draft_graph_payload(session, workflow, workflow.version, draft=draft, payload=payload)
+        if live is not None:
+            view.update(live)
+            view["metric_count"] = len(live["metrics"])
+            view["question_count"] = _question_count(view)
+    from app.db.models import CaliberDraftJob
+
+    job = await session.get(CaliberDraftJob, draft.id)
+    if job:
+        view["job"] = {"status": job.status, "attempt": job.attempt, "error": job.error,
+                       "retryable": draft.status == "failed" and not draft.workflow_id
+                                    and job.status not in ("queued", "running")}
+    return view
+
+
+def _graph_entry_fields(graph: dict[str, Any]) -> list[dict[str, Any]]:
+    """图里入口节点（input）的字段；草稿页和试跑用它，画布改过的入口字段不会被 payload 的旧快照盖住。"""
+    from app.apps.tree import node_map
+
+    start = next((node for node in node_map(graph).values() if node.get("type") == "input"), None)
+    return [dict(field) for field in ((start or {}).get("config") or {}).get("fields") or []
+            if isinstance(field, dict)]
+
+
+def _allowed_tables(source: DataSource | None) -> set[str]:
+    """这个数据源目录里允许出现的表名；和 _sql_problem 判表在不在目录用的是同一套键。"""
+    if source is None:
+        return set()
+    tables = _source_tables(source)
+    allowed = {str(table) for table in tables}
+    cache = source.schema_cache if isinstance(source.schema_cache, dict) else {}
+    schema = cache.get("schema")
+    if isinstance(schema, str) and schema:
+        allowed |= {f"{schema}.{table}" for table in tables}
+    return allowed
+
+
+async def _draft_checks(session: AsyncSession, draft: CaliberDraft, payload: dict[str, Any], graph: dict[str, Any],
+                        metrics: list[dict[str, Any]], groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """发布前检查：只读地算一份清单，不拦人，也不发起运行。
+
+    五项：图能过发布校验、取数都是单条只读 SELECT 且表在目录里、入口字段与 SQL 占位符一致、试运行成功、
+    每条指标都有引用原文。旧草稿没有图时不给 checks，页面整块不画。
+    """
+    from app.apps.validation import gate_issues
+    from app.ledger import draftplan
+
+    checks: list[dict[str, Any]] = []
+    detail, graph_ok = "", True
+    try:
+        issues = await gate_issues(session, graph, "published")
+        errors = [issue for issue in issues or [] if issue["level"] == "error"]
+        if issues is None:
+            raise ValueError("图结构无法解析")
+    except Exception as e:  # noqa: BLE001 - 图读不出来也是一项没通过，照实说
+        errors = []
+        graph_ok = False
+        detail = f"图读不出来：{e}"
+    if errors:
+        graph_ok = False
+        detail = "；".join(str(issue["message"]) for issue in errors[:3])
+        if len(errors) > 3:
+            detail += f"；另有 {len(errors) - 3} 项"
+    checks.append({"key": "graph", "label": "图能过发布校验", "ok": graph_ok, "detail": detail})
+
+    source = await session.get(DataSource, draft.datasource_id) if draft.datasource_id else None
+    allowed = _allowed_tables(source)
+    sql_reasons: list[str] = []
+    for group in groups:
+        sql = str(group.get("sql") or "")
+        if not sql.strip():
+            sql_reasons.append("有一组没有取数 SQL")
+            continue
+        if reason := draftplan._sql_problem(sql, allowed):
+            sql_reasons.append(reason)
+    sql_detail = "；".join(dict.fromkeys(sql_reasons))
+    checks.append({"key": "sql", "label": "取数都是单条只读 SELECT，表在数据目录里",
+                   "ok": not sql_reasons, "detail": sql_detail})
+
+    fields = _graph_entry_fields(graph)
+    declared = {str(field.get("name")) for field in fields if field.get("name")}
+    used: set[str] = set()
+    for group in groups:
+        used |= set(draftplan._INPUT.findall(str(group.get("sql") or "")))
+    missing = sorted(used - declared)
+    unused = sorted(declared - used)
+    entry_detail: list[str] = []
+    if missing:
+        entry_detail.append(f"SQL 里用了没声明的入口：{'、'.join(missing)}")
+    if unused:
+        entry_detail.append(f"声明了但 SQL 没用到的入口：{'、'.join(unused)}")
+    checks.append({"key": "entries", "label": "入口字段与 SQL 占位符一致", "ok": not entry_detail,
+                   "detail": "；".join(entry_detail)})
+
+    trial = payload.get("trial") if isinstance(payload.get("trial"), dict) else {}
+    trial_status = str(trial.get("status") or "")
+    trial_detail = ""
+    if trial_status == "failed":
+        trial_detail = str(trial.get("error") or "试运行没有成功")
+    elif trial_status == "needs_input":
+        trial_detail = "等补入口字段"
+    elif trial_status == "running":
+        trial_detail = "试运行还在进行"
+    elif trial_status == "stale":
+        trial_detail = "口径已修改，请重新试运行"
+    elif not trial_status:
+        trial_detail = "还没有试运行"
+    run_id = str(trial.get("run_id") or "")
+    trial_metrics = await _trial_metrics(run_id) if run_id and trial_status == "succeeded" else []
+    validation = await _trial_validation(run_id, trial_status, trial_metrics)
+    quality_details = "；".join(c["detail"] for c in validation["checks"][:5])
+    checks.append({"key": "trial", "label": "试运行结果通过质量检查", "ok": validation["status"] == "pass",
+                   "status": validation["status"], "detail": trial_detail or quality_details})
+
+    missing_citations = [str(metric.get("name") or metric.get("id")) for metric in metrics
+                         if not (metric.get("definition") or {}).get("citations")]
+    checks.append({"key": "citations", "label": "每条指标都有引用原文", "ok": not missing_citations,
+                   "detail": "；".join(f"「{name}」没有引用原文" for name in missing_citations[:5])})
+    return checks
+
+
+async def _draft_graph_payload(session: AsyncSession, workflow: Workflow, version: int, *,
+                               draft: CaliberDraft | None = None,
+                               payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """从草稿工作流的某一版图里取出草稿页要显示的那几项（指标、入口、SQL、groups）。
+
+    图是唯一真相：画布上改了指标名、定义或取数 SQL，草稿页跟着图变，不显示 payload 里起草那一刻的快照。取数节点
+    按 SQL 分组，指标按表达式里引用的节点归组；表达式不引用取数节点的（比如只读 vars）归到第一组。图里没有口径卡
+    或没有指标时交回空指标列表，不能退回起草时的旧快照。
+    """
+    from app.apps.tree import node_map
+
+    row = (await session.execute(select(WorkflowVersion).where(
+        WorkflowVersion.workflow_id == workflow.id,
+        WorkflowVersion.version == int(version)))).scalar_one_or_none()
+    if row is None or not isinstance(row.graph, dict):
+        return None
+    nodes = node_map(row.graph)
+    card = next((node for node in nodes.values()
+                 if node.get("type") == "metrics"
+                 and not (node.get("config") or {}).get("caliber_from")), None)
+    metrics = [metric for metric in ((card or {}).get("config") or {}).get("metrics") or []
+               if isinstance(metric, dict) and metric.get("id")]
+    fields = _graph_entry_fields(row.graph)
+    fetches: list[tuple[str, str]] = []
+    for node_id, node in nodes.items():
+        config = node.get("config") if isinstance(node.get("config"), dict) else {}
+        args = config.get("args") if isinstance(config.get("args"), dict) else {}
+        sql = args.get("sql") if isinstance(args, dict) else None
+        if node.get("type") == "tool" and isinstance(sql, str) and sql.strip():
+            fetches.append((str(node_id), sql))
+    groups: list[dict[str, Any]] = []
+    for node_id, sql in fetches:
+        pattern = re.compile(rf"nodes\.{re.escape(node_id)}(?![\w])")
+        from app.look.calibers import _metric_paths
+
+        ids = [str(metric["id"]) for metric in metrics
+               if any(pattern.search(path) for path in _metric_paths(metric) or [])]
+        groups.append({"sql": sql, "entry_fields": [dict(field) for field in fields], "metric_ids": ids})
+    assigned = {metric_id for group in groups for metric_id in group["metric_ids"]}
+    loose = [str(metric["id"]) for metric in metrics if str(metric["id"]) not in assigned]
+    if loose:
+        if groups:
+            groups[0]["metric_ids"].extend(loose)
+        else:
+            groups = [{"sql": "", "entry_fields": [dict(field) for field in fields], "metric_ids": loose}]
+    out = {
+        "version": version,
+        "metrics": metrics,
+        "entry_fields": [dict(field) for field in fields],
+        "sql": "\n\n".join(sql for _node, sql in fetches),
+        "groups": groups,
+        "blocks": len(fetches) or 1,
+    }
+    if draft is not None and payload is not None:
+        out["trial"] = await _trial_view(session, payload.get("trial") or {}, version=version, graph=row.graph)
+        out["checks"] = await _draft_checks(session, draft, {**payload, "trial": out["trial"]}, row.graph, metrics, groups)
+    return out
 
 
 async def _draft_or_404(session: AsyncSession, draft_id: str) -> CaliberDraft:
@@ -622,28 +874,6 @@ async def _draft_or_404(session: AsyncSession, draft_id: str) -> CaliberDraft:
     return draft
 
 
-async def _published_metrics(session: AsyncSession) -> list[dict[str, Any]]:
-    """已发布口径里的每一项指标，给 docdraft.alignment 用：{workflow_id, version, node_id, name, synonyms, unit,
-    definition_text}。直接复用 descriptor.list_calibers 的认法（只看最新已发布且未退役版本的源头口径卡）。"""
-    from app.ledger.descriptor import list_calibers
-
-    out: list[dict[str, Any]] = []
-    for described in await list_calibers(session):
-        for metric in described.get("metrics") or []:
-            if not isinstance(metric, dict):
-                continue
-            definition = metric.get("definition")
-            text = definition.get("text") if isinstance(definition, dict) else None
-            name = metric.get("name") or metric.get("id")
-            if not name:
-                continue
-            out.append({"workflow_id": described["workflow_id"], "version": described["version"],
-                        "node_id": described["card"]["node_id"], "name": str(name),
-                        "synonyms": metric.get("synonyms") if isinstance(metric.get("synonyms"), list) else [],
-                        "unit": metric.get("unit") or "", "definition_text": text or ""})
-    return out
-
-
 def _doc_title(docs: list[Document]) -> str:
     """草稿标题取第一份文档的名字；多份文档写明还有几份。"""
     first = docs[0]
@@ -651,29 +881,11 @@ def _doc_title(docs: list[Document]) -> str:
     return (f"{title}等 {len(docs)} 份文档" if len(docs) > 1 else title)[:200]
 
 
-#: 一次起草最多续跑几轮：模型一轮只给一组指标，文档里的指标分成几组由它自己切，覆盖完就停。
-#: 实测一份 39 条指标的文档，每轮 3–5 条，6 轮只覆盖 22 条，所以放到 10 轮（约 5 分钟）。
-MAX_ROUNDS = 10
+#: 一次起草最多续跑几轮：模型一次尽量交多组，一组交不下时按 uncovered 再续，最多 4 轮。
+#: 以前一轮只收一组、放到 10 轮；现在多组一次交，轮数只留给「这一轮写不下」的余量。
+MAX_ROUNDS = 4
 #: 一张草稿图最多收几条指标：再多，一张口径卡和一次试跑都读不动
 MAX_METRICS = 60
-
-
-def _merged_fields(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """各组声明的入口字段合成一份，给界面看：它和建图用的是同一套合并（draftplan.merge_entry_fields）。
-
-    早先这里是「先出现的为准」的另一份实现，建图那边还会因为同名冲突抛错——两份逻辑说不到一起。现在只有一处。
-    """
-    from app.ledger import draftplan
-
-    fields, _ = draftplan.merge_entry_fields(blocks)
-    return fields
-
-
-def _entry_notes(blocks: list[dict[str, Any]]) -> list[str]:
-    """入口字段在各组里声明不一致的地方（必填取并集、类型取更宽），摆给起草的人看。"""
-    from app.ledger import draftplan
-
-    return draftplan.merge_entry_fields(blocks)[1]
 
 
 #: 问题去重时取第一句多长：同一件事每轮换个说法，前面那句「问的是什么」通常一样，后面才是补充
@@ -682,274 +894,15 @@ _CLAUSE = "，,。；;：:！!？?"
 _PUNCT = set(" \t\r\n，。；：、！？,.!?;:'\"（）()[]【】《》<>-_/\\|`~")
 
 
-def _question_key(text: str) -> str:
-    """一句话的「问的是什么」：取第一个分句（问的是同一件事，后面常跟着各轮的补充说明）。"""
-    head = text
-    for mark in _CLAUSE:
-        at = head.find(mark)
-        if at > 0:
-            head = head[:at]
-    return "".join(ch for ch in head if ch not in _PUNCT)[:_QUESTION_KEY]
-
-
-def _merge_questions(kept: list[str], incoming: list[str]) -> list[str]:
-    """跨轮合并未决问题：同一件事每轮都会重新问一遍（68 条里有一半是重复），按归一化后的前 24 个字去重，
-    保留先出现的那一句。措辞不同但意思一样的仍会留下——机器分不出来，交给人决定要不要回。"""
-    seen = {_question_key(q) for q in kept}
-    out = list(kept)
-    for item in incoming:
-        text = item.strip() if isinstance(item, str) else ""
-        if not text:
-            continue
-        key = _question_key(text)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(text)
-    return out
-
-
-def _fresh_metrics(metrics: list[dict[str, Any]], covered: list[str]) -> list[dict[str, Any]]:
-    """这一轮里还没起草过的指标，按名字认；同一轮重复交同名指标的只留第一条。
-
-    提示词里已经写了「这些起草过、别重复」，但模型偶尔照抄一遍上一轮的指标。照单全收会出现同名两条指标，口径卡上
-    读的是哪条也说不清，所以在这里挡掉。
-    """
-    seen = set(covered)
-    fresh: list[dict[str, Any]] = []
-    for metric in metrics:
-        name = str(metric.get("name") or "").strip()
-        if name:
-            if name in seen:
-                continue
-            seen.add(name)
-        fresh.append(metric)
-    return fresh
-
-
-def _draft_payload(*, entries: list[dict[str, Any]], blocks: list[dict[str, Any]], problems: list[dict[str, Any]],
-                   questions: list[str], uncovered: list[str], progress: dict[str, int],
-                   doc_truncated: bool, catalog_truncated: bool, model_id: str,
-                   salvaged: bool) -> dict[str, Any]:
-    """草稿 payload 的形状：整份指标、各组 SQL、进度。起草中途也按它写回，页面靠 progress 显示第几轮、覆盖了几条。
-
-    blocks 是组数（不是内容）；sql 把各组的取数拼在一起（组间空一行），人看的是「这次一共要跑哪几条」。truncated 仍是
-    doc_truncated 与 catalog_truncated 的「或」，老前端只认这一个键。
-    """
-    return {
-        "documents": entries,
-        "metrics": [m for block in blocks for m in block["metrics"]],
-        "entry_fields": _merged_fields(blocks),
-        "entry_notes": _entry_notes(blocks),
-        "sql": "\n\n".join(str(block["sql"]) for block in blocks),
-        "version": 1,
-        "blocks": len(blocks),
-        "progress": progress,
-        "trial": {"run_id": "", "status": "running", "error": ""},
-        "dropped": problems,
-        "truncated": doc_truncated or catalog_truncated,
-        "doc_truncated": doc_truncated,
-        "catalog_truncated": catalog_truncated,
-        "model_id": model_id,
-        "open_questions": questions,
-        "uncovered": uncovered,
-        "salvaged": salvaged,
-    }
-
-
 async def _extract_in_background(draft_id: str) -> None:
-    """后台起草：读文档的段落和数据目录，分组反复调模型直到覆盖完，收成一张多取数的草稿图、建工作流、再跑一次试跑。
+    from app.ledger.authoring import extract
 
-    用新的会话：请求那一份在响应发出后就关了，后台接着用它写库是错的。没有数据源或没有表结构时起草必须失败——SQL 只能
-    对照真实目录写，没有目录就不让模型猜。个别指标不合格只丢那一条、写进 dropped / open_questions；SQL 本身不合格才整份
-    失败（图跑不了，留着也没有意义）。
-
-    **为什么一轮接一轮地跑。** 模型一轮只交一组能共用同一条 SQL 的指标（提示词里限 6 条），39 条指标的文档一轮必然覆盖
-    不完。以前只跑一轮，其余全进 uncovered，草稿就停在 6 条。现在把已起草的名字（covered）交回提示词、按 uncovered 续跑，
-    每轮收一组；直到模型不再给出新指标、uncovered 空了、或到轮数/条数上限。每轮都先写一次 payload 的 progress 再
-    commit：一轮要等一次模型调用，页面得能看见进展，而不是停在「起草中」。
-    """
-    from app.core.artifact_store import graph_hash
-    from app.db.models import WorkflowVersion
-    from app.ledger import docdraft, draftplan
-
-    async with SessionLocal() as session:
-        draft = await session.get(CaliberDraft, draft_id)
-        if draft is None or draft.status != "drafting":
-            return
-        origin = draft.origin if isinstance(draft.origin, dict) else {}
-        wanted = [str(d) for d in origin.get("documents") or []]
-        docs: list[Document] = []
-        for doc_id in wanted:
-            doc = await session.get(Document, doc_id)
-            if doc is not None:
-                docs.append(doc)
-        chunks: dict[str, dict[str, Any]] = {}
-        entries: list[dict[str, Any]] = []
-        for doc in docs:
-            rows = (await session.execute(select(Chunk).where(Chunk.document_id == doc.id)
-                                          .order_by(Chunk.ordinal, Chunk.id))).scalars()
-            chunk_ids: list[str] = []
-            for chunk in rows:
-                chunks[chunk.id] = {"ordinal": chunk.ordinal, "content": chunk.content or "",
-                                    "document_id": doc.id}
-                chunk_ids.append(chunk.id)
-            entries.append({"document_id": doc.id, "title": doc.title or doc.source or doc.id,
-                            "chunk_ids": chunk_ids})
-
-        source = await session.get(DataSource, draft.datasource_id) if draft.datasource_id else None
-        if source is None:
-            draft.error = "没有数据源：生成取数 SQL 必须对照数据目录里的表和列"
-            draft.status = "failed"
-            await session.commit()
-            return
-        focus_text = "\n".join(str(c.get("content") or "") for c in chunks.values())
-        tables_text, allowed_tables = await _schema_material(session, source, focus_text)
-        if not allowed_tables:
-            draft.error = "这个数据源还没有表结构：先探查表结构，再起草口径"
-            draft.status = "failed"
-            await session.commit()
-            return
-        datasource = {"name": source.name, "type": source.kind, "description": source.description}
-
-        guidance = str(origin.get("guidance") or "")
-        fixed_filters = str(origin.get("fixed_filters") or "")
-        alignment: dict[str, list[Any]] = {"new": [], "duplicate": [], "conflict": []}
-        # 每组一组指标：{sql, entry_fields, metrics}，循环结束时拼成一张图
-        blocks: list[dict[str, Any]] = []
-        problems: list[dict[str, Any]] = []
-        covered: list[str] = []
-        questions: list[str] = []
-        uncovered: list[str] = []
-        progress: dict[str, int] = {}
-        diagnostics = ""
-        doc_truncated = False
-        catalog_truncated = False
-        salvaged = False
-        model_id = ""
-
-        def state() -> dict[str, Any]:
-            return _draft_payload(entries=entries, blocks=blocks, problems=problems, questions=questions,
-                                  uncovered=uncovered, progress=progress, doc_truncated=doc_truncated,
-                                  catalog_truncated=catalog_truncated, model_id=model_id, salvaged=salvaged)
-
-        try:
-            for rnd in range(1, MAX_ROUNDS + 1):
-                result = await draftplan.plan(session, docs=entries, chunks=chunks, guidance=guidance,
-                                              datasource=datasource, tables_text=tables_text, covered=covered,
-                                              fixed=fixed_filters)
-                plan, round_problems = draftplan.normalize_plan(result, chunks, allowed_tables=allowed_tables)
-                fresh = _fresh_metrics(plan["metrics"], covered)
-                if plan["sql"] and fresh:
-                    blocks.append({"sql": plan["sql"], "entry_fields": plan["entry_fields"], "metrics": fresh})
-                    covered += [m["name"] for m in fresh if m.get("name")]
-                problems += round_problems
-                questions = _merge_questions(questions, plan["open_questions"])
-                uncovered = list(result.get("uncovered") or [])
-                diagnostics = result.get("diagnostics") or diagnostics
-                doc_truncated = doc_truncated or bool(result.get("doc_truncated"))
-                catalog_truncated = catalog_truncated or bool(result.get("catalog_truncated"))
-                salvaged = salvaged or bool(result.get("salvaged"))
-                model_id = result.get("model_id") or model_id
-                progress = {"round": rnd, "covered": len(covered), "uncovered": len(uncovered)}
-                # 每轮先落一次库：这一轮要等一次模型调用，页面这时就能显示「第几轮、起草了几条、还剩几条」
-                draft.payload = state()
-                await session.commit()
-                if not fresh or not uncovered or len(covered) >= MAX_METRICS:
-                    break
-
-            if not blocks:
-                error = _problems_text(problems) or "模型没有给出可用的取数 SQL 和指标"
-                if diagnostics:
-                    error = f"{error}（{diagnostics}）"
-                if questions:
-                    # 模型把缺什么说清楚了（目录里没有这些列、业务上还没定）：这是一份要补信息的草稿，不是失败
-                    draft.payload = {**state(), "trial": {"run_id": "", "status": "", "error": ""}}
-                    draft.model_id = model_id or None
-                    draft.error = ""
-                    draft.status = "questions_open"
-                    await session.commit()
-                    return
-                draft.payload = {**state(), "trial": {"run_id": "", "status": "failed", "error": error}}
-                draft.model_id = model_id or None
-                draft.error = error
-                draft.status = "failed"
-                await session.commit()
-                return
-
-            try:
-                graph = draftplan.build_graph(blocks, name=draft.title, question=guidance or draft.title,
-                                              datasource=source.name)
-            except ValueError as e:
-                # build_graph 现在合并入口字段不再抛错；这条留着兜底：真出现合不了的图，照实记为失败，别留半成品
-                draft.payload = {**state(), "dropped": [*problems, {"name": "入口字段", "reason": str(e)}],
-                                 "trial": {"run_id": "", "status": "failed", "error": str(e)}}
-                draft.model_id = model_id or None
-                draft.error = str(e)
-                draft.status = "failed"
-                await session.commit()
-                return
-
-            # 对齐要扫所有已发布口径：某一份读不出来不该让整份草稿失败，照实不做对齐（alignment 三个空列表）
-            try:
-                existing = await _published_metrics(session)
-            except Exception:  # noqa: BLE001 - 对齐是辅助信息，不是草稿本身
-                logger.exception("读已发布口径失败，草稿 %s 不做对齐", draft_id)
-                existing = []
-            metrics = [m for block in blocks for m in block["metrics"]]
-            alignment = docdraft.alignment(metrics, existing)
-
-            asked = list(dict.fromkeys(questions + [
-                f"{p['name']}：{p['reason']}" for p in problems
-                if p.get("name") not in ("sql", "metrics")]))
-            workflow = Workflow(
-                name=(draft.title.strip() or "文档口径草稿")[:200],
-                description=(f"从业务文档起草的口径：{len(metrics)} 个指标、{len(blocks)} 组取数，取数 SQL 由模型对照"
-                             f"数据目录生成，后台自动只读试运行；人工审改后按受管级别发布"),
-                graph=graph, status="draft", tags=["doc_draft"],
-                origin={"kind": "doc_draft", "draft_id": draft.id, "datasource_id": source.id,
-                        "documents": [doc.id for doc in docs], "guidance": guidance})
-            session.add(workflow)
-            await session.flush()
-            session.add(WorkflowVersion(workflow_id=workflow.id, version=1, graph=graph,
-                                        graph_hash=graph_hash(graph), note="从业务文档分组生成"))
-            payload = {
-                **state(), "workflow_id": workflow.id, "open_questions": asked,
-                "alignment": alignment,
-            }
-        except docdraft.DraftUnavailable as e:
-            draft.error = str(e) or "AI 起草不可用"
-            draft.status = "failed"
-            await session.commit()
-            return
-        except Exception as e:  # noqa: BLE001 - 后台出错要写回这一行，不然界面永远停在「起草中」
-            logger.exception("从文档起草口径出错（草稿 %s）", draft_id)
-            draft.error = f"起草出错：{e}"
-            draft.status = "failed"
-            await session.commit()
-            return
-        draft.payload = payload
-        draft.workflow_id = workflow.id
-        draft.model_id = model_id or None
-        draft.error = None
-        draft.status = _status_for(payload)
-        await session.commit()
-        values = {field["name"]: field.get("default") for field in _merged_fields(blocks)
-                  if field.get("default") not in (None, "")}
-
-    try:
-        trial = await _run_trial(draft_id=draft_id, workflow_id=workflow.id, graph=graph, values=values,
-                                 started_by=draft.created_by, entry_fields=_merged_fields(blocks))
-    except Exception as e:  # noqa: BLE001 - 试运行出错也要写进 payload，不能让界面停在「试运行中」
-        logger.exception("草稿 %s 的试运行出错", draft_id)
-        trial = {"run_id": "", "status": "failed", "error": f"试运行出错：{e}"}
-    await _save_trial(draft_id, trial)
+    await extract(draft_id, run_trial=_run_trial, save_trial=_save_trial, trial_binding=_trial_binding)
 
 
-def _problems_text(problems: list[dict[str, Any]]) -> str:
-    """把校验问题拼成一句给人看的原因（接口的 error 只有一个字段）。"""
-    return "；".join(f"{p.get('name') or '问题'}：{p.get('reason') or ''}".strip("：")
-                    for p in problems if p.get("reason"))[:2000]
+from app.ledger import jobs as draft_jobs
+
+draft_jobs.executor = _extract_in_background
 
 
 class DraftExtractIn(BaseModel):
@@ -1000,27 +953,48 @@ async def draft_extract(payload: DraftExtractIn, background: BackgroundTasks,
                                  "fixed_filters": payload.fixed_filters.strip()},
                          created_by=current_principal().username)
     session.add(draft)
+    await session.flush()
+    from app.db.models import CaliberDraftJob
+
+    session.add(CaliberDraftJob(id=draft.id))
     await session.commit()
-    background.add_task(_extract_in_background, draft.id)
+    background.add_task(draft_jobs.start, draft.id)
     return {"draft_id": draft.id, "status": draft.status}
 
 
 @router.get("/drafts")
 async def list_drafts(status: str | None = Query(default=None, description="按状态筛：drafting / ready / "
                                                    "questions_open / path_pending / attached / rejected / failed"),
+                      stage: str | None = Query(default=None, description="按界面阶段筛：drafting / review / "
+                                              "discarded / failed"),
                       session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """口径草稿列表，最近改过的在前。只给计数和状态，正文用 GET /api/ledger/drafts/{id} 看。"""
+    """口径草稿列表，最近改过的在前。只给计数、细状态和界面阶段，正文用 GET /api/ledger/drafts/{id} 看。
+
+    细状态（status）是接口兼容用的；页面按四种阶段（stage）筛：起草中、待审、已丢弃、失败。ready / questions_open /
+    path_pending / attached 都归「待审」。
+    """
     from app.api.deps import ensure_role
     from app.ledger import docdraft
 
     ensure_role("builder")
-    query = select(CaliberDraft).order_by(CaliberDraft.updated_at.desc(), CaliberDraft.id.desc())
+    query = select(CaliberDraft, Workflow).outerjoin(Workflow, Workflow.id == CaliberDraft.workflow_id) \
+        .order_by(CaliberDraft.updated_at.desc(), CaliberDraft.id.desc())
     if status:
         if status not in docdraft.STATUSES:
             raise HTTPException(422, f"不认识的状态：{status}")
         query = query.where(CaliberDraft.status == status)
-    rows = (await session.execute(query)).scalars()
-    return {"drafts": [_draft_summary(draft) for draft in rows]}
+    if stage:
+        if stage not in docdraft.STAGES:
+            raise HTTPException(422, f"不认识的阶段：{stage}")
+        if stage == "review":
+            query = query.where(CaliberDraft.status.in_(("ready", "questions_open", "path_pending", "attached")))
+        elif stage == "discarded":
+            query = query.where(CaliberDraft.status == "rejected")
+        else:
+            query = query.where(CaliberDraft.status == stage)
+    rows = (await session.execute(query)).all()
+    return {"drafts": [_draft_summary(draft, graph=workflow.graph if _doc_draft_workflow(workflow) else None)
+                       for draft, workflow in rows]}
 
 
 @router.get("/drafts/{draft_id}")
@@ -1035,29 +1009,35 @@ async def get_draft(draft_id: str, session: AsyncSession = Depends(get_session))
 
 @router.get("/drafts/{draft_id}/trial")
 async def get_draft_trial(draft_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """这份草稿的试跑：{run_id, status, metrics: [{id, name, rendered, value}], error}。
+    """这份草稿的试跑：{run_id, status, metrics: [{id, name, rendered, value}], queries, error}。
 
-    状态只有 succeeded / failed / running 三种；指标值读试跑运行封存的口径卡（和口径试跑同一个读法）。还没试跑（老草稿、
-    起草失败）回 404。只读，不发起运行。"""
+    状态只有 succeeded / failed / running 三种；指标值读试跑运行封存的口径卡（和口径试跑同一个读法），queries 是取数节点
+    交回的查询快照（前几行、遮罩列换成「已遮罩」，不含 SQL）。还没试跑（老草稿、起草失败）回 404。只读，不发起运行。"""
     from app.api.deps import ensure_role
 
     ensure_role("builder")
     draft = await _draft_or_404(session, draft_id)
     payload = draft.payload if isinstance(draft.payload, dict) else {}
     trial = payload.get("trial") if isinstance(payload.get("trial"), dict) else {}
+    workflow = await session.get(Workflow, draft.workflow_id) if draft.workflow_id else None
+    if _doc_draft_workflow(workflow):
+        trial = await _trial_view(session, trial, version=workflow.version, graph=workflow.graph)
+    if trial.get("status") == "stale":
+        return {**trial, "metrics": [], "queries": []}
     run_id = trial.get("run_id")
     if not isinstance(run_id, str) or not run_id:
-        if trial.get("status") == "needs_input":
-            return {"run_id": "", "status": "needs_input", "metrics": [],
-                    "error": str(trial.get("error") or "")}
+        if trial.get("status") in ("needs_input", "running"):
+            return {**trial, "metrics": [], "queries": []}
         raise HTTPException(404, "这份草稿还没有试运行")
     run = await session.get(Run, run_id)
     if run is None:
-        return {"run_id": run_id, "status": _run_status(trial.get("status")), "metrics": [],
+        return {"run_id": run_id, "status": _run_status(trial.get("status")), "metrics": [], "queries": [],
                 "error": str(trial.get("error") or "")}
     status = _run_status(run.status)
     metrics = await _trial_metrics(run.id) if status == "succeeded" else []
-    return {"run_id": run.id, "status": status, "metrics": metrics, "error": str(run.error or "")}
+    queries = await _trial_queries(run.id) if status == "succeeded" else []
+    return {**trial, "run_id": run.id, "status": status, "metrics": metrics, "queries": queries,
+            "validation": await _trial_validation(run.id, status, metrics), "error": str(run.error or "")}
 
 
 class DraftTrialIn(BaseModel):
@@ -1070,7 +1050,8 @@ async def run_draft_trial(draft_id: str, payload: DraftTrialIn,
     """按填好的入口字段试跑一次（builder 及以上）。
 
     自动试跑缺必填输入时停在 needs_input（不拿系统编的日期跑，那样跑出来的数没有意义），人在这里补上再跑。
-    参数按入口字段校验，和正式运行同一套（apps/forms）；跑的仍是探针图：只取数与口径卡，不写报告、不进统计。
+    参数按入口字段校验，和正式运行同一套（apps/forms）；跑的仍是探针图：只取数与口径卡，不写报告、不进统计。成功时另给
+    queries（取数节点交回的查询快照，前几行、遮罩列换成「已遮罩」，不含 SQL）；没有运行、失败或还在跑时为空数组。
     """
     from app.api.deps import current_principal, ensure_role
     from app.apps.forms import input_schema, validate_form
@@ -1082,21 +1063,31 @@ async def run_draft_trial(draft_id: str, payload: DraftTrialIn,
     workflow_id = draft.workflow_id or body.get("workflow_id")
     if not workflow_id:
         raise HTTPException(409, "这份草稿还没有取数图，不能试运行")
-    version = int(body.get("version") or 1)
+    workflow = await session.get(Workflow, str(workflow_id))
+    version = workflow.version if _doc_draft_workflow(workflow) else int(body.get("version") or 1)
     row = (await session.execute(select(WorkflowVersion).where(
         WorkflowVersion.workflow_id == workflow_id, WorkflowVersion.version == version))).scalar_one_or_none()
     if row is None or not isinstance(row.graph, dict):
         raise HTTPException(409, "找不到这份草稿的取数图，可能已被删除")
+    # 文档起草的草稿以图为准：画布上改过入口字段之后，试跑按图里的字段校验，不能拿 payload 的旧快照
+    if _doc_draft_workflow(workflow):
+        fields = _graph_entry_fields(row.graph)
+    unknown = sorted(set(payload.inputs) - {str(field.get("name")) for field in fields})
+    if unknown:
+        raise HTTPException(422, f"不认识的入口字段：{'、'.join(unknown)}")
     values: dict[str, Any] = {str(field.get("name")): field.get("default") for field in fields
                               if field.get("default") not in (None, "")}
     values.update({str(key): value for key, value in payload.inputs.items()})
     if errors := validate_form(input_schema(fields), values):
         raise HTTPException(422, "；".join(str(e.get("message")) for e in errors[:5]))
     trial = await _run_trial(draft_id=draft.id, workflow_id=str(workflow_id), graph=row.graph,
-                             values=values, started_by=current_principal().username, entry_fields=fields)
+                             values=values, started_by=current_principal().username, entry_fields=fields, version=version)
     await _save_trial(draft.id, trial)
     run_id = str(trial.get("run_id") or "")
-    return {**trial, "metrics": await _trial_metrics(run_id) if run_id else []}
+    queries = await _trial_queries(run_id) if run_id and trial.get("status") == "succeeded" else []
+    metrics = await _trial_metrics(run_id) if run_id and trial.get("status") == "succeeded" else []
+    return {**trial, "metrics": metrics, "queries": queries,
+            "validation": await _trial_validation(run_id, str(trial.get("status") or ""), metrics)}
 
 
 def _check_metrics(metrics: Any) -> list[dict[str, Any]]:
@@ -1118,6 +1109,48 @@ def _check_metrics(metrics: Any) -> list[dict[str, Any]]:
     return [dict(metric) for metric in metrics]
 
 
+async def _sync_draft_graph(session: AsyncSession, draft: CaliberDraft, payload_data: dict[str, Any]) -> None:
+    """在当前图上修改口径卡，再新增版本；取数节点、SQL、入口和用户添加的编排保持其身份。"""
+    from app.apps.versions import WorkflowChanged, save_graph
+
+    workflow = await session.get(Workflow, draft.workflow_id) if draft.workflow_id else None
+    metrics = payload_data.get("metrics")
+    if not _doc_draft_workflow(workflow) or not isinstance(metrics, list):
+        return
+    graph = copy.deepcopy(workflow.graph)
+    card = next((n for n in graph.get("nodes") or [] if n.get("type") == "metrics"
+                 and not (n.get("data", {}).get("config") or {}).get("caliber_from")), None)
+    if card is None:
+        raise HTTPException(409, "当前画布没有可编辑的口径卡，请先在画布上添加")
+    config = card.setdefault("data", {}).setdefault("config", {})
+    old_ids = {m.get("id") for m in config.get("metrics") or [] if isinstance(m, dict)}
+    new_ids = [m.get("id") for m in metrics]
+    if any(not isinstance(mid, str) or not mid.strip() for mid in new_ids) or len(set(new_ids)) != len(new_ids):
+        raise ValueError("每条指标需要非空且唯一的 ID")
+    config["metrics"] = copy.deepcopy(metrics)
+    removed = old_ids - set(new_ids)
+    for node in graph.get("nodes") or []:
+        contract = node.get("data", {}).get("config", {}).get("contract")
+        if not isinstance(contract, dict):
+            continue
+        sources = contract.get("metrics_from") or []
+        if card["id"] not in ([sources] if isinstance(sources, str) else sources):
+            continue
+        for key in ("required", "expected"):
+            if isinstance(contract.get(key), list):
+                before = contract[key]
+                contract[key] = list(new_ids) if key == "required" and set(before) == old_ids \
+                    else [mid for mid in before if mid not in removed]
+    try:
+        await save_graph(session, workflow, graph, note="编辑口径草稿")
+    except WorkflowChanged as e:
+        raise HTTPException(409, str(e)) from None
+    await session.flush()
+    live = await _draft_graph_payload(session, workflow, workflow.version)
+    if live is not None:
+        payload_data.update(live)
+
+
 class DraftPatchIn(BaseModel):
     """改标题、整体换掉指标、或把已经答清的问题消掉。"""
 
@@ -1133,11 +1166,22 @@ async def patch_draft(draft_id: str, payload: DraftPatchIn, session: AsyncSessio
     据此重算状态（还有问题 → questions_open，否则有图 → ready、没有图的老草稿 → path_pending）。已经 attach 或驳回的
     草稿不改状态——那时它说的已经不是一份草稿了。"""
     from app.api.deps import ensure_role
+    from sqlalchemy import update
 
     ensure_role("builder")
+    # 和重试对同一草稿串行，SQLite 也通过写锁保护；后台还在生成时不接受会被它覆盖的编辑。
+    await session.execute(update(CaliberDraft).where(CaliberDraft.id == draft_id)
+                          .values(updated_at=CaliberDraft.updated_at).execution_options(synchronize_session=False))
     draft = await _draft_or_404(session, draft_id)
+    if draft.status == "drafting":
+        raise HTTPException(409, "草稿仍在起草，请等待完成或停止起草后再编辑")
     body = draft.payload if isinstance(draft.payload, dict) else {}
-    payload_data = dict(body)
+    payload_data = copy.deepcopy(body)
+    workflow = await session.get(Workflow, draft.workflow_id) if draft.workflow_id else None
+    if _doc_draft_workflow(workflow):
+        live = await _draft_graph_payload(session, workflow, workflow.version)
+        if live is not None:
+            payload_data.update(copy.deepcopy(live))
     if payload.title is not None:
         if not payload.title.strip():
             raise HTTPException(422, "标题不能为空")
@@ -1156,6 +1200,11 @@ async def patch_draft(draft_id: str, payload: DraftPatchIn, session: AsyncSessio
             metric["open_questions"] = [q for q in metric["open_questions"]
                                         if not (isinstance(q, str) and q.strip() in drop)]
     if payload.metrics is not None or payload.resolved is not None:
+        # 换指标、清问题都要落到图上：草稿页从图读，只改 payload 会被下一次读取覆盖回去
+        try:
+            await _sync_draft_graph(session, draft, payload_data)
+        except ValueError as e:
+            raise HTTPException(422, f"改完的指标建不成图：{e}") from e
         draft.payload = payload_data
         metrics = payload_data.get("metrics")
         # 起草失败的草稿补上真指标后要能往前走；没有指标时不重算，免得空草稿被当成「待接数据路径」
@@ -1163,6 +1212,34 @@ async def patch_draft(draft_id: str, payload: DraftPatchIn, session: AsyncSessio
                                                                      "path_pending", "ready", "failed"):
             draft.status = _status_for(payload_data)
     await session.commit()
+    return await _draft_view(session, draft)
+
+
+@router.post("/drafts/{draft_id}/retry")
+async def retry_draft(draft_id: str, background: BackgroundTasks,
+                      session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    from app.api.deps import ensure_role
+
+    ensure_role("builder")
+    draft = await _draft_or_404(session, draft_id)
+    try:
+        await draft_jobs.retry(session, draft)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    background.add_task(draft_jobs.start, draft.id)
+    return {"draft_id": draft.id, "status": "drafting"}
+
+
+@router.post("/drafts/{draft_id}/stop")
+async def stop_draft(draft_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    from app.api.deps import ensure_role
+
+    ensure_role("builder")
+    draft = await _draft_or_404(session, draft_id)
+    await session.commit()
+    if not await draft_jobs.manager.stop(draft.id, "user"):
+        await draft_jobs.finish(session, draft.id, "cancelled", "起草已停止，已保留进度")
+    await session.refresh(draft)
     return await _draft_view(session, draft)
 
 
@@ -1179,11 +1256,16 @@ async def dismiss_draft(draft_id: str, payload: DraftDismissIn,
 
     ensure_role("builder")
     draft = await _draft_or_404(session, draft_id)
+    await session.commit()
+    await draft_jobs.manager.stop(draft.id, "user")
+    await session.refresh(draft)
     draft.status = "rejected"
     await record(session, DRAFT_DISMISS_ACTION, DRAFT_SUBJECT_KIND, draft.id,
                  data={k: v for k, v in {"title": draft.title, "note": payload.note}.items() if v})
     await session.commit()
-    return {"ok": True, "draft_id": draft.id, "status": draft.status}
+    from app.ledger import docdraft
+
+    return {"ok": True, "draft_id": draft.id, "status": draft.status, "stage": docdraft.stage_of(draft.status)}
 
 
 class DraftAttachIn(BaseModel):

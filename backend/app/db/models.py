@@ -1093,6 +1093,20 @@ class WebhookDelivery(Base):
 # --------------------------------------------------------------------------
 
 
+class CaliberDraftJob(Base, TimestampMixin):
+    """口径起草的持久化任务，和草稿业务状态分开。一次草稿同一时间只执行一个任务。"""
+
+    __tablename__ = "caliber_draft_jobs"
+
+    id: Mapped[str] = mapped_column(ForeignKey("caliber_drafts.id", ondelete="CASCADE"), primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    owner: Mapped[str | None] = mapped_column(String(120), default=current_owner)
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), default=None)
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), default=None)
+
+
 class CaliberDraft(Base, TimestampMixin):
     """从业务文档起草的一份口径（app/ledger/draftplan.py 的产出）。
 

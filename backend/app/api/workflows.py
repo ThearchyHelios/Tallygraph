@@ -100,14 +100,29 @@ async def _published_levels(session: AsyncSession, ids: list[str] | None = None)
 
 
 async def _same_as_published(session: AsyncSession, ids: list[str] | None = None) -> set[str]:
-    """画布这一版（Workflow.version）的图哈希和当前发布版相同的工作流 id。两边哈希都记着才比，不在前端比图。"""
+    """当前图与发布版执行内容相同；仅移动节点不算业务逻辑变化。旧封存哈希不改写。"""
+    from app.core.artifact_store import execution_hash
+
     current, published = aliased(WorkflowVersion), aliased(WorkflowVersion)
     stmt = select(Workflow.id, current.graph_hash, published.graph_hash).join(
         current, (current.workflow_id == Workflow.id) & (current.version == Workflow.version)).join(
         published, (published.workflow_id == Workflow.id) & (published.version == Workflow.published_version))
     if ids is not None:
         stmt = stmt.where(Workflow.id.in_(ids))
-    return {wid for wid, mine, theirs in (await session.execute(stmt)).all() if mine and mine == theirs}
+    rows = (await session.execute(stmt)).all()
+    same = {wid for wid, mine, theirs in rows if mine and mine == theirs}
+    changed = [wid for wid, _, _ in rows if wid not in same]
+    if not changed:
+        return same
+    # 常见的未改动版本直接用已存哈希；只有哈希不同的候选才读取图，避免列表每次反序列化全部发布图。
+    graphs = stmt.with_only_columns(Workflow.id, current.graph, published.graph).where(Workflow.id.in_(changed))
+    for wid, mine, theirs in (await session.execute(graphs)).all():
+        try:
+            if mine and theirs and execution_hash(mine) == execution_hash(theirs):
+                same.add(wid)
+        except (TypeError, ValueError):
+            continue  # 不能解析的历史图不宣称执行一致
+    return same
 
 
 async def _run_counts(session: AsyncSession, ids: list[str] | None = None) -> dict[str, int]:
@@ -244,24 +259,13 @@ async def update_workflow(
         workflow.description = payload.description
     if payload.tags is not None:
         workflow.tags = payload.tags
-    if payload.graph is not None and payload.graph != workflow.graph:
-        # 图有实际变化才留快照，避免改个名字就堆一堆版本
-        workflow.graph = payload.graph
-        workflow.version += 1
-        session.add(
-            WorkflowVersion(
-                workflow_id=workflow.id,
-                version=workflow.version,
-                graph=payload.graph,
-                graph_hash=graph_hash(payload.graph),
-                note=payload.note,
-            )
-        )
-        # status 说的是**当前画布**的状态，不是"这个工作流曾经发布过"。
-        # 改完图还挂着 governed，界面上就会显示一张从未过闸的图是受管模板——
-        # 已发布的那一版仍由 published_version 指着，formal 运行不受影响。
-        if workflow.status in ("published", "governed"):
-            workflow.status = "draft"
+    if payload.graph is not None:
+        from app.apps.versions import WorkflowChanged, save_graph
+
+        try:
+            await save_graph(session, workflow, payload.graph, note=payload.note)
+        except WorkflowChanged as e:
+            raise HTTPException(409, str(e)) from None
     await session.commit()
     await session.refresh(workflow)
     return await _workflow_out(session, workflow)
@@ -560,19 +564,8 @@ def _unparsed(graph: Any) -> str:
     return "无法解析工作流结构"
 
 
-async def gate_issues(session: AsyncSession, graph: Any, level: str) -> list[dict[str, Any]] | None:
-    """发布这张图会遇到的问题（validate + 门禁），只读：不改库、不发布。图不成形时为 None。
-    发布接口和发布单的预检（blueprints/publish_plan.py）共用，口径只有这一份。"""
-    try:
-        spec = GraphSpec.model_validate(graph)
-    except Exception:  # noqa: BLE001
-        return None
-    checkers = await _sql_checkers(session, spec)
-    providers = await _providers(session, spec)
-    with with_subgraphs(await load_subgraphs(session, spec)):
-        issues = [i.model_dump() for i in publish_issues(spec, level=level, checkers=checkers, providers=providers)]
-    # 这一版直接引用的表上还没处理的结构变化（next-round 03 B1）：只是警告，不拦发布
-    return issues + await open_structure_issues(session, spec)
+# 保留导出供旧调用方使用，发布预检的实现位于应用服务。
+from app.apps.validation import gate_issues
 
 
 async def commit_publish(session: AsyncSession, workflow: Workflow, snapshot: WorkflowVersion, level: str,

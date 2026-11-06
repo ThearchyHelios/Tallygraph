@@ -392,6 +392,13 @@ export interface CaliberMetric {
   format?: string
   /** 公式（formula）、外部常量（external）、单元格条件规则（rule）、评估（assessment） */
   kind?: string
+  grain?: string
+  time_field?: string
+  numerator?: string
+  denominator?: string
+  dimensions?: string[]
+  filters?: string[]
+  contract?: Record<string, unknown>
   /** 定义卡：文字定义、范围、排除项、负责人、生效日期、引用 */
   definition?: { text?: string; scope?: string; exclusions?: string[]; owner?: string; effective_from?: string; citations?: unknown[] }
   params?: { name: string; type: string; default?: unknown; min?: number; max?: number }[]
@@ -404,6 +411,7 @@ export interface CaliberDescriptor {
   version: number
   level: string
   graph_hash?: string | null
+  semantic_hash?: string | null
   card: { node_id: string; title: string; caliber?: string | null; caliber_version?: string | null }
   metrics: CaliberMetric[]
   entry_schema: FormSchema
@@ -424,28 +432,53 @@ export interface CaliberDescriptor {
   }
 }
 
+export interface ValidationCheck {
+  code: string
+  status: 'pass' | 'fail' | 'unknown'
+  detail: string
+  metric_id?: string
+  name?: string
+}
+
+export interface QualityReport {
+  status: 'pass' | 'fail' | 'unknown'
+  checks: ValidationCheck[]
+}
+
 export interface CaliberTrialMetric extends CaliberMetric {
+  quality?: QualityReport
+  masked?: boolean
   value?: unknown
   rendered?: string
 }
 
 /** POST /api/ledger/calibers/{wf}/{version}/{node}/trial：按固定版本试跑一次 */
 export interface CaliberTrialOut {
+  validation?: QualityReport
   run_id: string
   status: string
   output?: Record<string, unknown> | null
   error?: string | null
   metrics: CaliberTrialMetric[]
+  /** 这次试运行各取数节点读到的表；旧服务端没有 */
+  queries?: DraftTrialQuery[]
 }
 
 // ---------------------------------------------------------------- 从业务文档起草口径
 
 /**
- * 草稿的状态（app/ledger/docdraft.STATUSES）：起草中 → 待确认问题 / 待接数据路径 / 待签字发布 → 已接上；
- * 另有已驳回。ready 表示图已经生成、没有未决问题，可以试运行、可以签字发布；questions_open 也有图和数，
+ * 草稿的细状态（app/ledger/docdraft.STATUSES）：起草中 → 待确认问题 / 待接数据路径 / 待签字发布 → 已接上；
+ * 另有已驳回。界面不再逐个画这些状态，按 CaliberDraftStage 折成四种阶段；细状态留在标签的悬停提示里。
+ * ready 表示图已经生成、没有未决问题，可以试运行、可以签字发布；questions_open 也有图和数，
  * 只是还没清完问题，不阻断试运行。path_pending 是旧路径：图还没生成，取数只能来自一次真实运行。
  */
 export type CaliberDraftStatus = 'drafting' | 'questions_open' | 'path_pending' | 'ready' | 'attached' | 'rejected' | 'failed'
+
+/**
+ * 界面上的阶段（服务端 stage）：起草中 / 待审 / 已丢弃 / 失败。ready、questions_open、path_pending、attached
+ * 都归「待审」；细状态仍照实给，需要说清楚时用 status。
+ */
+export type CaliberDraftStage = 'drafting' | 'review' | 'discarded' | 'failed'
 
 /** 一条引用：逐字原文、原文所在段落（chunk）、段号、span 是原文里的 [start, end) */
 export interface DraftCitation {
@@ -467,7 +500,7 @@ export interface DraftDefinition {
   citations?: DraftCitation[]
 }
 
-/** 草稿里的一条指标：业务定义 + 取数表达式；SQL 在画布上看，这里不返回。 */
+/** 草稿里的一条指标：业务定义 + 取数表达式；取数 SQL 在草稿图上（CaliberDraft.sql），这里不返回。 */
 export interface DraftMetric {
   id?: string
   name: string
@@ -477,6 +510,7 @@ export interface DraftMetric {
   decimals?: number
   /** 指标表达式，形如 cell(nodes.fetch_1, 0, '列')；一组取数时节点 id 是 fetch */
   expression?: string
+  contract?: Record<string, unknown>
   /** 粒度，如「日」「订单行」 */
   grain?: string
   /** 业务时间字段的业务叫法 */
@@ -501,28 +535,58 @@ export interface DraftEntryField {
 /**
  * 试运行的状态：还会缺必填入口字段（needs_input），这时不跑，等人填了再发起；needs_input 没有 run_id。
  */
-export type DraftTrialStatus = 'running' | 'succeeded' | 'failed' | 'needs_input'
+export type DraftTrialStatus = 'running' | 'succeeded' | 'failed' | 'needs_input' | 'stale'
 
 /** 起草后自动发起的那次只读试运行（draft.payload.trial） */
 export interface DraftTrial {
   run_id: string
   status: DraftTrialStatus
   error?: string
+  version?: number
+  graph_hash?: string
+  execution_hash?: string
+  inputs_hash?: string
 }
 
 /** GET /api/ledger/drafts/{id}/trial 的一条：name 和 rendered 一一对应 */
 export interface DraftTrialMetric {
+  quality?: QualityReport
+  masked?: boolean
   id: string
   name: string
   value?: unknown
   rendered?: string
 }
 
+/**
+ * 一次试运行里某个取数节点读到的一张表：列头、前几行、总行数；截断时只带回前若干行，
+ * 遮罩过的格子在 rows 里已经是「已遮罩」这样的字样，页面照原样显示。
+ */
+export interface DraftTrialQuery {
+  node_id: string
+  /** 这张表是查还是别的工具拿到的（旧服务端可能没有） */
+  tool?: string
+  /** 取数用的数据源 */
+  source?: string
+  columns: string[]
+  rows: unknown[][]
+  total_rows: number
+  /** 只带回了前若干行 */
+  truncated?: boolean
+  source_truncated?: boolean
+  preview_truncated?: boolean
+  /** 遮罩过的列名；格子本身已经是遮罩后的字样 */
+  masked?: string[]
+}
+
 /** GET /api/ledger/drafts/{id}/trial：这次自动试运行的状态和每个指标的值；POST 同一个路径按填好的入口字段再发起一次 */
 export interface DraftTrialOut {
+  validation?: QualityReport
   run_id: string
   status: DraftTrialStatus
   metrics: DraftTrialMetric[]
+  /** 这次试运行各取数节点读到的表；旧服务端和旧草稿没有 */
+  queries?: DraftTrialQuery[]
   error?: string | null
 }
 
@@ -551,6 +615,8 @@ export interface CaliberDraftSummary {
   id: string
   title: string
   status: CaliberDraftStatus
+  /** 服务端算的界面阶段；旧服务端没有，页面按 status 推 */
+  stage?: CaliberDraftStage
   metric_count: number
   question_count: number
   workflow_id: string | null
@@ -565,25 +631,48 @@ export interface DraftProgress {
   uncovered: number
 }
 
+/** 发布前检查的一项：服务端从图和试跑状态算出来，只读，不拦人 */
+export interface DraftCheck {
+  key: string
+  label: string
+  ok: boolean
+  detail?: string
+}
+
+/** 草稿图里一组取数：一条 SQL 出哪几个指标（metric_ids 对应 DraftMetric.id） */
+export interface DraftGroup {
+  sql: string
+  entry_fields?: DraftEntryField[]
+  metric_ids?: string[]
+}
+
 /** GET /api/ledger/drafts/{id}：payload 摊平在上层（documents / metrics / dropped / open_questions / alignment） */
 export interface CaliberDraft extends CaliberDraftSummary {
+  job?: { status: string; attempt: number; error?: string | null; retryable: boolean }
+
   documents?: DraftDocument[]
   metrics?: DraftMetric[]
   /** 草稿图的入口字段 */
   entry_fields?: DraftEntryField[]
   /** 入口字段在各组里声明不一致的地方（必填取并集、类型取更宽），合并时记下的说明 */
   entry_notes?: string[]
+  /** 草稿图里的取数 SQL 模板：入口字段在运行时渲染；页面只读展示，不出现执行值 */
+  sql?: string | null
   dropped?: DraftDropped[]
   open_questions?: string[]
   /** 还没有起草出来的指标名称：续跑跑到轮数上限或没有新指标后剩下的，可以再起一份 */
   uncovered?: string[]
   /** 这张草稿图有几个取数节点（fetch_1、fetch_2…）：多组指标共用一张口径卡 */
   blocks?: number
+  /** 逐组取数：每条 SQL 出哪几个指标；旧草稿没有，页面回退到拼接的 sql 字段 */
+  groups?: DraftGroup[]
   /** 多轮续跑的进度；旧草稿没有 */
   progress?: DraftProgress
   /** 模型回复被截断，指标是从完整片段里抢救出来的 */
   salvaged?: boolean
   alignment?: DraftAlignment
+  /** 发布前检查；旧草稿没有图时不给 */
+  checks?: DraftCheck[]
   /** 起草后自动发起的那次只读试运行；旧草稿可能没有 */
   trial?: DraftTrial | null
   /** 草稿图对应的版本号 */

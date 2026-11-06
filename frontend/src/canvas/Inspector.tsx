@@ -1924,16 +1924,146 @@ function CaseList({ nodeId, mode, value, issues, onChange }: {
   )
 }
 
+/** 指标类型：和 engine/schema.py 的 METRIC_KINDS 同一组；公式是缺省类型，不写进配置 */
+const METRIC_KIND_OPTIONS = [
+  { value: 'formula', label: '公式' },
+  { value: 'external', label: '外部常量' },
+  { value: 'rule', label: '规则' },
+  { value: 'assessment', label: '评估' },
+] as const
+
+type MetricKind = (typeof METRIC_KIND_OPTIONS)[number]['value']
+
+/** 列表字段写成一行「、」分隔；空值不显示 */
+function listText(value: any): string {
+  return Array.isArray(value) ? value.filter((v) => typeof v === 'string' && v.trim()).join('、') : ''
+}
+
+/** 同义词一行拆成列表：顿号、逗号、换行都算分隔 */
+function splitItems(text: string): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const part of text.split(/[、,，\n]/)) {
+    const item = part.trim()
+    if (item && !seen.has(item)) { seen.add(item); out.push(item) }
+  }
+  return out
+}
+
+/** 多行文本拆成列表：每行一条，空行不要 */
+function lineItems(text: string): string[] {
+  return text.split('\n').map((line) => line.trim()).filter(Boolean)
+}
+
+/** 数字框：没填就删键，不把空串写成 0 */
+function numberText(value: any): string {
+  return typeof value === 'number' && Number.isFinite(value) ? String(value) : ''
+}
+
+function numberValue(text: string): number | undefined {
+  if (!text.trim()) return undefined
+  const value = Number(text)
+  return Number.isFinite(value) ? value : undefined
+}
+
+/**
+ * 指标定义卡：一条指标由「定义」和「计算」组成。
+ *
+ * 计算按类型分四种：公式用表达式；外部常量直接给值；规则与评估的结构字段用 JSON 编辑（形状见 engine/schema.py
+ * 的 metric_definition_issues）。定义是业务说法：名称、同义词、单位、小数位、定义说明、适用范围、负责人、生效日期、
+ * 不包含的情况。引用原文（citations）由文档起草逐字核对后留下，这里只读。
+ *
+ * 空值一律删键：schema 把空串当成写了值，会和「没写」分不开。
+ */
 function MetricList({ nodeId, value, issues, onChange }: {
   nodeId: string; value: any[]; issues: FieldIssue[]; onChange: (v: any[]) => void
 }) {
   const uid = useId()
+
+  /** 换掉一条指标对象：调用方先拼好，空值在下面几个 set 里已经删掉 */
+  const replace = (i: number, next: any) =>
+    onChange(value.map((m, idx) => (idx === i ? next : m)))
+
   const update = (i: number, patch: any) =>
     onChange(value.map((m, idx) => (idx === i ? { ...m, ...patch } : m)))
+
+  /** 类型只改 kind：切回公式时把 kind 删掉；其余结构字段原样留着，切回来不丢东西 */
+  const setKind = (i: number, kind: MetricKind) => {
+    const metric = value[i] ?? {}
+    const next = { ...metric }
+    if (kind === 'formula') delete next.kind
+    else next.kind = kind
+    replace(i, next)
+  }
+
+  /** 外部常量：值、来源、截止日期、过期天数；空对象删掉 */
+  const setExternal = (i: number, key: string, raw: any) => {
+    const metric = value[i] ?? {}
+    const external = { ...(metric.external && typeof metric.external === 'object' ? metric.external : {}) }
+    if (raw === undefined || raw === '') delete external[key]
+    else external[key] = key === 'stale_after_days' ? Math.trunc(raw) : raw
+    const next = { ...metric }
+    if (Object.keys(external).length) next.external = external
+    else delete next.external
+    replace(i, next)
+  }
+
+  /** 定义说明：除了 citations 之外的几个键；定义对象空了就删掉 */
+  const setDefinition = (i: number, key: string, raw: any) => {
+    const metric = value[i] ?? {}
+    const definition = { ...(metric.definition && typeof metric.definition === 'object' ? metric.definition : {}) }
+    if (raw === undefined || raw === '' || (Array.isArray(raw) && raw.length === 0)) delete definition[key]
+    else definition[key] = raw
+    const next = { ...metric }
+    if (Object.keys(definition).length) next.definition = definition
+    else delete next.definition
+    replace(i, next)
+  }
+
+  /** 规则 / 评估：整个对象交给 JSON 编辑；清空就删键 */
+  const setNested = (i: number, key: string, raw: any) => {
+    const metric = value[i] ?? {}
+    const next = { ...metric }
+    if (raw === undefined || raw === null) delete next[key]
+    else next[key] = raw
+    replace(i, next)
+  }
+
+  const setList = (i: number, key: string, text: string) => {
+    const metric = value[i] ?? {}
+    const items = key === 'exclusions' ? lineItems(text) : splitItems(text)
+    const next = { ...metric }
+    if (items.length) next[key] = items
+    else delete next[key]
+    replace(i, next)
+  }
+
+  const setNumber = (i: number, key: string, text: string, integer = false) => {
+    const raw = numberValue(text)
+    const metric = value[i] ?? {}
+    const next = { ...metric }
+    if (raw === undefined) delete next[key]
+    else next[key] = integer ? Math.trunc(raw) : raw
+    replace(i, next)
+  }
+
   return (
     <div>
       {value.map((m, i) => {
         const own = issues.filter((x) => x.at?.index === i)
+        const at = (sub: string) => own.filter((x) => x.at?.sub === sub || x.at?.sub?.startsWith(`${sub}.`))
+        const kind = (METRIC_KIND_OPTIONS.some((o) => o.value === m.kind) ? m.kind : 'formula') as MetricKind
+        const definition: Record<string, any> = m.definition && typeof m.definition === 'object' ? m.definition : {}
+        const external: Record<string, any> = m.external && typeof m.external === 'object' ? m.external : {}
+        const citations = Array.isArray(definition.citations) ? definition.citations.length : 0
+        const exclusions = Array.isArray(definition.exclusions)
+          ? definition.exclusions.filter((v: any) => typeof v === 'string' && v.trim()).join('\n') : ''
+        const rest = own.filter((x) => {
+          const base = x.at?.sub?.split('.')[0]
+          if (!base) return true
+          if (base === 'expression') return kind !== 'formula'
+          return !['kind', 'external', 'rule', 'assessment', 'definition', 'decimals', 'synonyms'].includes(base)
+        })
         return (
           <Row key={i} item={i} removeLabel={`删除指标 ${m.id || i + 1}`}
                tone={own.some((x) => x.level === 'error') ? 'error' : own.length ? 'warning' : undefined}
@@ -1952,12 +2082,134 @@ function MetricList({ nodeId, value, issues, onChange }: {
                        onChange={(e) => update(i, { unit: e.target.value })} />
               </Sub>
             </div>
-            <Sub label="计算" htmlFor={`${uid}-${i}-expr`} syntax="expression" sub="expression">
-              <TemplateText id={`${uid}-${i}-expr`} multiline={false} syntax="expression" nodeId={nodeId}
-                            className="text-xs" placeholder="round(vars.agg.amount / vars.agg.orders, 2)"
-                            value={m.expression ?? ''} onChange={(v) => update(i, { expression: v })} />
+            <div className="flex gap-1.5">
+              <Sub label="类型" htmlFor={`${uid}-${i}-kind`} className="min-w-0 flex-1" sub="kind">
+                <select id={`${uid}-${i}-kind`} className="field" value={kind}
+                        onChange={(e) => setKind(i, e.target.value as MetricKind)}>
+                  {METRIC_KIND_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </Sub>
+              <Sub label="小数位" htmlFor={`${uid}-${i}-decimals`} className="w-16 shrink-0" sub="decimals">
+                <input id={`${uid}-${i}-decimals`} type="number" min={0} max={8} className="field tnum"
+                       value={numberText(m.decimals)} placeholder="—"
+                       onChange={(e) => setNumber(i, 'decimals', e.target.value, true)} />
+              </Sub>
+            </div>
+            {at('kind').map((x, k) => <IssueLine key={`kind:${k}`} issue={x} />)}
+            {at('decimals').map((x, k) => <IssueLine key={`decimals:${k}`} issue={x} />)}
+            {kind === 'formula' && (
+              <>
+                <Sub label="计算" htmlFor={`${uid}-${i}-expr`} syntax="expression" sub="expression">
+                  <TemplateText id={`${uid}-${i}-expr`} multiline={false} syntax="expression" nodeId={nodeId}
+                                className="text-xs" placeholder="round(vars.agg.amount / vars.agg.orders, 2)"
+                                value={m.expression ?? ''} onChange={(v) => update(i, { expression: v })} />
+                </Sub>
+                {at('expression').map((x, k) => <IssueLine key={`expression:${k}`} issue={x} />)}
+              </>
+            )}
+            {kind === 'external' && (
+              <>
+                <p className="text-2xs leading-snug text-faint">外部常量不从查询计算，值由人填写。</p>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <Sub label="值" htmlFor={`${uid}-${i}-external-value`} sub="external.value">
+                    <input id={`${uid}-${i}-external-value`} type="number" step="any" className="field tnum"
+                           value={numberText(external.value)}
+                           onChange={(e) => setExternal(i, 'value', numberValue(e.target.value))} />
+                  </Sub>
+                  <Sub label="来源" htmlFor={`${uid}-${i}-external-source`} sub="external.source">
+                    <input id={`${uid}-${i}-external-source`} className="field" value={external.source ?? ''}
+                           onChange={(e) => setExternal(i, 'source', e.target.value)} />
+                  </Sub>
+                  <Sub label="截止日期" htmlFor={`${uid}-${i}-external-as-of`} sub="external.as_of">
+                    <input id={`${uid}-${i}-external-as-of`} className="field" placeholder="YYYY-MM-DD"
+                           value={external.as_of ?? ''}
+                           onChange={(e) => setExternal(i, 'as_of', e.target.value)} />
+                  </Sub>
+                  <Sub label="过期天数" htmlFor={`${uid}-${i}-external-days`} sub="external.stale_after_days">
+                    <input id={`${uid}-${i}-external-days`} type="number" min={0} className="field tnum"
+                           value={numberText(external.stale_after_days)}
+                           onChange={(e) => setExternal(i, 'stale_after_days', numberValue(e.target.value))} />
+                  </Sub>
+                </div>
+                {at('external').map((x, k) => <IssueLine key={`external:${k}`} issue={x} />)}
+              </>
+            )}
+            {kind === 'rule' && (
+              <>
+                <Sub label="规则结构（按 JSON 编辑）" htmlFor={`${uid}-${i}-rule`} sub="rule">
+                  <JsonInput id={`${uid}-${i}-rule`} value={m.rule} rows={6}
+                             onChange={(v) => setNested(i, 'rule', v)} />
+                </Sub>
+                <p className="text-2xs leading-snug text-faint">规则的输入、条件、成立与不成立时的取值都写在结构里。</p>
+                {at('rule').map((x, k) => <IssueLine key={`rule:${k}`} issue={x} />)}
+              </>
+            )}
+            {kind === 'assessment' && (
+              <>
+                <Sub label="评估结构（按 JSON 编辑）" htmlFor={`${uid}-${i}-assessment`} sub="assessment">
+                  <JsonInput id={`${uid}-${i}-assessment`} value={m.assessment} rows={6}
+                             onChange={(v) => setNested(i, 'assessment', v)} />
+                </Sub>
+                <p className="text-2xs leading-snug text-faint">评估按维度加权评分，再按分数落等级。</p>
+                {at('assessment').map((x, k) => <IssueLine key={`assessment:${k}`} issue={x} />)}
+              </>
+            )}
+            <details className="rounded border bg-panel px-2 py-1.5" data-metric-contract="">
+              <summary className="cursor-pointer text-2xs text-dim">计算约束</summary>
+              <Sub label="结果形状、粒度和取值约束" htmlFor={`${uid}-${i}-contract`} sub="contract">
+                <JsonInput id={`${uid}-${i}-contract`} value={m.contract} rows={5}
+                           onChange={(v) => setNested(i, 'contract', v)} />
+              </Sub>
+              <p className="text-2xs leading-snug text-faint">
+                shape 选 scalar 时要求查询恰好一行；grain 指定唯一粒度列，non_null 指定非空列，minimum / maximum 限制取值。
+                ratio 可指定同一查询中的 numerator、denominator 列及 scale 换算倍率；subset 为 true 时检查分子不超过分母。
+                业务描述与 SQL 的一致性仍需审阅。
+              </p>
+              {at('contract').map((x, k) => <IssueLine key={`contract:${k}`} issue={x} />)}
+            </details>
+            <Sub label="同义词（逗号分隔）" htmlFor={`${uid}-${i}-synonyms`} sub="synonyms">
+              <input id={`${uid}-${i}-synonyms`} className="field" value={listText(m.synonyms)}
+                     onChange={(e) => setList(i, 'synonyms', e.target.value)} />
             </Sub>
-            {own.map((x, k) => <IssueLine key={k} issue={x} />)}
+            {at('synonyms').map((x, k) => <IssueLine key={`synonyms:${k}`} issue={x} />)}
+            <details className="rounded border bg-panel px-2 py-1.5" data-metric-definition="">
+              <summary className="cursor-pointer text-2xs text-dim">定义说明与出处</summary>
+              <div className="mt-1.5 space-y-1.5">
+                <Sub label="定义说明" htmlFor={`${uid}-${i}-def-text`} sub="definition.text">
+                  <textarea id={`${uid}-${i}-def-text`} className="field text-xs" rows={3}
+                            value={definition.text ?? ''}
+                            onChange={(e) => setDefinition(i, 'text', e.target.value)} />
+                </Sub>
+                <div className="flex gap-1.5">
+                  <Sub label="适用范围" htmlFor={`${uid}-${i}-def-scope`} className="min-w-0 flex-1" sub="definition.scope">
+                    <input id={`${uid}-${i}-def-scope`} className="field" value={definition.scope ?? ''}
+                           onChange={(e) => setDefinition(i, 'scope', e.target.value)} />
+                  </Sub>
+                  <Sub label="负责人" htmlFor={`${uid}-${i}-def-owner`} className="min-w-0 flex-1" sub="definition.owner">
+                    <input id={`${uid}-${i}-def-owner`} className="field" value={definition.owner ?? ''}
+                           onChange={(e) => setDefinition(i, 'owner', e.target.value)} />
+                  </Sub>
+                </div>
+                <Sub label="生效日期" htmlFor={`${uid}-${i}-def-from`} sub="definition.effective_from">
+                  <input id={`${uid}-${i}-def-from`} className="field" placeholder="YYYY-MM-DD"
+                         value={definition.effective_from ?? ''}
+                         onChange={(e) => setDefinition(i, 'effective_from', e.target.value)} />
+                </Sub>
+                <Sub label="不包含（每行一条）" htmlFor={`${uid}-${i}-def-exclusions`} sub="definition.exclusions">
+                  <textarea id={`${uid}-${i}-def-exclusions`} className="field text-xs" rows={2}
+                            value={exclusions} onChange={(e) => setDefinition(i, 'exclusions', lineItems(e.target.value))} />
+                </Sub>
+                {citations > 0 && (
+                  <p className="text-2xs leading-snug text-faint">
+                    引用原文 {citations} 条，起草时逐字核对过；这里只读。
+                  </p>
+                )}
+                {at('definition').map((x, k) => <IssueLine key={`definition:${k}`} issue={x} />)}
+              </div>
+            </details>
+            {rest.map((x, k) => <IssueLine key={`rest:${k}`} issue={x} />)}
           </Row>
         )
       })}

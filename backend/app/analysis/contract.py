@@ -41,15 +41,15 @@ MODES: dict[str, tuple[str, ...]] = {
 }
 #: 每个算子（和模式）的方法名与版本：改算法就升版本号，结论里记下实际用的那一版
 METHODS: dict[tuple[str, str | None], str] = {
-    ("decompose", "additive"): "decompose.additive@1",
-    ("decompose", "ratio"): "decompose.ratio@1",
-    ("decompose", "factor"): "decompose.factor@1",
-    ("baseline", None): "baseline.robust@1",
-    ("trend", None): "trend.theil_sen_mk@1",
-    ("differ", "rate"): "differ.rate@1",
-    ("differ", "mean"): "differ.welch@1",
-    ("differ", "rows"): "differ.welch_rows@1",
-    ("comparable", None): "comparable@1",
+    ("decompose", "additive"): "decompose.additive@2",
+    ("decompose", "ratio"): "decompose.ratio@2",
+    ("decompose", "factor"): "decompose.factor@2",
+    ("baseline", None): "baseline.robust@2",
+    ("trend", None): "trend.theil_sen_mk@2",
+    ("differ", "rate"): "differ.rate@2",
+    ("differ", "mean"): "differ.welch@2",
+    ("differ", "rows"): "differ.welch_rows@2",
+    ("comparable", None): "comparable@2",
 }
 #: agent 分析工具的名字（tools/builtin 里注册），一个算子一个工具：参数各自聚焦，模型少写错
 TOOL_NAMES: dict[str, str] = {op: f"analysis_{op}" for op in OPS}

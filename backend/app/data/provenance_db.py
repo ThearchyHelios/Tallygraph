@@ -93,8 +93,8 @@ def view_of(snapshot: SourceSnapshot, *, source_name: str) -> SourceView:
 
 
 async def compile_facts(view: SourceView, sql: str) -> CompileFacts:
-    """在查询读过的同一个文件上编译原 SQL（EXPLAIN，不执行），给出与解析无关的三项事实（R15）：
-    授权回调报出读了哪些表、字节码里 ResultRow 和 Yield 各有几个。
+    """在查询读过的同一个文件上编译原 SQL（EXPLAIN，不执行），给出与解析无关的事实（R15）：
+    授权回调报出读了哪些表、编译了几个 SELECT，字节码里 ResultRow 和 Yield 各有几个。
 
     步骤：经 EngineCache 取引擎（首次时整份核对哈希）→ **同步**取 engines.pinned(view)（中间没有 await，不会被 LRU
     挤掉）→ 在线程里：比指纹 → 单开 immutable 只读连接（和 EngineCache 打开快照的方式相同）→ 装授权回调、EXPLAIN
@@ -115,12 +115,16 @@ def _compile(path: str, pinned: engine_mod.Fingerprint, sql: str) -> CompileFact
     if _fingerprint(path) != pinned:
         raise SnapshotTampered(_REPLACED)
     reads: set[str] = set()
+    selects = 0
 
     def observe(action: int, arg1: str | None, _arg2: str | None, _db: str | None, _trigger: str | None) -> int:
+        nonlocal selects
         # SQLITE_READ 的 arg1 是表名（建表时的写法）。子查询、自连接读到的表都会报出来，改名、CTE 报的和合法写法
         # 一样（P4-SPEC 2.4 末尾），所以这只是兜底，主判据仍是识别器
         if action == sqlite3.SQLITE_READ and arg1:
             reads.add(arg1)
+        if action == sqlite3.SQLITE_SELECT:
+            selects += 1
         return sqlite3.SQLITE_OK
 
     conn = open_checked_sqlite(path, readonly=True, immutable=True)
@@ -131,7 +135,7 @@ def _compile(path: str, pinned: engine_mod.Fingerprint, sql: str) -> CompileFact
         conn.close()
     if _fingerprint(path) != pinned:
         raise SnapshotTampered(_REPLACED)
-    return CompileFacts(tables=reads, result_rows=opcodes.count("ResultRow"), yields=opcodes.count("Yield"))
+    return CompileFacts(tables=reads, result_rows=opcodes.count("ResultRow"), yields=opcodes.count("Yield"), selects=selects)
 
 
 # --------------------------------------------------------------------------

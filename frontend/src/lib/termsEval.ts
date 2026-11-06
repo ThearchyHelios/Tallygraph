@@ -153,7 +153,7 @@ export const EVAL_TEXT = {
   expectation: {
     kind: {
       scalar: '一个数', table: '多行', set: '名单', none: '没有数据', ask: '反问', text: '文字要点', contribution: '贡献',
-      verdict: '判定',
+      verdict: '判定', investigation: '调查过程',
     } as Record<EvalExpectationKind, string>,
     scalarCell: (column: string, row: number) => `「${column}」第 ${row + 1} 行`,
     scalarWhere: (column: string, where: string) => `「${column}」（${where}）`,

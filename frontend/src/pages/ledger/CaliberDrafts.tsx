@@ -11,41 +11,48 @@
  *   （第 N 段），逐条的未决问题可以勾掉；被丢弃的条目单独列出原因；入口字段列出名字、类型、必填和缺省值；
  * - 发布：主按钮去画布审改并发布。「接上一次运行」只是辅助入口：已经有答案时让它认这份定义。
  *
- * 页面不显示 SQL，取数到画布上看。状态由服务端算（还有问题 → questions_open，否则 ready；旧路径可能停在 path_pending），
- * 页面只按状态画。
+ * 页面不显示执行值：取数 SQL 只作为模板只读展示，具体取数到画布上看。服务端把细状态折成四种阶段（起草中 / 待审 /
+ * 已丢弃 / 失败），页面按阶段筛、按阶段画；细状态放在标签的悬停提示里。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ChevronLeft, FileText, PenLine, Play, RefreshCw, ScrollText } from 'lucide-react'
+import { AlertTriangle, Check, ChevronLeft, FileText, PenLine, Play, RefreshCw, ScrollText } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../../api/client'
 import { EmptyState, ErrorState, Notice, PageHeader, Skeleton, Spinner, promptDialog, toast } from '../../components/ui'
 import { formatDateTime, formatTime } from '../../lib/format'
 import { LEDGER_UI } from '../../lib/termsLedger'
+import { TrialResult, TrialValidation } from './TrialResult'
 import type { DataSourceName, KbDocument, Run } from '../../types'
 import type {
-  CaliberDraft, CaliberDraftStatus, CaliberDraftSummary, DraftAlignment, DraftCitation, DraftEntryField, DraftMetric,
-  DraftTrialMetric, DraftTrialOut,
+  CaliberDraft, CaliberDraftStage, CaliberDraftStatus, CaliberDraftSummary, DraftAlignment, DraftCitation, DraftEntryField,
+  DraftMetric, DraftTrialMetric, DraftTrialOut,
 } from '../../typesLedger'
 
 const D = LEDGER_UI.drafts
 
-/** 列表的状态筛：全部加七种状态；起草中也会停留几分钟，可以单独筛出来看 */
-type Filter = '' | CaliberDraftStatus
-const FILTERS: Filter[] = ['', 'drafting', 'ready', 'questions_open', 'path_pending', 'attached', 'rejected', 'failed']
+/** 列表按阶段筛：全部、起草中、待审、已丢弃、失败；细状态不再单独占筛选项 */
+type Filter = '' | CaliberDraftStage
+const FILTERS: Filter[] = ['', 'drafting', 'review', 'discarded', 'failed']
+
+/** 细状态 → 界面阶段；旧服务端没有 stage 时按 status 推，页面不会因为少一个字段就空 */
+const stageOf = (draft: CaliberDraftSummary | CaliberDraft): CaliberDraftStage =>
+  draft.stage ?? (draft.status === 'drafting' ? 'drafting' : draft.status === 'rejected' ? 'discarded'
+    : draft.status === 'failed' ? 'failed' : 'review')
 
 /** 起草轮询：每两秒一次，多轮续跑要几分钟，最多等十分钟 */
 const DRAFT_POLL_MS = 2_000
 const DRAFT_POLL_LIMIT_MS = 15 * 60_000
 
-/** 状态标签：起草中 / 待签字发布 / 待确认问题 / 待接数据路径 / 已接上 / 已驳回 / 起草失败 */
-function StatusPill({ status }: { status: CaliberDraftStatus }) {
-  const color = status === 'ready' || status === 'attached' ? 'var(--ok)' : status === 'rejected' ? 'var(--text-faint)'
-    : status === 'drafting' ? 'var(--accent)' : status === 'failed' ? 'var(--err)' : 'var(--warn)'
+/** 阶段标签：起草中 / 待审 / 已丢弃 / 起草失败；细状态放在 title 里，鼠标悬停能看到「待确认问题」这类差别 */
+function StatusPill({ stage, status }: { stage: CaliberDraftStage; status?: CaliberDraftStatus }) {
+  const color = stage === 'review'
+    ? (status === 'ready' || status === 'attached' ? 'var(--ok)' : 'var(--warn)')
+    : stage === 'drafting' ? 'var(--accent)' : stage === 'discarded' ? 'var(--text-faint)' : 'var(--err)'
   return (
-    <span className="shrink-0 rounded border px-1.5 py-0.5 text-[10px]"
+    <span className="shrink-0 rounded border px-1.5 py-0.5 text-[10px]" title={status ? D.status[status] : undefined}
           style={{ color, borderColor: `color-mix(in srgb, ${color} 40%, var(--border))` }}>
-      {D.status[status] ?? status}
+      {D.stage[stage] ?? stage}
     </span>
   )
 }
@@ -207,6 +214,8 @@ export function CaliberDrafts() {
   const [trialPollId, setTrialPollId] = useState<string | null>(null)
   const [trialTimedOut, setTrialTimedOut] = useState(false)
   const [trialError, setTrialError] = useState<unknown>(null)
+  const [jobError, setJobError] = useState<unknown>(null)
+  const [jobBusy, setJobBusy] = useState<string | null>(null)
 
   /** 试运行的表单值：入口字段可改，必填没填满时按钮禁用；prefilled 记哪些是页面替人预填的 */
   const [entryValues, setEntryValues] = useState<Record<string, string>>({})
@@ -270,6 +279,7 @@ export function CaliberDrafts() {
     setTrialPollId(null)
     setTrialTimedOut(false)
     setTrialError(null)
+    setJobError(null)
     try {
       const draft = await api.caliberLedger.draft(id)
       if (seq !== openSeq.current) return
@@ -322,7 +332,7 @@ export function CaliberDrafts() {
     const run = detail?.trial?.run_id
     if (!id || !run) return
     let alive = true
-    setTrial((cur) => (cur?.run_id === run ? cur : {
+    setTrial((cur) => (cur?.run_id === run && detail?.trial?.status !== 'stale' ? cur : {
       run_id: run, status: detail?.trial?.status ?? 'running', metrics: [], error: detail?.trial?.error ?? '',
     }))
     api.caliberLedger.draftTrial(id).then((out) => {
@@ -337,7 +347,7 @@ export function CaliberDrafts() {
       setTrialPollId(null)
     })
     return () => { alive = false }
-  }, [detail?.id, detail?.trial?.run_id])
+  }, [detail?.id, detail?.version, detail?.trial?.run_id, detail?.trial?.status])
 
   /** 试运行还在跑：每两秒取一次，超过一分钟就停；收尾时顺带刷新详情（状态可能已变成待签字发布） */
   useEffect(() => {
@@ -378,7 +388,7 @@ export function CaliberDrafts() {
   }, [detail, ensureChunks])
 
   const shown = useMemo(
-    () => (drafts ?? []).filter((d) => !filter || d.status === filter),
+    () => (drafts ?? []).filter((d) => !filter || stageOf(d) === filter),
     [drafts, filter],
   )
 
@@ -528,6 +538,8 @@ export function CaliberDrafts() {
       setTrial(out)
       setTrialTimedOut(false)
       if (out.status === 'running' && out.run_id) setTrialPollId(draft.id)
+      const fresh = await api.caliberLedger.draft(draft.id)
+      setDetail((cur) => cur?.id === fresh.id ? fresh : cur)
     } catch (e) {
       setTrialError(e)
     } finally {
@@ -535,15 +547,36 @@ export function CaliberDrafts() {
     }
   }
 
+  const changeDraftJob = async (draft: CaliberDraft, action: 'retry' | 'stop') => {
+    const seq = openSeq.current
+    setJobBusy(draft.id)
+    setJobError(null)
+    try {
+      if (action === 'retry') await api.caliberLedger.retryDraft(draft.id)
+      else await api.caliberLedger.stopDraft(draft.id)
+      const fresh = await api.caliberLedger.draft(draft.id)
+      if (seq === openSeq.current) {
+        setDetail(fresh)
+        if (fresh.status === 'drafting') { setPollTimedOut(false); setPollingId(draft.id) }
+        else setPollingId(null)
+      }
+      await loadList()
+    } catch (error) {
+      if (seq === openSeq.current) setJobError(error)
+    } finally {
+      setJobBusy((id) => id === draft.id ? null : id)
+    }
+  }
+
   /** 自动试运行：状态、每个指标的值（名字和值成对）、失败原因；没有试运行就整块不画 */
   const renderTrial = (draft: CaliberDraft) => {
-    const status = trial?.status ?? draft.trial?.status
+    const status = draft.trial?.status === 'stale' ? 'stale' : trial?.status ?? draft.trial?.status
     if (!status) return null
     const rows = trial?.metrics ?? []
-    const color = status === 'succeeded' ? 'var(--ok)' : status === 'failed' ? 'var(--err)'
-      : status === 'needs_input' ? 'var(--warn)' : 'var(--accent)'
+    const color = status === 'succeeded' ? (trial?.validation?.status === 'pass' ? 'var(--ok)' : 'var(--warn)') : status === 'failed' ? 'var(--err)'
+      : status === 'needs_input' || status === 'stale' ? 'var(--warn)' : 'var(--accent)'
     const label = status === 'succeeded' ? D.trialSucceeded : status === 'failed' ? D.trialFailed
-      : status === 'needs_input' ? D.trialNeedsInput : D.trialRunning
+      : status === 'needs_input' ? D.trialNeedsInput : status === 'stale' ? D.trialStale : D.trialRunning
     const unitOf = (id: string) => (draft.metrics ?? []).find((m) => m.id === id)?.unit
     return (
       <div className="rounded-md border bg-elev px-3 py-2" data-draft-trial={status}>
@@ -573,24 +606,104 @@ export function CaliberDrafts() {
             {D.trialNeedsInputHint}：{trial?.error || draft.trial?.error || ''}
           </p>
         )}
-        {status === 'succeeded' && (rows.length > 0 ? (
-          <ul className="mt-1 grid gap-x-4 gap-y-0.5 text-2xs sm:grid-cols-[1fr_auto]">
-            {rows.map((row) => {
-              const unit = unitOf(row.id)
-              return (
-                <li key={row.id} className="contents" data-draft-trial-metric={row.id}>
-                  <span className="text-dim [overflow-wrap:anywhere]">{row.name || row.id}</span>
-                  <span className="tnum text-right font-medium">
-                    {row.rendered ?? (row.value == null ? '—' : String(row.value))}{unit ? ` ${unit}` : ''}
-                  </span>
-                </li>
-              )
-            })}
-          </ul>
-        ) : (
-          <p className="mt-1 text-2xs text-faint">{D.trialNoMetrics}</p>
-        ))}
+        {status === 'stale' && <p className="mt-1 text-2xs text-dim">{D.trialStaleHint}</p>}
+        {status === 'succeeded' && (
+          <>
+            {rows.length > 0 ? (
+              <ul className="mt-1 grid gap-x-4 gap-y-0.5 text-2xs sm:grid-cols-[1fr_auto]">
+                {rows.map((row) => {
+                  const unit = unitOf(row.id)
+                  return (
+                    <li key={row.id} className="contents" data-draft-trial-metric={row.id}>
+                      <span className="text-dim [overflow-wrap:anywhere]">{row.name || row.id}</span>
+                      <span className="tnum text-right font-medium">
+                        {row.rendered ?? (row.value == null ? '—' : String(row.value))}{unit ? ` ${unit}` : ''}
+                      </span>
+                    </li>
+                  )
+                })}
+              </ul>
+            ) : (
+              <p className="mt-1 text-2xs text-faint">{D.trialNoMetrics}</p>
+            )}
+            <TrialValidation report={trial?.validation} />
+            <TrialResult queries={trial?.queries} />
+          </>
+        )}
         {trialError != null && <div className="mt-1"><Notice tone="warn">{D.trialUnavailable}</Notice></div>}
+      </div>
+    )
+  }
+
+  /**
+   * 取数 SQL：草稿图里写好的模板，入口字段在运行时渲染；只读展示，不出现执行值。
+   * 默认折叠，SQL 可能为空（旧草稿、没写出取数），那时整块不画。
+   */
+  const renderSql = (draft: CaliberDraft) => {
+    const groups = (draft.groups ?? []).filter((group) => (group.sql ?? '').trim())
+    const sql = (draft.sql ?? '').trim()
+    if (!groups.length && !sql) return null
+    const names = new Map((draft.metrics ?? []).filter((metric) => metric.id)
+      .map((metric) => [metric.id as string, metric.name]))
+    return (
+      <details className="rounded-md border bg-elev px-3 py-2" data-draft-sql="">
+        <summary className="cursor-pointer text-2xs font-semibold text-dim">{D.sqlTitle}</summary>
+        <p className="mt-0.5 text-2xs leading-relaxed text-faint">{D.sqlHint}</p>
+        {groups.length > 0 ? (
+          <div className="mt-1 space-y-2">
+            {groups.map((group, index) => (
+              <div key={`${index}:${group.sql}`} className="rounded bg-panel px-2 py-1.5"
+                   data-draft-sql-group={index}>
+                <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-2xs">
+                  <span className="font-medium text-dim">{D.sqlGroup(index + 1, group.metric_ids?.length ?? 0)}</span>
+                  {!!group.metric_ids?.length && (
+                    <span className="text-faint [overflow-wrap:anywhere]">
+                      {(group.metric_ids ?? []).map((id) => names.get(id) ?? id).join('、')}
+                    </span>
+                  )}
+                </div>
+                <div className="mt-1 overflow-x-auto">
+                  <code className="mono block whitespace-pre-wrap text-2xs leading-relaxed text-dim">{group.sql}</code>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="mt-1 overflow-x-auto rounded bg-panel px-2 py-1.5">
+            <code className="mono block whitespace-pre-wrap text-2xs leading-relaxed text-dim">{sql}</code>
+          </div>
+        )}
+      </details>
+    )
+  }
+
+  /** 发布前检查：服务端从图和试跑状态算，只读；未通过的不拦人，逐项写原因 */
+  const renderChecks = (draft: CaliberDraft) => {
+    const checks = draft.checks ?? []
+    if (!checks.length) return null
+    const passed = checks.filter((check) => check.ok).length
+    return (
+      <div className="rounded-md border bg-elev px-3 py-2" data-draft-checks="">
+        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+          <h3 className="text-2xs font-semibold text-dim">{D.checks}</h3>
+          <span className={clsx('tnum text-2xs', passed === checks.length ? 'text-[var(--ok)]' : 'text-[var(--warn)]')}>
+            {D.checksSummary(passed, checks.length)}
+          </span>
+        </div>
+        <ul className="mt-1 space-y-1">
+          {checks.map((check) => (
+            <li key={check.key} className="flex items-start gap-1.5 text-2xs leading-relaxed" data-draft-check={check.key}>
+              {check.ok ? <Check size={11} className="mt-px shrink-0 text-[var(--ok)]" aria-hidden />
+                : <AlertTriangle size={11} className="mt-px shrink-0 text-[var(--warn)]" aria-hidden />}
+              <span className="min-w-0 flex-1">
+                <span className={check.ok ? 'text-dim' : 'text-[var(--warn)]'}>{check.label}</span>
+                {!check.ok && <span className="text-faint">（{D.checkFail}）</span>}
+                {check.detail && <p className="mt-0.5 text-2xs text-faint [overflow-wrap:anywhere]">{check.detail}</p>}
+              </span>
+            </li>
+          ))}
+        </ul>
+        <p className="mt-1 text-2xs text-faint">{D.checksHint}</p>
       </div>
     )
   }
@@ -739,25 +852,28 @@ export function CaliberDrafts() {
   }
 
   const renderDetail = (draft: CaliberDraft) => {
+    const stage = stageOf(draft)
     const drafting = draft.status === 'drafting'
-    const terminal = draft.status === 'attached' || draft.status === 'rejected'
+    const terminal = stage === 'discarded'
+    const stageNote = stage === 'review' ? D.stageNote(draft.status) : ''
     const questions = draft.open_questions ?? []
     const dropped = draft.dropped ?? []
     const uncovered = draft.uncovered ?? []
     const metrics = draft.metrics ?? []
-    const values = new Map((trial?.metrics ?? []).map((row) => [row.id, row]))
+    const values = new Map((draft.trial?.status === 'stale' ? [] : trial?.metrics ?? []).map((row) => [row.id, row]))
     // 第一轮还没落库时服务端写的是空对象：没有轮次就不画，别显示「第 undefined 轮」
     const progress = draft.progress && typeof draft.progress.round === 'number' ? draft.progress : null
     return (
       <div className="space-y-3 border-t px-3 py-3" data-draft-detail="">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs text-faint">
-          <StatusPill status={draft.status} />
+          <StatusPill stage={stage} status={draft.status} />
+          {stageNote && <span>{stageNote}</span>}
           {!!draft.documents?.length && <span>{D.documentsUsed(draft.documents.length)}</span>}
           {typeof draft.blocks === 'number' && draft.blocks > 1 && <span>{D.blocks(draft.blocks)}</span>}
           {draft.created_at && <span title={formatDateTime(draft.created_at)}>{formatTime(draft.created_at)}</span>}
           {draft.created_by && <span>{D.createdBy(draft.created_by)}</span>}
           {draft.model_id && <span title={draft.model_id}>{D.model(draft.model_id)}</span>}
-          {draft.workflow_id && draft.status !== 'rejected' && (
+          {draft.workflow_id && stage !== 'discarded' && (
             <Link to={`/studio/${draft.workflow_id}`} className="text-accent hover:underline" data-draft-workflow="">
               {D.openWorkflow}{draft.workflow_name ? `：${draft.workflow_name}` : ''}
               {draft.version != null ? ` · ${D.workflowVersion(draft.version)}` : ''}
@@ -765,6 +881,13 @@ export function CaliberDrafts() {
           )}
         </div>
 
+        {(drafting || draft.job?.retryable || (draft.status === 'failed' && !draft.workflow_id)) && (
+          <div className="flex gap-2">
+            {drafting && <button className="btn btn-sm" disabled={jobBusy === draft.id} onClick={() => void changeDraftJob(draft, 'stop')}>停止起草</button>}
+            {!drafting && <button className="btn btn-sm" disabled={jobBusy === draft.id} onClick={() => void changeDraftJob(draft, 'retry')}>重试起草</button>}
+          </div>
+        )}
+        {jobError != null && <ErrorState error={jobError} compact />}
         {draft.error && (
           <Notice tone="err">
             {drafting ? D.draftingFailed : D.loadFailed}：{draft.error}
@@ -799,6 +922,7 @@ export function CaliberDrafts() {
 
         {renderTrial(draft)}
         {renderEntryFields(draft)}
+        {renderSql(draft)}
 
         <div>
           <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
@@ -854,7 +978,9 @@ export function CaliberDrafts() {
 
         {draft.alignment && <AlignmentBlock alignment={draft.alignment} />}
 
-        {!drafting && !terminal && draft.workflow_id && (
+        {renderChecks(draft)}
+
+        {!drafting && stage === 'review' && draft.workflow_id && (
           <div className="flex flex-wrap items-center gap-2" data-draft-publish="">
             <Link to={`/studio/${draft.workflow_id}`} className="btn btn-primary btn-sm">
               <PenLine size={12} aria-hidden /> {D.publish}
@@ -863,7 +989,7 @@ export function CaliberDrafts() {
           </div>
         )}
 
-        {!drafting && !terminal && (
+        {!drafting && stage === 'review' && draft.status !== 'attached' && (
           <details className="rounded-md border bg-elev px-3 py-2" data-draft-attach="">
             <summary className="cursor-pointer text-2xs font-semibold text-dim">{D.attach}</summary>
             <p className="mt-0.5 text-2xs leading-relaxed text-faint">{D.attachHint}</p>
@@ -1004,7 +1130,7 @@ export function CaliberDrafts() {
                       aria-pressed={filter === f} onClick={() => setFilter(f)} data-draft-filter={f || 'all'}>
                 {f ? D.filter[f] : D.filter.all}
                 {drafts && <span className="tnum ml-1 text-[10px] opacity-70">
-                  {f ? drafts.filter((d) => d.status === f).length : drafts.length}
+                  {f ? drafts.filter((d) => stageOf(d) === f).length : drafts.length}
                 </span>}
               </button>
             ))}
@@ -1036,7 +1162,7 @@ export function CaliberDrafts() {
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
                         <span className="text-sm font-medium [overflow-wrap:anywhere]">{draft.title}</span>
-                        <StatusPill status={draft.status} />
+                        <StatusPill stage={stageOf(draft)} status={draft.status} />
                         {draft.error && <span className="text-2xs text-[var(--err)]">{D.draftingFailed}</span>}
                       </div>
                       <div className="mt-0.5 text-2xs text-faint">

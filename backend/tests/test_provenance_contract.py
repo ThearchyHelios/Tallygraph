@@ -145,7 +145,7 @@ SHAPES: dict[str, list[tuple[str, object]]] = {
     "LocateProblem": [("code", REQ), ("detail", "")],
     "SumEqRule": [("table", REQ), ("total", REQ), ("parts", REQ), ("types", REQ)],
     "RelatedCheckPlan": [("check", REQ), ("rule", REQ)],
-    "CompileFacts": [("tables", REQ), ("result_rows", REQ), ("yields", REQ)],
+    "CompileFacts": [("tables", REQ), ("result_rows", REQ), ("yields", REQ), ("selects", 1)],
 }
 RESPONSE = ("ReportRef", "CellRef", "Reason", "Alert", "TableRef", "PeriodView", "AcceptanceView", "StateNote",
             "PartView", "VersionView", "FromCell", "YearSource", "CanonicalView", "Recheck", "CellSource",

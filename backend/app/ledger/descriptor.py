@@ -29,7 +29,7 @@ from app.tools.datasource import QUERY_PREFIX
 
 #: 指标只写口径卡配置里真有的这几个键
 METRIC_KEYS = ("id", "name", "unit", "decimals", "format", "kind", "definition", "params", "external", "rule",
-               "assessment", "synonyms")
+               "assessment", "synonyms", "grain", "time_field", "numerator", "denominator", "dimensions", "filters", "contract")
 
 
 async def list_calibers(session: AsyncSession, *, workflow_id: str | None = None) -> list[dict[str, Any]]:
@@ -88,6 +88,8 @@ async def _describe(session: AsyncSession, workflow: Workflow, row: Any, node_id
                 if problem := template_problem(str(nid), node.get("config") or {}):
                     reason = problem
                     break
+    from app.data.caliber_identity import semantic_hash
+
     key = (workflow.id, int(row.version))
     if key not in side_cache:
         side_cache[key] = await graph_side_effect(session, graph, level=level or None)
@@ -106,6 +108,7 @@ async def _describe(session: AsyncSession, workflow: Workflow, row: Any, node_id
         "version": int(row.version),
         "level": level,
         "graph_hash": row.graph_hash,
+        "semantic_hash": semantic_hash(graph, node_id),
         "card": {"node_id": node_id, "title": card["title"], "caliber": cfg.get("caliber"),
                  "caliber_version": cfg.get("caliber_version")},
         "metrics": [{k: m[k] for k in METRIC_KEYS if k in m}

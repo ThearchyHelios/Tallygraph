@@ -88,7 +88,7 @@ export interface EvalSuiteDetail extends EvalSuite {
 // ---------------------------------------------------------------------------
 
 export type EvalCaseKind = 'ask' | 'workflow'
-export type EvalExpectationKind = 'scalar' | 'table' | 'set' | 'none' | 'ask' | 'text' | 'contribution' | 'verdict'
+export type EvalExpectationKind = 'scalar' | 'table' | 'set' | 'none' | 'ask' | 'text' | 'contribution' | 'verdict' | 'investigation'
 
 /** 分析期望用的分析方法（服务端 app/analysis/contract.OPS）：贡献恒为 decompose，判定是另外四种 */
 export type EvalAnalysisOp = 'decompose' | 'baseline' | 'trend' | 'differ' | 'comparable'
@@ -107,6 +107,10 @@ export type EvalJudgement = 'source' | 'dispersed' | 'flat' | 'mix' | 'rate' | '
  * （贡献、判定）只写做哪种分析、参数，来源、方向、判定由平台的分析方法在期望 SQL 的结果上算
  */
 export interface EvalExpectation {
+  minimum_depth?: number
+  max_queries?: number
+  status?: 'complete' | 'partial'
+  stop_reason?: string
   id?: string
   kind: EvalExpectationKind
   required?: boolean

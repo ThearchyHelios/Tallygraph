@@ -1106,6 +1106,13 @@ def metric_definition_issues(node: GraphNode, metric: Any, index: int) -> list[V
     if not isinstance(metric, dict):
         add("指标定义需要是一个对象")
         return out
+    if metric.get("contract") is not None:
+        from app.engine.metric_spec import MetricContract
+
+        try:
+            MetricContract.model_validate(metric["contract"])
+        except ValueError as exc:
+            add(f"指标约束无效：{exc}", f"{field}.contract", code="metrics.contract_invalid")
     if not metric.get("id") or not str(metric.get("id")).strip():
         add(f"指标定义缺少 ID：{field}", code="metrics.id_missing")
     kind = str(metric.get("kind") or "formula")
@@ -1120,8 +1127,8 @@ def metric_definition_issues(node: GraphNode, metric: Any, index: int) -> list[V
                 f"{field}.external", code="metrics.external_invalid")
         else:
             value = external.get("value")
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                add("external.value 需要是数", f"{field}.external.value", code="metrics.external_invalid")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                add("external.value 需要是有限数值", f"{field}.external.value", code="metrics.external_invalid")
             if not isinstance(external.get("source"), str) or not external["source"].strip():
                 add("external.source 需要写明来源", f"{field}.external.source", code="metrics.external_invalid")
             raw = external.get("as_of")
@@ -1202,10 +1209,10 @@ def metric_definition_issues(node: GraphNode, metric: Any, index: int) -> list[V
                     add("评估维度的 input 要写成 cell(nodes.…)、vars.… 或 input.…",
                         f"{key}.input", code="metrics.assessment_invalid")
                 weight = dimension.get("weight", 1)
-                if isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0:
+                if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight <= 0:
                     add("评估维度的 weight 需要是正数", f"{key}.weight", code="metrics.assessment_invalid")
                 low, high = dimension.get("min", 0), dimension.get("max", 100)
-                if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (low, high)) or high <= low:
+                if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in (low, high)) or high <= low:
                     add("评估维度的 min / max 需要是数，且 max 大于 min", key, code="metrics.assessment_invalid")
             levels = assessment.get("levels")
             if not isinstance(levels, list) or not levels:
@@ -1221,7 +1228,7 @@ def metric_definition_issues(node: GraphNode, metric: Any, index: int) -> list[V
                 if not isinstance(level.get("name"), str) or not level["name"].strip():
                     add("评估等级需要名字", f"{key}.name", code="metrics.assessment_invalid")
                 minimum = level.get("min")
-                if isinstance(minimum, bool) or not isinstance(minimum, (int, float)):
+                if isinstance(minimum, bool) or not isinstance(minimum, (int, float)) or not math.isfinite(minimum):
                     add("评估等级的 min 需要是数", f"{key}.min", code="metrics.assessment_invalid")
                 elif previous is not None and minimum >= previous:
                     add("评估等级要按 min 从高到低排列", f"{key}.min", code="metrics.assessment_invalid")
@@ -1389,6 +1396,14 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
         elif node.type == NodeType.LOOP:
             if not spec.outgoing(node.id):
                 result.add("「循环」节点没有循环体", node_id=node.id)
+
+        if node.type == NodeType.AGENT and cfg.get("investigation") is not None:
+            from app.engine.investigation import InvestigationPolicy
+
+            try:
+                InvestigationPolicy.model_validate(cfg["investigation"])
+            except ValueError as exc:
+                result.add(f"调查策略无效：{exc}", node_id=node.id, field="investigation", code="agent.investigation_invalid")
 
         if node.type in (NodeType.LLM, NodeType.AGENT, NodeType.SUPERVISOR, NodeType.REPORT):
             if not (cfg.get("model") or spec.defaults.get("model")):

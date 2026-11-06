@@ -225,20 +225,23 @@ export const LEDGER_UI = {
 
   // ---- 从业务文档起草口径（/ledger/drafts；app/ledger/docdraft.py、docattach.py） ----
   drafts: {
-    entry: '从业务文档起草',
+    entry: '新增口径',
     title: '从业务文档起草口径',
     subtitle: '文档整理成定义和取数，自动试运行一次；去画布审改后由人签字发布',
     back: '返回口径目录',
     refresh: '刷新',
-    /** 列表按状态筛：全部加起草中和六种落点；起草中会停留几分钟，单独筛出来看 */
+    /** 列表按阶段筛：全部、起草中、待审、已丢弃、失败。ready / questions_open / path_pending / attached 都归「待审」 */
     filter: {
       all: '全部',
       drafting: '起草中',
-      ready: '待签字发布',
-      questions_open: '待确认问题',
-      path_pending: '待接数据路径',
-      attached: '已接上',
-      rejected: '已驳回',
+      review: '待审',
+      discarded: '已丢弃',
+      failed: '起草失败',
+    } as Record<string, string>,
+    stage: {
+      drafting: '起草中',
+      review: '待审',
+      discarded: '已丢弃',
       failed: '起草失败',
     } as Record<string, string>,
     status: {
@@ -250,13 +253,16 @@ export const LEDGER_UI = {
       rejected: '已驳回',
       failed: '起草失败',
     } as Record<string, string>,
-    filterLabel: '按状态筛',
+    /** 细状态里值得在阶段旁边多说一句的：没有图、接了运行 */
+    stageNote: (status: string) => status === 'path_pending' ? '还没有取数图'
+      : status === 'attached' ? '已接上一次运行' : '',
+    filterLabel: '按阶段筛',
     summary: (metrics: number, questions: number) => `${formatNumber(metrics)} 个指标 · ${
       questions ? `${formatNumber(questions)} 个未决问题` : '没有未决问题'}`,
     loadFailed: '无法读取口径草稿',
     empty: '还没有口径草稿',
     emptyBody: '选一份业务文档，把里面的指标整理成定义和取数草稿',
-    emptyFiltered: '这个状态下没有草稿，换个状态看看',
+    emptyFiltered: '这个阶段没有草稿，换个阶段看看',
 
     // ---- 发起：选文档、可选数据源和起草要求 ----
     start: '起草一份新口径',
@@ -297,9 +303,16 @@ export const LEDGER_UI = {
     trialNoMetrics: '这次试运行没有产出指标值',
     trialUnavailable: '暂时无法读取试运行状态',
     trialRun: '看这次运行',
+    /** 试运行读到的表：草稿页和口径目录共用，只读，不是正式出具 */
+    trialResult: '只读试运行结果，不是正式出具',
+    trialRows: (total: number) => `共 ${formatNumber(total)} 行`,
+    trialTruncated: (shown: number) => `只显示前 ${formatNumber(shown)} 行`,
+    trialNoRows: '这次试运行没有读到数据',
     /** 必填入口字段没有值：状态停在 needs_input，不拿系统编的值去跑 */
     trialNeedsInput: '等补入口字段',
     trialNeedsInputHint: '填好入口字段再试运行',
+    trialStale: '需要重新试运行',
+    trialStaleHint: '口径已修改，之前的试运行结果不再代表当前定义。',
     trialRunAction: '试运行',
     trialRunStarting: '正在发起…',
 
@@ -308,6 +321,11 @@ export const LEDGER_UI = {
     docTruncated: '文档太长，后面的段落没有参与起草',
     catalogTruncated: '数据目录太大，只展开了文档点到的几张表',
     blocks: (n: number) => `${formatNumber(n)} 个取数节点`,
+    /** 取数 SQL：草稿图里的模板，入口字段在运行时渲染；页面只读展示，不出现执行值 */
+    sqlTitle: '取数 SQL',
+    sqlHint: '取数模板，入口字段在运行时渲染',
+    /** 逐组取数：第几组、这条 SQL 出哪几个指标 */
+    sqlGroup: (n: number, metrics: number) => `第 ${formatNumber(n)} 组 · ${formatNumber(metrics)} 个指标`,
     metricsCount: (n: number) => `指标（${formatNumber(n)} 条）`,
     /** 指标卡默认收起：标题行看名字、单位、值和未决问题数，展开看定义、表达式和引用 */
     metricSummaryHint: '展开看定义、表达式和引用原文',
@@ -359,10 +377,16 @@ export const LEDGER_UI = {
     defaultValue: (value: string) => `缺省 ${value}`,
     publish: '去画布审改并发布',
     publishHint: '在画布上核对图、改完再发布；发布这一步由人签字',
+    /** 发布前检查：服务端从图和试跑状态算，只读、不拦人 */
+    checks: '发布前检查',
+    checksHint: '只读检查，不拦人；未通过的项照实列出',
+    checkOk: '通过',
+    checkFail: '待处理',
+    checksSummary: (passed: number, total: number) => `${formatNumber(passed)}/${formatNumber(total)} 项通过`,
     workflowVersion: (version: number) => `工作流 v${version}`,
 
     // ---- 接上一次运行（辅助入口） ----
-    attach: '接上一次运行',
+    attach: '已经有答案？接上一次运行',
     attachHint: '已经有一次运行得出的答案，让它认这份定义：取数照抄那次运行执行过的查询，不重新生成；接上后产出可试运行的工作流版本，不发布',
     runId: '运行 id',
     runIdPlaceholder: '粘贴运行记录里的 id',

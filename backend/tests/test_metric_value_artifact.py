@@ -86,6 +86,11 @@ def without_new_keys(card: dict) -> dict:
     """去掉这个功能之前没有的两个键：value_artifact 和 definition_hash（口径的内容指纹）。"""
     out = without_value_artifacts(card)
     out.pop("definition_hash", None)
+    out.pop("semantic_hash", None)
+    out.pop("validation_version", None)
+    for metric in out["metrics"]:
+        metric.pop("quality", None)
+        metric.pop("contract_findings", None)
     return out
 
 

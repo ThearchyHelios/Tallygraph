@@ -112,6 +112,9 @@ export const ledger = {
    */
   version: (workflowId: string, version: number) =>
     get<{ apps: { app_id: string; name: string; app_version: number }[]; effects: number; formal_runs: number
+      workflows?: { workflow_id: string; version: number; name: string; node_id: string; depth: number }[]
+      indirect_apps?: { app_id: string; name: string; app_version: number }[]
+      unreadable_workflows?: { workflow_id: string; version: number; name: string }[]
       answers?: number; exports?: number; schedules?: number; recall?: VersionRecallCounts }>(
       `/ledger/workflow-versions/${encodeURIComponent(workflowId)}/${version}`),
 }

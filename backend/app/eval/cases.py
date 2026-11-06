@@ -54,7 +54,7 @@ GOLD_GUARD = "eval_gold_guard"
 #: 口径题指的卡不能当口径题（422）：不存在、不是口径卡、不能复用、取数节点引用了入口字段以外的值
 CALIBER_NOT_REUSABLE = "eval_caliber_not_reusable"
 
-EXPECTATION_KINDS = ("scalar", "table", "set", "none", "ask", "text", "contribution", "verdict")
+EXPECTATION_KINDS = ("scalar", "table", "set", "none", "ask", "text", "contribution", "verdict", "investigation")
 #: 要期望答案来源的期望：数都由 SQL / 口径算，分析的判定由算子在期望 SQL 的结果上算
 NEEDS_GOLD = ("scalar", "table", "set", "none", "contribution", "verdict")
 #: 不计入准确率的（评测-D4：文字要点由裁判判，单列）
@@ -74,6 +74,7 @@ _EXPECTATION_KEYS: dict[str, tuple[str, ...]] = {
     "text": ("points",),
     "contribution": ("op", "mode", "params", "top_n"),
     "verdict": ("op", "mode", "params"),
+    "investigation": ("minimum_depth", "max_queries", "status", "stop_reason"),
 }
 _COMMON_KEYS = ("id", "kind", "required", "label")
 #: 期望答案来源的键（客户端能写的）；from_run 只能由服务端建
@@ -236,7 +237,7 @@ def _expectation(raw: Any, i: int, *, gold_kind: str | None, taken: set[str]) ->
     if kind in NEEDS_GOLD and gold_kind is None:
         raise CaseInvalid(f"{where}要答出数（或答「没有数据」），需要期望答案的来源：写一条期望 SQL、选一个口径，"
                           "或从运行里认定一条查询", "gold")
-    if gold_kind == "caliber" and kind not in ("scalar", "ask", "text"):
+    if gold_kind == "caliber" and kind not in ("scalar", "ask", "text", "investigation"):
         raise CaseInvalid(f"{where}（{kind}）不能用口径题算：口径卡给的是一个个指标，只配「一个数」的期望",
                           f"{path}.kind")
     if kind == "scalar":
@@ -286,6 +287,22 @@ def _expectation(raw: Any, i: int, *, gold_kind: str | None, taken: set[str]) ->
         if len(points) > POINTS_MAX or any(len(p.strip()) > POINT_MAX for p in points):
             raise CaseInvalid(f"{where}最多 {POINTS_MAX} 条要点，每条不超过 {POINT_MAX} 个字符", f"{path}.points")
         out["points"] = [p.strip() for p in points]
+    elif kind == "investigation":
+        status = raw.get("status", "complete")
+        if status not in ("complete", "partial"):
+            raise CaseInvalid("调查期望 status 只能是 complete 或 partial", f"{path}.status")
+        out["status"] = status
+        for key, low, high in (("minimum_depth", 0, 5), ("max_queries", 1, 1000)):
+            if key in raw:
+                value = raw[key]
+                if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                    raise CaseInvalid(f"{key} 需要是 {low} 到 {high} 的整数", f"{path}.{key}")
+                out[key] = value
+        if raw.get("stop_reason") is not None:
+            reason = raw["stop_reason"]
+            if not isinstance(reason, str) or not reason.strip() or len(reason) > 80:
+                raise CaseInvalid("停止原因需要是简短的机器码", f"{path}.stop_reason")
+            out["stop_reason"] = reason
     elif kind in ("contribution", "verdict"):
         out.update(_analysis_expectation(raw, kind, where, path))
     return out

@@ -57,6 +57,16 @@ def plan_reply(chunk_id: str, *, questions=None, sql: str | None = None, metrics
     }, ensure_ascii=False)
 
 
+def groups_reply(*plans: dict) -> str:
+    """一次交多组：每组沿用 plan_reply 的 sql / entry_fields / metrics。"""
+    return json.dumps({
+        "groups": [{"sql": plan["sql"], "entry_fields": plan["entry_fields"], "metrics": plan["metrics"]}
+                   for plan in plans],
+        "open_questions": [],
+        "uncovered": [],
+    }, ensure_ascii=False)
+
+
 class FakeModel:
     """起草模型：ainvoke 返回带 .content 的对象；按顺序交回复，交完重复最后一份。"""
 
@@ -96,16 +106,19 @@ async def fake_trial(monkeypatch):
     """试跑换成写一行 succeeded 的运行：不启动引擎、不查库，接口和 payload 的形状照真的一样。"""
     made: list[str] = []
 
-    async def start(*, draft_id, workflow_id, graph, values, started_by, entry_fields=()):
+    async def start(*, draft_id, workflow_id, graph, values, started_by, entry_fields=(), version=1):
         run_id = f"run-draft-{uuid.uuid4().hex[:10]}"
         async with SessionLocal() as session:
             session.add(Run(id=run_id, workflow_id=workflow_id, status="succeeded", graph=graph,
                             input=values, run_class="exploratory", origin_kind="caliber_trial",
                             origin={"kind": "caliber_trial", "draft_id": draft_id,
-                                    "workflow_id": workflow_id, "version": 1}))
+                                    "workflow_id": workflow_id, "version": version}))
             await session.commit()
         made.append(run_id)
-        return {"run_id": run_id, "status": "succeeded", "error": ""}
+        trial = {**api_ledger._trial_binding(version, graph, values),
+                 "run_id": run_id, "status": "succeeded", "error": ""}
+        await api_ledger._save_trial(draft_id, trial, replace=True)
+        return trial
 
     monkeypatch.setattr(api_ledger, "_run_trial", start)
     yield made
@@ -213,6 +226,10 @@ async def test_extract_produces_a_ready_draft_with_a_graph_and_a_trial(client, d
     assert made["alignment"]["new"] == ["已支付退款率"]
     assert made["truncated"] is False and made["model_id"] == "fake-model"
     assert made["datasource_id"] == source_id
+    # 发布前检查：五项都从图和试跑状态算，不另起一份判断
+    assert {check["key"] for check in made["checks"]} == {"graph", "sql", "entries", "trial", "citations"}
+    assert all(check["ok"] for check in made["checks"] if check["key"] != "trial"), made["checks"]
+    assert next(check for check in made["checks"] if check["key"] == "trial")["status"] == "unknown"
 
     # 工作流和 v1 已建：合法的草稿图，取数指向这个数据源
     async with SessionLocal() as session:
@@ -225,10 +242,27 @@ async def test_extract_produces_a_ready_draft_with_a_graph_and_a_trial(client, d
     assert [n["id"] for n in workflow.graph["nodes"]] == ["start", "fetch", "card", "write", "out"]
     assert validate_graph(GraphSpec.model_validate(workflow.graph)).ok
 
-    # 试跑只读接口：契约里的形状
+    # 试跑只读接口：契约里的形状（queries 是取数节点交回的查询快照；这次是假试跑，没有快照）
     trial = (await client.get(f"/api/ledger/drafts/{body['draft_id']}/trial")).json()
-    assert set(trial) == {"run_id", "status", "metrics", "error"}
+    assert set(trial) == {"run_id", "status", "metrics", "queries", "error", "version", "graph_hash", "execution_hash", "inputs_hash", "validation"}
     assert trial["run_id"] == made["trial"]["run_id"] and trial["status"] == "succeeded"
+    assert trial["queries"] == []
+
+
+async def test_publish_checks_point_at_an_entry_field_the_sql_never_uses(client, documents, datasource, monkeypatch):
+    """发布前检查照实说：声明了入口但 SQL 没用，也算不一致；其他项不跟着判失败。"""
+    doc = await documents("dd-checks")
+    source_id = await datasource()
+    plan = json.loads(plan_reply(f"{doc}-2", sql="SELECT COUNT(*) * 1.0 AS refund_rate FROM orders "
+                                                  "WHERE status = 'paid'"))
+    fake_model(monkeypatch, json.dumps(plan, ensure_ascii=False))
+    draft_id = (await extract(client, doc, source_id))["draft_id"]
+
+    made = (await client.get(f"/api/ledger/drafts/{draft_id}")).json()
+    by_key = {check["key"]: check for check in made["checks"]}
+    assert by_key["entries"]["ok"] is False and "store" in by_key["entries"]["detail"]
+    assert by_key["graph"]["ok"] and by_key["sql"]["ok"] and by_key["citations"]["ok"]
+    assert by_key["trial"]["status"] == "unknown"
 
 
 async def test_open_questions_keep_the_draft_in_questions_open_but_still_run_it(
@@ -240,6 +274,7 @@ async def test_open_questions_keep_the_draft_in_questions_open_but_still_run_it(
     body = await extract(client, doc, source_id)
     made = (await client.get(f"/api/ledger/drafts/{body['draft_id']}")).json()
     assert made["status"] == "questions_open"
+    assert made["stage"] == "review"
     assert made["open_questions"] == ["退款算在哪一天"]
     assert made["workflow_id"] and made["sql"]
     assert made["trial"]["status"] == "succeeded"
@@ -318,6 +353,15 @@ async def test_patch_replaces_metrics_and_clears_resolved_questions(client, docu
     assert [m["name"] for m in made["metrics"]] == ["已支付退款率（按支付日）"]
     assert made["open_questions"] == [] and made["question_count"] == 0
 
+    # PATCH 和画布一样新增版本，读取新版本而不是覆盖 v1
+    async with SessionLocal() as session:
+        draft_row = await session.get(CaliberDraft, draft_id)
+        version_row = (await session.execute(select(WorkflowVersion).where(
+            WorkflowVersion.workflow_id == draft_row.workflow_id,
+            WorkflowVersion.version == made["version"]))).scalars().one()
+    card = next(n for n in version_row.graph["nodes"] if n["type"] == "metrics")
+    assert [m["name"] for m in card["data"]["config"]["metrics"]] == ["已支付退款率（按支付日）"]
+
     # 结构不对的指标 422，草稿不动
     bad = await client.patch(f"/api/ledger/drafts/{draft_id}", json={"metrics": [{"synonyms": ["x"]}]})
     assert bad.status_code == 422
@@ -330,6 +374,94 @@ async def test_patch_replaces_metrics_and_clears_resolved_questions(client, docu
     assert res.json()["status"] == "questions_open" and res.json()["question_count"] == 1
 
 
+async def test_draft_view_reads_the_graph_so_canvas_edits_show_up(client, documents, datasource, monkeypatch):
+    """画布改了指标名和取数 SQL 之后，草稿页从图里读最新的那几项，不再显示起草时的 payload 快照。"""
+    doc = await documents("dd-live")
+    source_id = await datasource()
+    fake_model(monkeypatch, plan_reply(f"{doc}-2"))
+    draft_id = (await extract(client, doc, source_id))["draft_id"]
+
+    # 必须走画布的真实保存接口：它新增 v2，不能直接覆盖 v1 来模拟
+    async with SessionLocal() as session:
+        draft = await session.get(CaliberDraft, draft_id)
+        row = (await session.execute(select(WorkflowVersion).where(
+            WorkflowVersion.workflow_id == draft.workflow_id,
+            WorkflowVersion.version == 1))).scalars().one()
+        graph = copy.deepcopy(row.graph)
+        for node in graph["nodes"]:
+            if node["type"] == "metrics":
+                node["data"]["config"]["metrics"][0]["name"] = "已支付退款率（画布改过）"
+            if node["type"] == "tool" and (node["data"]["config"].get("args") or {}).get("sql"):
+                node["data"]["config"]["args"]["sql"] = "SELECT 1 AS refund_rate"
+        workflow_id = draft.workflow_id
+    saved = await client.patch(f"/api/workflows/{workflow_id}", json={"graph": graph})
+    assert saved.status_code == 200 and saved.json()["version"] == 2, saved.text
+
+    made = (await client.get(f"/api/ledger/drafts/{draft_id}")).json()
+    assert made["metrics"][0]["name"] == "已支付退款率（画布改过）"
+    assert made["sql"] == "SELECT 1 AS refund_rate"
+    assert [group["sql"] for group in made["groups"]] == ["SELECT 1 AS refund_rate"]
+    assert made["version"] == 2 and made["trial"]["status"] == "stale"
+
+
+async def test_resolving_a_metric_question_writes_it_back_to_the_graph(client, documents, datasource, monkeypatch):
+    """答清一条指标自己的未决问题之后，图里那条指标的 open_questions 也要去掉：草稿页从图读，不能又显示出来。"""
+    doc = await documents("dd-resolve")
+    source_id = await datasource()
+    plan = json.loads(plan_reply(f"{doc}-2"))
+    plan["metrics"][0]["open_questions"] = ["按哪个门店口径"]
+    fake_model(monkeypatch, json.dumps(plan, ensure_ascii=False))
+    draft_id = (await extract(client, doc, source_id))["draft_id"]
+
+    made = (await client.get(f"/api/ledger/drafts/{draft_id}")).json()
+    assert made["status"] == "questions_open"
+    assert made["metrics"][0]["open_questions"] == ["按哪个门店口径"]
+
+    res = await client.patch(f"/api/ledger/drafts/{draft_id}", json={"resolved": ["按哪个门店口径"]})
+    assert res.status_code == 200, res.text
+    fixed = res.json()
+    assert fixed["status"] == "ready" and fixed["question_count"] == 0
+    assert fixed["metrics"][0]["open_questions"] == []
+
+    async with SessionLocal() as session:
+        draft = await session.get(CaliberDraft, draft_id)
+        row = (await session.execute(select(WorkflowVersion).where(
+            WorkflowVersion.workflow_id == draft.workflow_id,
+            WorkflowVersion.version == fixed["version"]))).scalars().one()
+    card = next(n for n in row.graph["nodes"] if n["type"] == "metrics")
+    assert not card["data"]["config"]["metrics"][0].get("open_questions")
+
+
+async def test_trial_validates_against_graph_entry_fields_after_canvas_edit(
+        client, documents, datasource, monkeypatch):
+    """画布上给入口加了必填字段之后，试跑按图里的字段校验；payload 的旧入口字段不能把新字段漏掉。"""
+    doc = await documents("dd-entry-live")
+    source_id = await datasource()
+    fake_model(monkeypatch, plan_reply(f"{doc}-2"))
+    draft_id = (await extract(client, doc, source_id))["draft_id"]
+
+    async with SessionLocal() as session:
+        draft = await session.get(CaliberDraft, draft_id)
+        row = (await session.execute(select(WorkflowVersion).where(
+            WorkflowVersion.workflow_id == draft.workflow_id,
+            WorkflowVersion.version == 1))).scalars().one()
+        graph = copy.deepcopy(row.graph)
+        for node in graph["nodes"]:
+            if node["type"] == "input":
+                node["data"]["config"]["fields"].append(
+                    {"name": "region", "type": "string", "required": True, "default": "",
+                     "description": "区域"})
+        workflow_id = draft.workflow_id
+    saved = await client.patch(f"/api/workflows/{workflow_id}", json={"graph": graph})
+    assert saved.status_code == 200 and saved.json()["version"] == 2, saved.text
+
+    missing = await client.post(f"/api/ledger/drafts/{draft_id}/trial", json={"inputs": {}})
+    assert missing.status_code == 422 and "region" in missing.text
+    ok = await client.post(f"/api/ledger/drafts/{draft_id}/trial", json={"inputs": {"region": "华东"}})
+    assert ok.status_code == 200, ok.text and ok.text[:200]
+    assert ok.json()["status"] == "succeeded"
+
+
 async def test_dismiss_marks_rejected_and_writes_an_audit(client, documents, datasource, monkeypatch):
     doc = await documents("dd-7")
     source_id = await datasource()
@@ -337,7 +469,7 @@ async def test_dismiss_marks_rejected_and_writes_an_audit(client, documents, dat
     draft_id = (await extract(client, doc, source_id))["draft_id"]
 
     res = await client.post(f"/api/ledger/drafts/{draft_id}/dismiss", json={"note": "已经有口径了"})
-    assert res.status_code == 200 and res.json()["status"] == "rejected"
+    assert res.status_code == 200 and res.json()["status"] == "rejected" and res.json()["stage"] == "discarded"
     async with SessionLocal() as session:
         event = (await session.execute(select(AuditEvent).where(
             AuditEvent.action == "ledger.docdraft.dismiss", AuditEvent.subject_id == draft_id))).scalars().one()
@@ -358,14 +490,20 @@ async def test_list_counts_orders_by_last_change_and_filters_by_status(client, d
     listed = (await client.get("/api/ledger/drafts")).json()["drafts"]
     assert [d["id"] for d in listed] == [two, one]
     latest, earlier = listed
-    assert (latest["title"], latest["status"], latest["metric_count"], latest["question_count"]) == \
-        ("二.md", "ready", 1, 0)
-    assert (earlier["status"], earlier["metric_count"], earlier["question_count"]) == ("questions_open", 1, 1)
+    assert (latest["title"], latest["status"], latest["stage"], latest["metric_count"], latest["question_count"]) == \
+        ("二.md", "ready", "review", 1, 0)
+    assert (earlier["status"], earlier["stage"], earlier["metric_count"], earlier["question_count"]) == \
+        ("questions_open", "review", 1, 1)
     assert earlier["workflow_id"] and earlier["created_at"] and earlier["error"] is None
 
     only = (await client.get("/api/ledger/drafts", params={"status": "questions_open"})).json()["drafts"]
     assert [d["id"] for d in only] == [one]
+    # 界面按阶段筛：ready 和 questions_open 都是「待审」
+    review = (await client.get("/api/ledger/drafts", params={"stage": "review"})).json()["drafts"]
+    assert {d["id"] for d in review} == {one, two}
+    assert (await client.get("/api/ledger/drafts", params={"stage": "discarded"})).json()["drafts"] == []
     assert (await client.get("/api/ledger/drafts", params={"status": "nope"})).status_code == 422
+    assert (await client.get("/api/ledger/drafts", params={"stage": "nope"})).status_code == 422
     assert (await client.get("/api/ledger/drafts/d-nope")).status_code == 404
 
 
@@ -382,9 +520,11 @@ async def test_trial_endpoint_returns_metric_values_from_the_run(client, documen
     res = await client.get(f"/api/ledger/drafts/{draft_id}/trial")
     assert res.status_code == 200, res.text
     body = res.json()
-    assert body == {"run_id": body["run_id"], "status": "succeeded",
+    assert body == {"run_id": body["run_id"], "status": "succeeded", "version": 1,
+                    "graph_hash": body["graph_hash"], "execution_hash": body["execution_hash"],
+                    "validation": body["validation"], "inputs_hash": body["inputs_hash"],
                     "metrics": [{"id": "m1", "name": "已支付退款率", "rendered": "3.2%", "value": 0.032}],
-                    "error": ""}
+                    "queries": [], "error": ""}
 
     # 没有试跑的老草稿
     async with SessionLocal() as session:
@@ -489,6 +629,14 @@ async def test_a_real_trial_run_feeds_the_trial_endpoint(client, documents, tmp_
         assert [m["id"] for m in trial["metrics"]] == ["m1"]
         assert trial["metrics"][0]["name"] == "已支付销售额"
         assert float(trial["metrics"][0]["value"]) == 156.5
+        # 试跑结果集：取数节点交回的查询快照，给列和行、不给 SQL
+        assert [query["node_id"] for query in trial["queries"]] == ["fetch"]
+        query = trial["queries"][0]
+        assert set(query) == {"node_id", "tool", "source", "columns", "rows", "total_rows",
+                              "truncated", "masked", "source_truncated", "preview_truncated"}
+        assert query["columns"] == ["gmv"] and query["rows"] == [[156.5]]
+        assert query["total_rows"] == 1 and query["truncated"] is False and query["masked"] == []
+        assert "sql" not in query
         async with SessionLocal() as session:
             run = await session.get(Run, run_id)
         assert run.origin_kind == "caliber_trial" and run.run_class == "exploratory"
@@ -508,6 +656,64 @@ async def test_a_real_trial_run_feeds_the_trial_endpoint(client, documents, tmp_
             if source is not None:
                 await session.delete(source)
             await session.commit()
+
+
+async def test_one_reply_can_bring_several_independent_groups(client, documents, datasource, monkeypatch):
+    """模型一次交两组：只调一次模型，两组各自成块，不再一组一轮。"""
+    doc = await documents("dd-groups")
+    source_id = await datasource()
+    first = json.loads(plan_reply(f"{doc}-2"))
+    second = json.loads(plan_reply(f"{doc}-2"))
+    second["sql"] = ("SELECT COUNT(*) AS orders FROM orders WHERE status = 'paid' "
+                     "AND store = '{{ input.store }}'")
+    second["metrics"] = [{**second["metrics"][0], "id": "m1", "name": "已支付订单数",
+                          "expression": "cell(nodes.fetch, 0, 'orders')"}]
+    model = fake_model(monkeypatch, groups_reply(first, second))
+
+    body = await extract(client, doc, source_id)
+    made = (await client.get(f"/api/ledger/drafts/{body['draft_id']}")).json()
+    assert made["status"] == "ready" and made["blocks"] == 2 and made["metric_count"] == 2
+    assert [group["sql"] for group in made["groups"]] == [first["sql"], second["sql"]]
+    assert [m["id"] for m in made["metrics"]] == ["m1", "m2"]
+    assert made["progress"] == {"round": 1, "covered": 2, "uncovered": 0}
+    assert len(model.calls) == 1
+
+
+async def test_one_bad_group_is_repaired_without_failing_the_others(client, documents, datasource, monkeypatch):
+    """一组 SQL 不合格只重写这一组；修好后照常落图，好的那组不受影响。"""
+    doc = await documents("dd-groups-bad")
+    source_id = await datasource()
+    good = json.loads(plan_reply(f"{doc}-2"))
+    bad = json.loads(plan_reply(f"{doc}-2", sql="SELECT * FROM secrets"))
+    bad["metrics"] = [{**bad["metrics"][0], "id": "m1", "name": "已支付订单数",
+                       "expression": "cell(nodes.fetch, 0, 'orders')"}]
+    fixed = {**bad, "sql": ("SELECT COUNT(*) AS orders FROM orders WHERE status = 'paid' "
+                            "AND store = '{{ input.store }}'")}
+    model = fake_model(monkeypatch, groups_reply(good, bad), groups_reply(fixed))
+
+    body = await extract(client, doc, source_id)
+    made = (await client.get(f"/api/ledger/drafts/{body['draft_id']}")).json()
+    assert made["status"] == "ready" and made["blocks"] == 2 and made["metric_count"] == 2
+    assert made["workflow_id"] and len(model.calls) == 2
+    assert [group["sql"] for group in made["groups"]] == [good["sql"], fixed["sql"]]
+    assert not any("secrets" in item["reason"] for item in made["dropped"])
+
+
+async def test_a_bad_group_that_still_cannot_be_repaired_is_dropped(client, documents, datasource, monkeypatch):
+    """重写也没修好：只丢这一组，问题照实写下来，不把整份草稿判死。"""
+    doc = await documents("dd-groups-unfixable")
+    source_id = await datasource()
+    good = json.loads(plan_reply(f"{doc}-2"))
+    bad = json.loads(plan_reply(f"{doc}-2", sql="SELECT * FROM secrets"))
+    bad["metrics"] = [{**bad["metrics"][0], "id": "m1", "name": "已支付订单数",
+                       "expression": "cell(nodes.fetch, 0, 'orders')"}]
+    model = fake_model(monkeypatch, groups_reply(good, bad))
+
+    body = await extract(client, doc, source_id)
+    made = (await client.get(f"/api/ledger/drafts/{body['draft_id']}")).json()
+    assert made["status"] == "ready" and made["blocks"] == 1 and made["metric_count"] == 1
+    assert len(model.calls) == 2
+    assert any("secrets" in item["reason"] for item in made["dropped"])
 
 
 async def test_a_big_document_is_drafted_in_several_rounds_onto_one_multi_fetch_graph(
@@ -531,6 +737,13 @@ async def test_a_big_document_is_drafted_in_several_rounds_onto_one_multi_fetch_
     assert made["status"] == "ready"
     assert [m["name"] for m in made["metrics"]] == ["已支付退款率", "已支付订单数"]
     assert made["blocks"] == 2
+    # groups 逐组给出 SQL、入口字段和指标 id：页面按组画「这条 SQL 出哪几个指标」，不必从拼接的 sql 里猜边界
+    assert [set(group) for group in made["groups"]] == [{"sql", "entry_fields", "metric_ids"}] * 2
+    assert [group["sql"] for group in made["groups"]] == [first["sql"], second["sql"]]
+    assert [group["metric_ids"] for group in made["groups"]] == [["m1"], ["m2"]]
+    # 各组都从 m1 起草，拼图前重排：payload 的指标 id 和 groups 指同一组指标，页面按 id 配试跑值才不会张冠李戴
+    assert [m["id"] for m in made["metrics"]] == ["m1", "m2"]
+    assert [f["name"] for f in made["groups"][0]["entry_fields"]] == ["store"]
     assert made["progress"] == {"round": 2, "covered": 2, "uncovered": 0}
     assert made["truncated"] is False and made["doc_truncated"] is False and made["catalog_truncated"] is False
     # 第二轮提示词写明上一轮起草过什么：模型据此不再重复起草
@@ -641,6 +854,8 @@ async def test_a_real_trial_run_reads_values_from_both_fetch_nodes(client, docum
         trial = (await client.get(f"/api/ledger/drafts/{draft_id}/trial")).json()
         assert trial["status"] == "succeeded" and trial["error"] == ""
         assert {m["id"]: float(m["value"]) for m in trial["metrics"]} == {"m1": 156.5, "m2": 4.0}
+        assert [query["node_id"] for query in trial["queries"]] == ["fetch_1", "fetch_2"]
+        assert [query["columns"] for query in trial["queries"]] == [["gmv"], ["orders"]]
         async with SessionLocal() as session:
             run = await session.get(Run, run_id)
         tools = [n["id"] for n in (run.graph or {}).get("nodes") or [] if n.get("type") == "tool"]
@@ -712,25 +927,26 @@ async def test_running_the_trial_with_inputs_typed_on_the_page(client, documents
                     "AND paid_at >= '{{ input.start }}'")
     fake_model(monkeypatch, json.dumps(reply, ensure_ascii=False))
 
-    async def waiting(*, draft_id, workflow_id, graph, values, started_by, entry_fields=()):
-        return {"run_id": "", "status": "needs_input", "error": "缺少必填输入：start"}
+    async def waiting(*, draft_id, workflow_id, graph, values, started_by, entry_fields=(), version=1):
+        return {**api_ledger._trial_binding(version, graph, values),
+                "run_id": "", "status": "needs_input", "error": "缺少必填输入：start"}
 
     monkeypatch.setattr(api_ledger, "_run_trial", waiting)
     body = await extract(client, doc, source_id)
     made = (await client.get(f"/api/ledger/drafts/{body['draft_id']}")).json()
     assert made["trial"]["status"] == "needs_input"
     trial = (await client.get(f"/api/ledger/drafts/{body['draft_id']}/trial")).json()
-    assert trial["status"] == "needs_input" and trial["metrics"] == []
+    assert trial["status"] == "needs_input" and trial["metrics"] == [] and trial["queries"] == []
 
     missing = await client.post(f"/api/ledger/drafts/{body['draft_id']}/trial", json={"inputs": {}})
     assert missing.status_code == 422
 
     seen: dict[str, object] = {}
 
-    async def started(*, draft_id, workflow_id, graph, values, started_by, entry_fields=()):
+    async def started(*, draft_id, workflow_id, graph, values, started_by, entry_fields=(), version=1):
         seen.clear()
         seen.update(values)
-        return {"run_id": "", "status": "running", "error": ""}
+        return {**api_ledger._trial_binding(version, graph, values), "run_id": "", "status": "running", "error": ""}
 
     monkeypatch.setattr(api_ledger, "_run_trial", started)
     res = await client.post(f"/api/ledger/drafts/{body['draft_id']}/trial", json={"inputs": {"start": "2026-01-01"}})
@@ -746,13 +962,13 @@ async def test_extract_hands_the_fixed_filters_to_every_round(client, documents,
     source_id = await datasource()
     fake_model(monkeypatch, plan_reply(f"{doc}-2"))
     seen: dict[str, object] = {}
-    real_plan = draftplan.plan
+    real_plan = draftplan.plan_groups
 
     async def spy(session, **kwargs):
         seen.update(kwargs)
         return await real_plan(session, **kwargs)
 
-    monkeypatch.setattr(draftplan, "plan", spy)
+    monkeypatch.setattr(draftplan, "plan_groups", spy)
     body = await client.post("/api/ledger/drafts/extract", json={
         "documents": [doc], "datasource_id": source_id, "fixed_filters": "line_code = 'FOAM01'"})
     made = (await client.get(f"/api/ledger/drafts/{body.json()['draft_id']}")).json()

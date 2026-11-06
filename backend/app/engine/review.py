@@ -147,6 +147,7 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     # 分析能力一轮（00-总方案 §3.7）：只写说明、不自动重来（NOTE_ONLY）。答案照常交付，缺口照实说一句就够了：
     # 报告里判断词没挂对分析结论、原因没有依据，重写后仍有（check 标在报告里，strict 另记出具缺口）
     "report_analysis_claims": ("report_analysis_claims", DEGRADED),
+    "investigation_incomplete": ("investigation_incomplete", DEGRADED),
     # 一份分析算不了（历史不够、本期不完整、截断……）：算不了本身是一条结论，写作者照实写原因。一次运行里几次算不了的
     # 并成一条「有 n 次分析没做成」（_analysis_signal），不一次一条
     REFUSED_CODE: (REFUSED_CODE, DEGRADED),
@@ -166,7 +167,7 @@ REBUILD = {"query_no_data", "metric_no_data"}
 
 #: 只写说明、不自动重来的信号（00-总方案 §3.7）：都是缺口（DEGRADED）、不进 RETRYABLE / REBUILD。一次运行的信号全是
 #: 这几种时复核不叫模型，说明就照信号原话写（review）：答案照常、报告里已经标出，叫一次模型只是把同一句话换个说法
-NOTE_ONLY = frozenset({"report_analysis_claims", REFUSED_CODE, "metric_comparability_skipped", ANALYSIS_CALL_FAILED})
+NOTE_ONLY = frozenset({"investigation_incomplete", "report_analysis_claims", REFUSED_CODE, "metric_comparability_skipped", ANALYSIS_CALL_FAILED})
 #: 「有 n 次分析没做成」那条信号里最多点名几次，其余写「……」
 _ANALYSIS_SHOWN = 3
 

@@ -5,10 +5,11 @@
 
 - definition_hash：一张口径卡的指标定义（caliber、caliber_version 和每个指标的语义字段）的 sha256；
 - version_hash：一份口径版本里各卡的内容哈希排序后再取 sha256，也就是整份版本的定义指纹；
+- semantic_hash：口径卡及上游执行依赖的指纹，含 SQL、数据源与绑定，排除布局；
 - card_hash_of：从 {node_id, metrics, caliber?, caliber_version?} 这种卡形状取哈希（运行时指标卡、账本里源头口径卡的
   两种写法共用）。
 
-**只取语义字段。** 指标只留 id / name / expression / unit / decimals / format / kind / definition / params 里存在的键，
+**定义指纹只取声明字段。** 指标只留 SEMANTIC_FIELDS 中存在的键（含类型配置、粒度、过滤和可执行约束），
 按 id 排序（顺序不影响哈希）；空字符串、None、空的列表和字典不写进规范 JSON。值、渲染后的字、输入出处、状态这些都是
 运行时产物，不进哈希——同一份定义重跑一次，或者补了无关的字段，哈希不变。
 
@@ -26,7 +27,8 @@ from typing import Any
 
 #: 指标的语义字段：只有这几样算定义，运行时值（value、rendered、inputs……）不参与哈希
 SEMANTIC_FIELDS = ("id", "name", "expression", "unit", "decimals", "format", "kind", "definition", "params", "external",
-                   "rule", "assessment")
+                   "rule", "assessment", "grain", "time_field", "numerator", "denominator", "dimensions", "filters",
+                   "contract")
 
 
 def _blank(value: Any) -> bool:
@@ -70,6 +72,40 @@ def version_hash(card_hashes: Iterable[str]) -> str:
     from app.core.artifact_store import content_hash
 
     return content_hash("\n".join(sorted(str(h) for h in card_hashes or () if h)))
+
+
+def semantic_hash(graph: dict[str, Any], node_id: str) -> str:
+    """口径及其上游执行依赖的指纹：包含 SQL、数据源、入口绑定和固定版本引用。
+
+    definition_hash 继续表示指标定义自身；此指纹才覆盖取数语义。保守保留 SQL 原文，
+    不把未证明等价的改写判为相同；画布坐标和无关的下游写作节点不参与。
+    """
+    import re
+
+    from app.core.artifact_store import canonical_json, content_hash, execution_content
+
+    content = execution_content(graph)
+    nodes = {n["id"]: n for n in content["nodes"]}
+    wanted, pending = set(), [node_id]
+    while pending:
+        current = pending.pop()
+        if current in wanted:
+            continue
+        wanted.add(current)
+        pending.extend(e["source"] for e in content["edges"] if e["target"] == current)
+        node = nodes.get(current)
+        if node:
+            # 非相邻节点也能被表达式引用。保守扫描配置，包含节点参数中的模板引用。
+            config = canonical_json(node["data"].get("config") or {})
+            pending.extend(re.findall(r"\bnodes\.([\w-]+)", config))
+            pending.extend(re.findall(r"\bnodes\[['\"]([\w-]+)['\"]\]", config.replace('\\"', '"')))
+    inputs = {n["id"] for n in nodes.values() if n["type"] == "input"}
+    wanted |= inputs
+    return content_hash(canonical_json({
+        "schema_version": 1, "defaults": content["defaults"],
+        "nodes": [n for n in content["nodes"] if n["id"] in wanted],
+        "edges": [e for e in content["edges"] if e["source"] in wanted and e["target"] in wanted],
+    }))
 
 
 __all__ = ["SEMANTIC_FIELDS", "card_hash_of", "definition_hash", "version_hash"]

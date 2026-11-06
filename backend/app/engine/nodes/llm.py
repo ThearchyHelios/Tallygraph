@@ -664,6 +664,12 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     #: 为什么没等到模型自己给结论：steps / stall / budget_tokens / budget_usd / context
     settle_reason: str | None = None
     answered = False
+    from app.engine.investigation import InvestigationPolicy, assess as assess_investigation
+
+    investigation_policy = InvestigationPolicy.model_validate(ctx.cfg("investigation", {}) or {})
+    investigation_rounds = 0
+    investigation_question = "\n".join(message_text(m) for m in messages if isinstance(m, HumanMessage))
+
     for step in range(max_steps):
         response = await llm_step(step, messages)
         if guard:
@@ -683,6 +689,18 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 await once(ctx, EventType.LOG, level="warn", code="tool_markup_leak",
                            message=f"{markup_warning(snippet)}，已要求模型重试一次")
                 messages.append(HumanMessage(content=TOOL_MARKUP_NUDGE))
+                final_text = ""
+                continue
+            investigation = assess_investigation(scope, investigation_question, investigation_policy)
+            if (investigation["active"] and investigation["status"] != "complete"
+                    and investigation_rounds < investigation_policy.max_rounds and step < max_steps - 1):
+                investigation_rounds += 1
+                messages.append(HumanMessage(content=(
+                    f"调查尚未完成：{investigation['reason']}。{investigation['next_step']}"
+                    "仅在现有权限和查询预算内补充证据；不能获得证据时明确说明，不编造原因。")))
+                await once(ctx, EventType.LOG, level="info", code="investigation_continue",
+                           round=investigation_rounds, stage=investigation.get("stage"),
+                           message=investigation["reason"])
                 final_text = ""
                 continue
             answered = True
@@ -861,6 +879,16 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             final_text = f"{final_text}\n\n（{hint}）".strip() if final_text else f"（{hint}）"
             ctx.emit(EventType.LOG, level="warn", message=hint, code="step_limit", **limited)
 
+    investigation = assess_investigation(scope, investigation_question, investigation_policy)
+    if investigation["active"]:
+        investigation["rounds"] = investigation_rounds
+        investigation["stop_reason"] = (settle_reason or "evidence_sufficient" if investigation["status"] == "complete"
+                                        else settle_reason or "evidence_insufficient")
+        if investigation["status"] != "complete":
+            final_text = f"{final_text}\n\n调查范围：{investigation['reason']}；现有证据不足以确认根因。".strip()
+            await once(ctx, EventType.LOG, level="warn", code="investigation_incomplete", investigation=investigation,
+                       message=investigation["reason"])
+
     cited: tuple[dict[str, Any], dict[str, Any]] | None = None
     schema = _output_schema(ctx) if evidence_on and ctx.cfg("cite_fields") is True else None
     if schema is not None and (fields := cited_fields(schema)):
@@ -882,6 +910,7 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     result = {
         "text": final_text,
         "steps": len(transcript),
+        **({"investigation": investigation} if investigation["active"] else {}),
         "tool_calls": transcript,
         "model": model_id,
         # 没等到模型自己给结论就收了尾：下游校验失败时拿它说明根源（human.py）

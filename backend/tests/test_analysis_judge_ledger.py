@@ -32,7 +32,7 @@ def test_the_judge_gets_the_method_the_judgment_and_the_input_sql():
     [cand] = request.cands
     assert cand.aliases == ("A1",) and "A1" in cand.whole and ("A1", 0) in cand.rows and ("A1", "delta") in cand.cols
     excerpt = request.excerpts["A1"]
-    assert excerpt.startswith("【A1】分析结论（变化拆解（可加），方法 decompose.additive@1）")
+    assert excerpt.startswith("【A1】分析结论（变化拆解（可加），方法 decompose.additive@2）")
     assert "判定：销售额下降 194 万（-8.7%），主要来自华东（-120 万，占 62%）" in excerpt
     assert "判定标准：一段占总变化一半以上算主要来源" in excerpt
     assert "关键数：base_total=2,220 | target_total=2,026 | delta_total=-194" in excerpt

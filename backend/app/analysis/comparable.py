@@ -20,7 +20,7 @@
 - 数据问题：两边查询结果上「查询区间里这张表没有数据」（快照的 no_data）fail，SQL 检查的错误级结果（快照的 checks，level
   error）warn。
 
-判定：有 fail → incomparable；只有 warn → conditional；其余 comparable（有核对不了的项照实写在判定语后面）。
+判定：有 fail → incomparable；有 warn 或 unknown → conditional；全部核对通过才是 comparable。
 """
 from __future__ import annotations
 
@@ -437,7 +437,7 @@ def _decide(checks: list[Check], base: Span | None, target: Span | None) -> Outc
     fails = [r for c in checks if c.status == "fail" for r in c.reasons]
     warns = [r for c in checks if c.status == "warn" for r in c.reasons]
     unknown = [CHECK_NAMES[c.id] for c in checks if c.status == "unknown"]
-    verdict = "incomparable" if fails else "conditional" if warns else "comparable"
+    verdict = "incomparable" if fails else "conditional" if warns or unknown else "comparable"
     reasons = fails + warns
     structure = next((c.reasons[0] for c in checks if c.id == "same_query" and c.status == "fail" and c.reasons), None)
     return Outcome(checks, verdict, reasons, unknown, ph.comparable_phrase(verdict, reasons, unknown), structure,

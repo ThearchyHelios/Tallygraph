@@ -43,8 +43,10 @@ MAX_SQL_CHARS = 20000
 
 #: 入口字段能写的类型（apps/spec.FORM_TYPES 的子集；日期用 string + description 说清）
 ENTRY_TYPES = ("string", "number", "integer", "boolean")
-#: 指标里固定出现的字段（顺序照接口契约）
-METRIC_FIELDS = ("id", "name", "synonyms", "unit", "decimals", "expression", "definition", "open_questions")
+#: 指标里固定出现的字段（顺序照接口契约）。grain、time_field、numerator、denominator、dimensions、filters 是文档起草
+#: 交回来的业务描述（docdraft.METRIC_FIELDS 里也有），校验阶段必须原样留着，草稿页要逐行展示
+METRIC_FIELDS = ("id", "name", "synonyms", "unit", "decimals", "expression", "grain", "time_field",
+                 "numerator", "denominator", "dimensions", "filters", "definition", "open_questions")
 
 #: 入口字段最多几个（时间范围占两个）。再多说明把「每次都不变」的条件也做成了参数，
 #: 人每跑一次都要填一遍，口径就没法用了
@@ -62,20 +64,20 @@ _SYSTEM = """你是业务口径与取数模板的起草助手。读给定的业�
 
 硬性约束：
 1. 只输出一个 JSON 对象，不要写解释，不要写 Markdown 代码块之外的话。
-2. sql 是取数模板，只能是**一条只读 SELECT**：不要多语句、不要 INSERT/UPDATE/DELETE/DDL，也不要在注释后面再藏一条。
+2. 每组的 sql 是取数模板，只能是**一条只读 SELECT**：不要多语句、不要 INSERT/UPDATE/DELETE/DDL，也不要在注释后面再藏一条。
    表和列只能来自「数据目录」，表名、列名照抄，不许猜、不许编。
-3. sql 里需要按入口筛选时写 '{{ input.字段名 }}'（字符串）或 {{ input.字段名 }}（数），并在 entry_fields 里声明同名
+3. sql 里需要按入口筛选时写 '{{ input.字段名 }}'（字符串）或 {{ input.字段名 }}（数），并在该组的 entry_fields 里声明同名
    字段；不要把日期、门店之类的字面量写死。
-4. 每条指标都要有 expression，固定写成 cell(nodes.fetch, 0, '列名')，列名是 sql 最外层 SELECT 的输出列名。
+4. 每条指标都要有 expression，固定写成 cell(nodes.fetch, 0, '列名')，列名是这组 sql 最外层 SELECT 的输出列名。
 5. 每条指标的定义必须带 citations：引用逐字抄原文，chunk 写材料里方括号内的 id。核对不上、或原文里没有依据的定义
    不要写进指标，写进 open_questions。
 6. 拿不准的不要猜，写进 open_questions，用一句问得清的话。不要编造文档里没有的数字、单位、生效日期。
-7. **一次只起草能共用同一条 SQL 的一组指标，最多 6 条。** 文档里其余的指标不要硬凑进这一条 SQL，把名称写进
-   uncovered（字符串数组），下一轮再起草。不同粒度、不同表、不同时间字段的指标本来就不该共用一条 SQL。
-   human 里会列出「已经起草过的指标」：这些不要重复起草，这一组只从未起草的指标里选，剩下的未起草指标都写进 uncovered。
+7. **一次尽量多交几组。** 每组是能共用同一条 SQL 的指标，最多 6 条；不同粒度、不同表、不同时间字段的指标不要硬凑
+   进同一组。文档里其余的指标不要硬凑，把名称写进 uncovered（字符串数组），下一轮再起草。human 里会列出「已经起草
+   过的指标」：这些不要重复起草，剩下的未起草指标都写进 uncovered。
 8. **sql 要短。** 能用 GROUP BY 和聚合表达的，不要为每个属性枚举一长串 CASE WHEN 列；输出额度有限，SQL 写长了，
    后面的指标就写不出来了。
-9. 写不下时宁可少写几条指标、把剩下的写进 uncovered，**也不要让 JSON 半截断掉**。
+9. 写不下时宁可少写几组、把剩下的写进 uncovered，**也不要让 JSON 半截断掉**。
 10. **同一件事只做一个入口。** 工厂、产线这类维度全图只给一个字段，不要为不同的表各造一个
     （factory_code / plant_code / workshop_code 说的是同一件事）；跨表的编码差异在 sql 里用 JOIN 或子查询映射，
     不要让填参数的人重复填等价编码。
@@ -88,27 +90,31 @@ _SYSTEM = """你是业务口径与取数模板的起草助手。读给定的业�
 
 输出格式：
 {
-  "entry_fields": [
-    {"name": "start", "type": "string", "required": true, "default": "", "description": "开始日期，格式 YYYY-MM-DD"}
-  ],
-  "sql": "SELECT SUM(amount) AS gmv FROM orders WHERE paid_at >= '{{ input.start }}'",
-  "metrics": [
+  "groups": [
     {
-      "id": "m1",
-      "name": "指标名称",
-      "synonyms": ["同义词"],
-      "unit": "单位（文档没写就留空）",
-      "decimals": 2,
-      "expression": "cell(nodes.fetch, 0, 'gmv')",
-      "definition": {
-        "text": "口径说明",
-        "scope": "适用范围",
-        "exclusions": ["不包含的情况"],
-        "owner": "文档写明的负责人或部门",
-        "effective_from": "生效日期（文档原文写法）",
-        "citations": [{"chunk": "c1", "quote": "逐字原文"}]
-      },
-      "open_questions": ["还没说清、需要业务确认的问题"]
+      "entry_fields": [
+        {"name": "start", "type": "string", "required": true, "default": "", "description": "开始日期，格式 YYYY-MM-DD"}
+      ],
+      "sql": "SELECT SUM(amount) AS gmv FROM orders WHERE paid_at >= '{{ input.start }}'",
+      "metrics": [
+        {
+          "id": "m1",
+          "name": "指标名称",
+          "synonyms": ["同义词"],
+          "unit": "单位（文档没写就留空）",
+          "decimals": 2,
+          "expression": "cell(nodes.fetch, 0, 'gmv')",
+          "definition": {
+            "text": "口径说明",
+            "scope": "适用范围",
+            "exclusions": ["不包含的情况"],
+            "owner": "文档写明的负责人或部门",
+            "effective_from": "生效日期（文档原文写法）",
+            "citations": [{"chunk": "c1", "quote": "逐字原文"}]
+          },
+          "open_questions": ["还没说清、需要业务确认的问题"]
+        }
+      ]
     }
   ],
   "open_questions": ["跨指标、以及整条 SQL 还没把握的问题"],
@@ -325,6 +331,108 @@ async def plan(session: Any, *, docs: list[dict], chunks: dict[str, dict], guida
 # ==========================================================================
 
 
+def _reply_groups(data: Mapping) -> list[dict]:
+    """从模型回复里取分组：有 groups 数组就逐项收；旧形状（顶层 sql + metrics）当成只有一组。"""
+    raw = data.get("groups")
+    if isinstance(raw, list):
+        return [dict(group) for group in raw if isinstance(group, Mapping)]
+    return [dict(data)] if (data.get("sql") or data.get("metrics")) else []
+
+
+async def plan_groups(session: Any, *, docs: list[dict], chunks: dict[str, dict], guidance: str = "",
+                      datasource: dict | None = None, tables_text: str = "", model: Any = None,
+                      covered: Sequence[str] = (), fixed: str = "") -> dict:
+    """一次模型调用，交回**多组**草案（未校验）：{groups, open_questions, uncovered, model_id, ...}。
+
+    和 plan() 的区别只在输出形状：模型一次尽量交几组「能共用一条 SQL 的指标」，剩下的写 uncovered；调用方不必为一组
+    指标各调一次模型。每组的结构仍是 {sql, entry_fields, metrics}，交给 normalize_plan 逐组校验；一组不合格只丢那一组，
+    不影响别的组。旧形状（顶层 sql + metrics）也收，当成只有一组——模型不按新格式回时不用整份作废。
+    """
+    from app.engine.state import message_text
+
+    if model is None:
+        from app.data.recipe_ai import resolve_draft_model
+
+        model, model_id, availability = await resolve_draft_model(session)
+        if model is None or not getattr(availability, "available", False):
+            raise docdraft.DraftUnavailable(getattr(availability, "reason", "") or "AI 起草不可用")
+    else:
+        named = getattr(model, "model_name", None) or getattr(model, "model", None)
+        model_id = named if isinstance(named, str) else ""
+
+    kept, tables, doc_truncated, catalog_truncated = _fit(docs, chunks, guidance, datasource, tables_text,
+                                                          covered, fixed)
+    reply = await model.ainvoke(prompt(docs, kept, guidance, datasource, tables, covered, fixed))
+    text = message_text(reply)
+    salvaged = False
+    try:
+        data = docdraft.parse_reply(text)
+    except ValueError:
+        salvaged_data = _salvage_reply(text)
+        if salvaged_data.get("sql") or salvaged_data.get("metrics"):
+            data = salvaged_data
+        else:
+            data = {"groups": [], "open_questions": [], "uncovered": []}
+        salvaged = True
+    groups = _reply_groups(data)
+    questions = data.get("open_questions")
+    uncovered = data.get("uncovered")
+    diagnostics = ""
+    if not groups:
+        keys = "、".join(str(key) for key in data) or "无"
+        diagnostics = f"模型回复里没有可读的分组（顶层键：{keys}）"
+        if salvaged:
+            diagnostics += "；回复被截断，没有抢救出完整的一组"
+    return {
+        "groups": groups,
+        "open_questions": [q for q in questions if isinstance(q, str) and q.strip()]
+        if isinstance(questions, list) else [],
+        "uncovered": [q.strip() for q in uncovered if isinstance(q, str) and q.strip()]
+        if isinstance(uncovered, list) else [],
+        "salvaged": salvaged,
+        "diagnostics": diagnostics,
+        "model_id": model_id,
+        "doc_truncated": doc_truncated,
+        "catalog_truncated": catalog_truncated,
+        "truncated": doc_truncated or catalog_truncated,
+    }
+
+
+async def repair_group(session: Any, *, group: Mapping, problems: list[dict], docs: list[dict],
+                       chunks: dict[str, dict], guidance: str = "", datasource: dict | None = None,
+                       tables_text: str = "", model: Any = None, fixed: str = "") -> dict:
+    """只重写一组：把这一组原来的指标和没通过校验的原因交回模型，返回修好的原始组（未校验）。
+
+    修不出来返回 {}，由调用方照实记失败，不让整份草稿跟着作废。修的时候只给这一组的指标名和问题，不让模型重排别的组。
+    """
+    from app.engine.state import message_text
+
+    if model is None:
+        from app.data.recipe_ai import resolve_draft_model
+
+        model, _model_id, availability = await resolve_draft_model(session)
+        if model is None or not getattr(availability, "available", False):
+            raise docdraft.DraftUnavailable(getattr(availability, "reason", "") or "AI 起草不可用")
+    kept, tables, _doc_truncated, _catalog_truncated = _fit(docs, chunks, guidance, datasource, tables_text,
+                                                            (), fixed)
+    names = [str(metric.get("name") or metric.get("id")) for metric in group.get("metrics") or []
+             if isinstance(metric, Mapping) and (metric.get("name") or metric.get("id"))]
+    reasons = "；".join(f"{problem.get('name') or '问题'}：{problem.get('reason') or ''}"
+                        for problem in problems if problem.get("reason"))
+    repair = ("上一版这一组没有通过校验：" + (reasons or "原因不明") + "。"
+              + (f"这一组原来的指标：{'、'.join(names)}。" if names else "")
+              + "只重写这一组：保留原来的指标名，改正 sql / expression / entry_fields；不要重复别的组，也不要新增指标。")
+    full_guidance = f"{guidance}\n\n{repair}" if guidance.strip() else repair
+    reply = await model.ainvoke(prompt(docs, kept, full_guidance, datasource, tables, fixed=fixed))
+    text = message_text(reply)
+    try:
+        data = docdraft.parse_reply(text)
+    except ValueError:
+        data = _salvage_reply(text)
+    groups = _reply_groups(data)
+    return groups[0] if groups else {}
+
+
 def _entry_fields(value: Any, problems: list[dict]) -> list[dict]:
     """入口字段归一化：名字必填、不重名；类型落回能认的几种，认不出的按文字。"""
     out: list[dict] = []
@@ -402,8 +510,24 @@ def _sql_problem(sql: str, allowed_tables: set[str]) -> str | None:
     return None
 
 
+def _text(value: Any) -> str:
+    """文档起草交回的文字字段：去掉首尾空白；不是字符串的当没有。"""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _texts(value: Any) -> list[str]:
+    """文档起草交回的字符串列表：只收非空字符串（去首尾空白），别的类型和空项都丢掉。"""
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
 def _metric(item: Mapping, position: int, problems: list[dict]) -> dict | None:
-    """一条已经过 docdraft 引用核对的指标：再查 expression，归一成契约里的字段。"""
+    """一条已经过 docdraft 引用核对的指标：再查 expression，归一成契约里的字段。
+
+    grain / time_field / numerator / denominator / dimensions / filters 是文档起草里的业务描述。前端草稿页已经在画这几行，
+    这里不能像以前那样重建指标时丢掉；空值不写成空字符串（没有这个键就没有内容），dimensions / filters 只收非空字符串。
+    """
     name = str(item.get("name") or "").strip()
     expression = item.get("expression")
     if not isinstance(expression, str) or not _EXPRESSION.match(expression.strip()):
@@ -417,6 +541,9 @@ def _metric(item: Mapping, position: int, problems: list[dict]) -> dict | None:
         decimals = None
     synonyms = item.get("synonyms")
     questions = item.get("open_questions")
+    grain, time_field = _text(item.get("grain")), _text(item.get("time_field"))
+    numerator, denominator = _text(item.get("numerator")), _text(item.get("denominator"))
+    dimensions, filters = _texts(item.get("dimensions")), _texts(item.get("filters"))
     return {
         "id": str(item.get("id") or "").strip(),
         "name": name,
@@ -425,6 +552,13 @@ def _metric(item: Mapping, position: int, problems: list[dict]) -> dict | None:
         "unit": item.get("unit") if isinstance(item.get("unit"), str) else "",
         "decimals": decimals,
         "expression": expression.strip(),
+        "contract": {"shape": "scalar"},
+        **({"grain": grain} if grain else {}),
+        **({"time_field": time_field} if time_field else {}),
+        **({"numerator": numerator} if numerator else {}),
+        **({"denominator": denominator} if denominator else {}),
+        **({"dimensions": dimensions} if dimensions else {}),
+        **({"filters": filters} if filters else {}),
         "definition": {
             "text": definition.get("text") if isinstance(definition.get("text"), str) else "",
             "scope": definition.get("scope") if isinstance(definition.get("scope"), str) else "",
@@ -514,12 +648,12 @@ def _blocks(value: Any) -> list[dict]:
     return [dict(block) for block in value or [] if isinstance(block, Mapping)]
 
 
-def _merge_fields(target: dict[str, dict], value: Any, notes: list[str]) -> None:
+def _merge_fields(target: dict[str, dict], value: Any, notes: list[str], conflicts: set[str]) -> None:
     """入口字段按 name 合并，冲突取更保守的一边，**不抛错**。
 
     同一份文档分几轮起草，各组对同一个字段的声明常常对不上：一组说必填、另一组给了缺省；一组按数、另一组按文本。
     这不是错误——它们本来就是从不同批指标里各看了一次。合并时必填取并集（有一组要就必须给），类型取更宽的一个
-    （能填进文本），缺省和说明取先出现的非空值；每一处不一致记一条 note 交给人看，不悄悄拿一组覆盖另一组。
+    （能填进文本）。默认值冲突时清掉默认值、要求人填，不能自动把某一组的范围用于其他组；0 和 False 都是有效值。
 
     早先这里抛 ValueError，结果一份 34 条指标的草稿因为一个字段的 required 不同就整份作废——代价完全不成比例。
     """
@@ -545,7 +679,15 @@ def _merge_fields(target: dict[str, dict], value: Any, notes: list[str]) -> None
             merged["required"] = bool(old.get("required")) or bool(item.get("required"))
             notes.append(f"入口字段「{name}」在各组里的必填不一致，合并后按"
                          f"{'必填' if merged['required'] else '可选'}")
-        if not merged.get("default") and item.get("default") not in (None, ""):
+        old_default, new_default = merged.get("default"), item.get("default")
+        if old_default not in (None, "") and new_default not in (None, "") \
+                and (old_default != new_default or isinstance(old_default, bool) != isinstance(new_default, bool)):
+            conflicts.add(name)
+            notes.append(f"入口字段「{name}」在各组里的默认值不一致，已取消默认值，请确认后填写")
+        if name in conflicts:
+            merged.pop("default", None)
+            merged["required"] = True
+        elif old_default in (None, "") and new_default not in (None, ""):
             merged["default"] = item["default"]
         if not merged.get("description") and item.get("description"):
             merged["description"] = item["description"]
@@ -556,9 +698,26 @@ def merge_entry_fields(blocks: Any) -> tuple[list[dict], list[str]]:
     """各组草案的入口字段合成一份：(字段, 不一致的说明)。调用方把说明摆给起草的人看。"""
     target: dict[str, dict] = {}
     notes: list[str] = []
+    conflicts: set[str] = set()
     for block in _blocks(blocks):
-        _merge_fields(target, block.get("entry_fields"), notes)
+        _merge_fields(target, block.get("entry_fields"), notes, conflicts)
     return list(target.values()), notes
+
+
+def unique_metric_ids(blocks: Any) -> None:
+    """把各组指标的 id 在全图里改成唯一，就地改调用方的 blocks。调用方在建图前调一次。
+
+    模型按组起草，每组都从 m1 开始；多组拼一张图时 id 会撞。build_graph 只改图里的副本，草稿 payload 和 groups
+    仍留着撞车的 id，页面的「指标 → 试跑值」就会张冠李戴（第二组的 m1 显示成第一组的数）。这里先改同一份 blocks，
+    图、payload、groups 和试跑值用同一组 id；本来就唯一的保持原 id 不动。
+    """
+    metrics = [metric for block in _blocks(blocks) for metric in block.get("metrics") or []
+               if isinstance(metric, dict)]
+    ids = [str(metric.get("id") or "").strip() for metric in metrics]
+    if "" not in ids and len(set(ids)) == len(ids):
+        return
+    for position, metric in enumerate(metrics, start=1):
+        metric["id"] = f"m{position}"
 
 
 def build_graph(blocks: Any, *, name: str, question: str = "", datasource: str = "") -> dict:
@@ -587,11 +746,12 @@ def build_graph(blocks: Any, *, name: str, question: str = "", datasource: str =
         return f"fetch_{index + 1}" if multi else "fetch"
 
     merged: dict[str, dict] = {}
+    conflicts: set[str] = set()
     metrics: list[dict] = []
     fetch_nodes: list[dict[str, Any]] = []
     source = str(datasource or "")
     for index, group in enumerate(groups):
-        _merge_fields(merged, group.get("entry_fields"), [])
+        _merge_fields(merged, group.get("entry_fields"), [], conflicts)
         node_id = nid(index)
         for metric in group.get("metrics") or []:
             if not isinstance(metric, Mapping):
@@ -639,4 +799,4 @@ def build_graph(blocks: Any, *, name: str, question: str = "", datasource: str =
 
 
 __all__ = ["ENTRY_TYPES", "MAX_INPUT_CHARS", "MAX_SQL_CHARS", "MAX_TABLES_CHARS", "METRIC_FIELDS",
-           "build_graph", "normalize_plan", "plan", "prompt"]
+           "build_graph", "normalize_plan", "plan", "plan_groups", "prompt", "repair_group", "unique_metric_ids"]

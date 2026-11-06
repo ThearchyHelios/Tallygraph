@@ -143,6 +143,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         from app.chat import job as chat_job
         from app.eval import runner as eval_runner, snapshots as eval_snapshots
 
+        from app.ledger import jobs as draft_jobs
+
+        await draft_jobs.manager.shutdown()
         await catalog_jobs.manager.shutdown()
         await catalog_profile_jobs.manager.shutdown()
         await introspect_jobs.manager.shutdown()
@@ -243,6 +246,7 @@ def _register_reapers() -> None:
     from app.data import catalog_jobs, catalog_profile_jobs, introspect_jobs
     from app.eval import runner as eval_runner, snapshots as eval_snapshots
     from app.process import actions, tasks
+    from app.ledger import jobs as draft_jobs
 
     async def documents(live: Any) -> int:
         return await _reap_documents(live)
@@ -250,6 +254,7 @@ def _register_reapers() -> None:
     for name, fn in (
         ("运行", run_manager.reap),
         ("处理中的文档", documents),
+        ("口径起草任务", lambda live: draft_jobs.startup(live=live)),
         ("数据目录起草任务", lambda live: catalog_jobs.startup(live=live)),
         ("数据剖析任务", lambda live: catalog_profile_jobs.startup(live=live)),
         ("探查任务", lambda live: introspect_jobs.startup(live=live)),

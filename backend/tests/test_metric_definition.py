@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import pytest
+
 from app.engine.schema import GraphSpec, validate_graph
 from tests import ledger_samples as S
 
@@ -208,3 +210,21 @@ def test_an_assessment_metric_is_labelled_assessed():
     assert label["kind"] == "assessed" and label["queries"] == ["q1"]
     assert label["assessment"]["level"] == "B" and label["definition_hash"] == "abc"
     assert "19900000501" not in str(label)
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf"])
+async def test_nonfinite_assessment_input_cannot_be_clamped_into_a_normal_score(raw):
+    from app.engine.runner import run_manager
+
+    await run_manager.setup()
+    try:
+        graph = S.chain(S.node("start", "input"), S.node("card", "metrics", caliber="评估", metrics=[{
+            "id": "quality", "kind": "assessment", "assessment": {
+                "dimensions": [{"name": "得分", "input": "input.raw", "weight": 1}],
+                "levels": [{"name": "合格", "min": 60}, {"name": "不合格", "min": 0}],
+            }}]), S.node("out", "output", fields=[{"name": "v", "value": "{{ nodes.card.text }}"}]))
+        started = await run_manager.start(graph=graph, input_payload={"raw": raw})
+        row = await S.wait(started.id)
+        assert row.status == "failed" and "输入必须是有限数值" in row.error
+    finally:
+        await run_manager.shutdown()

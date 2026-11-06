@@ -523,7 +523,8 @@ def comparable_phrase(verdict: str, reasons: Sequence[str], unknown: Sequence[st
     if verdict == "incomparable":
         return "两期不可比：" + "；".join(reasons)
     if verdict == "conditional":
-        return "两期有条件可比：" + "；".join(reasons)
+        details = [*reasons, *([f"{'、'.join(unknown)}核对不了"] if unknown else [])]
+        return "两期有条件可比：" + "；".join(details)
     return "两期可比" + (f"，{'、'.join(unknown)}核对不了" if unknown else "")
 
 

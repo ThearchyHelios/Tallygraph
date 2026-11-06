@@ -186,12 +186,13 @@ class Answer:
     problem: str | None = None
     analyses: list[dict[str, Any]] = field(default_factory=list)
     sentences: list[dict[str, Any]] = field(default_factory=list)
+    investigations: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {"run_id": self.run_id, "text": self.text, "values": self.values, "bare": self.bare,
                 "queries": self.queries, "cited": self.cited, "stats": self.stats, "tier": self.tier,
                 "report": self.report, "problem": self.problem, "analyses": self.analyses,
-                "sentences": self.sentences}
+                "sentences": self.sentences, "investigations": self.investigations}
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> Answer:
@@ -199,7 +200,7 @@ class Answer:
                    bare=list(raw.get("bare") or []), queries=list(raw.get("queries") or []),
                    cited=list(raw.get("cited") or []), stats=dict(raw.get("stats") or {}), tier=raw.get("tier"),
                    report=raw.get("report"), problem=raw.get("problem"), analyses=list(raw.get("analyses") or []),
-                   sentences=list(raw.get("sentences") or []))
+                   sentences=list(raw.get("sentences") or []), investigations=list(raw.get("investigations") or []))
 
 
 def _output_text(output: Any) -> str:
@@ -291,6 +292,11 @@ async def read_answer(run_id: str | None, *, reply: str | None = None) -> Answer
         return Answer(run_id=run_id, problem="作答的运行封存核对不一致，答案不能当证据")
     cache: dict[str, Any] = {}
     answer = Answer(run_id=run_id)
+    for node_id in sealed.nodes_of("agent", nested=True):
+        payload = sealed.payload_of([node_id]) or {}
+        investigation = payload.get("investigation")
+        if isinstance(investigation, dict) and investigation.get("active"):
+            answer.investigations.append({**investigation, "node_id": node_id})
     for artifact, info in sealed.queries.items():
         snap = _snapshot(artifact, cache)
         if snap is None:
@@ -614,6 +620,26 @@ def _expectation_scores(expectations: Sequence[Mapping[str, Any]], values: Mappi
             ok = path == "asked"
             out.append({**base, "outcome": "traced" if ok else "wrong",
                         **({} if ok else {"reason": "期望反问（问法含糊），助手却没有反问"})})
+            continue
+        if kind == "investigation":
+            findings = answer.investigations
+            problems = []
+            if answer.problem:
+                out.append({**base, "outcome": "ungradable", "reason": answer.problem})
+                continue
+            if not findings:
+                problems.append("没有封存的调查过程记录")
+            for finding in findings:
+                if finding.get("status") != exp.get("status", "complete"):
+                    problems.append("调查完成状态不符合期望")
+                if int(finding.get("depth") or 0) < int(exp.get("minimum_depth") or 0):
+                    problems.append("未达到要求的下钻深度")
+                if exp.get("stop_reason") and finding.get("stop_reason") != exp["stop_reason"]:
+                    problems.append("停止原因不符合期望")
+            if exp.get("max_queries") is not None and sum(int(f.get("query_count") or 0) for f in findings) > exp["max_queries"]:
+                problems.append("查询次数超出预算")
+            out.append({**base, "outcome": "wrong" if problems else "traced",
+                        "reason": "；".join(dict.fromkeys(problems)) or None, "investigations": findings})
             continue
         gold = values.get(exp["id"])
         if gold is None:

@@ -143,3 +143,15 @@ async def test_metric_synonyms_reach_the_descriptor(client):
     [made] = await descriptors(client, wf)
     [metric] = made["metrics"]
     assert metric["synonyms"] == ["月活", "MAU"]
+
+
+async def test_metric_constraints_and_semantic_identity_reach_the_descriptor(client):
+    graph = S.caliber_graph()
+    definition = {"shape": "scalar", "minimum": 0, "unit": "元"}
+    for node in graph["nodes"]:
+        if node["type"] == "metrics":
+            node["data"]["config"]["metrics"][0].update(contract=definition, grain="汇总", time_field="支付时间")
+    [made] = await descriptors(client, await S.publish(graph=graph))
+    [metric] = made["metrics"]
+    assert metric["contract"] == definition and metric["grain"] == "汇总"
+    assert metric["time_field"] == "支付时间" and made["semantic_hash"]

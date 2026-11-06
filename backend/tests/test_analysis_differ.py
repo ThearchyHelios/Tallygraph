@@ -24,7 +24,7 @@ async def rate(rows, **params):
 
 async def test_small_samples_use_fisher_and_say_it_may_be_noise():
     result = await rate([["西南", 2, 40], ["华东", 5, 230]])
-    assert result["method"] == "differ.rate@1"
+    assert result["method"] == "differ.rate@2"
     assert result["verdict"] == {"code": "no_evidence", "subjects": [["西南"], ["华东"]], "direction": None}
     assert result["values"]["test"] == "fisher" and result["values"]["n_a"] == "40" and result["values"]["n_b"] == "230"
     assert Fraction(result["values"]["p"]) == pytest.approx(stats.fisher_exact(2, 38, 5, 225), rel=1e-9)
@@ -91,7 +91,7 @@ async def test_means_from_sums_and_squares_use_welch():
     assert Fraction(result["values"]["p"]) == pytest.approx(expected.p, rel=1e-9)
     assert result["verdict"]["code"] == "differs" and result["values"]["test"] == "welch"
     assert result["phrase"] == "线上的客单价（50）高于线下（40），差异站得住"
-    assert result["method"] == "differ.welch@1" and result["settings"] == {"differ_alpha": 0.05, "min_n": 30}
+    assert result["method"] == "differ.welch@2" and result["settings"] == {"differ_alpha": 0.05, "min_n": 30}
 
 
 async def test_means_from_mean_sd_and_n_and_small_samples():
@@ -111,7 +111,7 @@ async def test_rows_mode_flags_a_single_value_that_flips_the_verdict():
     online[-1] = ["线上", "231.3"]
     s = snap("Q1", "SELECT channel, amount FROM orders", ["channel", "amount"], online + base)
     result = await analyze("differ", "rows", snaps=[s], query="Q1", by="channel", value="amount", label="客单价")
-    assert result["method"] == "differ.welch_rows@1"
+    assert result["method"] == "differ.welch_rows@2"
     assert result["verdict"]["code"] == "differs"
     note = next(c for c in result["caveats"] if c["code"] == "outlier_sensitive")
     assert note["text"] == "去掉最大的一笔后，差异不再站得住"

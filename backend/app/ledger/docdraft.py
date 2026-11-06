@@ -21,11 +21,25 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-#: 草稿的状态。ready 是主路径的常态：图已生成（含取数 SQL）、没有未决问题、可试跑可签字发布；questions_open 有图也有数，
-#: 只是问题还没清完（不阻断试跑）；path_pending 只留给这次改版之前起草、还没有取数路径的老草稿；attached 是经辅助入口接上
-#: 一次真实运行之后的。failed 是起草这一步没跑成（没有可用模型、模型回复读不懂、SQL 不合格），和 rejected（人判它不是口径）
-#: 不是一回事。
+#: 草稿的状态（机器判别的落点，接口按它返回）。界面上只看得到四种阶段（STAGES）：草稿在写、待审、已丢弃、失败。
+#: ready 是主路径的常态：图已生成（含取数 SQL）、没有未决问题、可试跑可签字发布；questions_open 有图也有数，只是问题
+#: 还没清完（不阻断试跑）；path_pending 留给这次改版之前起草、还没有取数路径的老草稿；attached 是经辅助入口接上一次
+#: 真实运行之后的。这些在界面上都归到「待审」。failed 是起草这一步没跑成（没有可用模型、模型回复读不懂、SQL 不合格），
+#: rejected 是人判它不是口径——两者不是一回事。
 STATUSES = ("drafting", "ready", "questions_open", "path_pending", "attached", "rejected", "failed")
+#: 界面上的四种阶段。状态仍按 STATUSES 存（接口兼容、画布和试跑按细状态走），页面按阶段画、按阶段筛。
+STAGES = ("drafting", "review", "discarded", "failed")
+
+
+def stage_of(status: str) -> str:
+    """细状态 → 界面阶段：ready / questions_open / path_pending / attached 都是「待审」，rejected 是「已丢弃」。"""
+    if status == "drafting":
+        return "drafting"
+    if status == "rejected":
+        return "discarded"
+    if status == "failed":
+        return "failed"
+    return "review"
 
 #: 一次发给模型的总字数上限（按 chunk 边界截断，见 extract）
 MAX_INPUT_CHARS = 40000
@@ -585,6 +599,6 @@ salvage_metrics = _salvage_metrics
 
 __all__ = [
     "DEFINITION_FIELDS", "DraftUnavailable", "FORBIDDEN_FIELDS", "MAX_INPUT_CHARS", "METRIC_FIELDS",
-    "MIN_QUOTE_CHARS", "STATUSES", "alignment", "extract", "merge_definition", "normalize_metrics",
-    "parse_reply", "prompt", "salvage_metrics", "verify_quote",
+    "MIN_QUOTE_CHARS", "STAGES", "STATUSES", "alignment", "extract", "merge_definition", "normalize_metrics",
+    "parse_reply", "prompt", "salvage_metrics", "stage_of", "verify_quote",
 ]

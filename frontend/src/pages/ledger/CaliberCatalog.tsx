@@ -7,13 +7,14 @@
  */
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ChevronDown, FileText, Layers, Play, RefreshCw, Search } from 'lucide-react'
+import { ChevronDown, Layers, Play, Plus, RefreshCw, Search } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '../../api/client'
 import { SchemaForm } from '../../components/SchemaForm'
 import { EmptyState, ErrorState, Notice, PageHeader, Skeleton, Spinner, toast } from '../../components/ui'
 import { LEDGER_TEXT } from '../../lib/terms'
 import { LEDGER_UI } from '../../lib/termsLedger'
+import { TrialResult, TrialValidation } from './TrialResult'
 import type { FormSchema } from '../../typesApp'
 import type { CaliberDescriptor, CaliberTrialOut } from '../../typesLedger'
 
@@ -80,8 +81,9 @@ export function CaliberCatalog() {
     <div className="flex h-full flex-col" data-caliber-catalog="">
       <PageHeader icon={<Layers size={14} />} title="口径" subtitle="已发布口径的入口、指标、依赖与试运行"
                   actions={<>
-                    <Link to="/ledger/drafts" className="btn btn-xs btn-ghost" data-caliber-drafts-link="">
-                      <FileText size={12} aria-hidden /> {LEDGER_UI.drafts.entry}
+                    <Link to="/ledger/drafts" className="btn btn-xs btn-primary" data-caliber-drafts-link=""
+                           title="从业务文档起草；已经有答案的，在草稿里接一次运行">
+                      <Plus size={12} aria-hidden /> {LEDGER_UI.drafts.entry}
                     </Link>
                     <button type="button" className="btn btn-xs btn-ghost" onClick={load} title="重新加载">
                       <RefreshCw size={12} aria-hidden /> 刷新
@@ -204,9 +206,17 @@ export function CaliberCatalog() {
                             <Notice tone={result.status === 'running' ? 'info' : 'err'}>
                               {result.status === 'running' ? '还在运行：' : '试运行没有成功：'}
                               {result.error || result.status}
-                              {' '}<Link className="underline" to={`/runs/${result.run_id}`}>看运行</Link>
                             </Notice>
                           )}
+                          {result.run_id && (
+                            <div className="mt-1">
+                              <Link className="text-2xs text-accent hover:underline" to={`/runs/${result.run_id}`}
+                                    data-caliber-trial-run="">
+                                {LEDGER_UI.drafts.trialRun}
+                              </Link>
+                            </div>
+                          )}
+                          {result.status === 'succeeded' && <><TrialValidation report={result.validation} /><TrialResult queries={result.queries} /></>}
                         </div>
                       )}
                     </div>
