@@ -10,7 +10,7 @@
 - retry_after_review：复核之后要不要带着原图重来一次；
 - retry_instruction：重来时交给助手的那句话（两种措辞）。
 
-接口把决定交给问数据页：/copilot/generate-stream 的 final 带 next（run | ready | fail），error 带 next（retry | fail），
+接口把决定交给问数据页：/copilot/generate-stream 的 final 带 next（run | ready | done | fail），error 带 next（retry | fail），
 /copilot/review 的结果带 retry_instruction（要重来时是那句话，不重来是 null）。问数据页照后端给的走；老后端没有这两个字段时退回它自己那份同样的
 规则（tests/test_chat_turn_policy.py 逐条对照两边的常量和措辞）。评测（第 3 波）用同一组函数把一轮串起来。
 
@@ -26,9 +26,9 @@ from typing import Any
 #: 一轮最多自动试几次（含第一次）：第二次还不行多半是问题本身没说清，该让用户介入（同 chat.ts 的 MAX_ATTEMPTS）
 MAX_ATTEMPTS = 2
 
-#: final 之后的三种走法（final.next）：运行、只建不跑（摆着等用户点运行）、判失败（没过检查的图不拿去跑）
-NEXT_RUN, NEXT_READY, NEXT_FAIL = "run", "ready", "fail"
-NEXT_STEPS = (NEXT_RUN, NEXT_READY, NEXT_FAIL)
+#: final 之后的四种走法（final.next）：运行、只建不跑（摆着等用户点运行）、这一轮已经有了跑完的运行（固定执行）、判失败
+NEXT_RUN, NEXT_READY, NEXT_DONE, NEXT_FAIL = "run", "ready", "done", "fail"
+NEXT_STEPS = (NEXT_RUN, NEXT_READY, NEXT_DONE, NEXT_FAIL)
 #: 别的结局：直接回答了（reply）、助手反问了等用户答（asked）、重来一次（retry：没自查过的老服务端交来没过检查的图，或者
 #: 生成过程一个操作都没给）
 NEXT_REPLY, NEXT_ASKED, NEXT_RETRY = "reply", "asked", "retry"
@@ -77,9 +77,11 @@ def next_step(terminal: Mapping[str, Any] | None, *, self_checked: bool = True) 
     - reply：直接回答，这一轮到此为止；只有反问：等用户回答；
     - error：生成过程一个操作都没给（code 是 EMPTY_GENERATION）时重来一次（retry，次数由调用方按 MAX_ATTEMPTS 管，原因
       取 error_reason），别的判失败；
-    - final：有 error 级问题时，服务端已经自查过（收到过 check 的结论）就判失败——没过的问题已经交回模型在同一轮里改过
-      了，再整轮重来是再烧一次完整生成、改的还是同一批问题；没自查过（老服务端）才重来一次（retry）；模型说不运行
-      （autorun=false：用户要的是流程本身、或者问了用户）只建不跑；其余运行。
+    - final：这一轮的运行**已经在生成这一轮里跑完了**（固定执行的 final 带 execution.run_id，app/ledger/nlchange 的两条
+      接缝）就是 NEXT_DONE——不发起第二次，收下那次运行（chat/drive.TurnDriver 把 run_id 记进这一轮）；有 error 级问题时，
+      服务端已经自查过（收到过 check 的结论）就判失败——没过的问题已经交回模型在同一轮里改过了，再整轮重来是再烧一次完整
+      生成、改的还是同一批问题；没自查过（老服务端）才重来一次（retry）；模型说不运行（autorun=false：用户要的是流程本身、
+      或者问了用户）只建不跑；其余运行。
     """
     if terminal is None:
         return NEXT_ASKED
@@ -90,11 +92,22 @@ def next_step(terminal: Mapping[str, Any] | None, *, self_checked: bool = True) 
         return NEXT_RETRY if terminal.get("code") in RETRY_ERRORS else NEXT_FAIL
     if kind != "final":
         return NEXT_FAIL
+    # 这一轮的运行已经跑完了：运行已经发生，不能再按 ready / run 解释一遍（见 _completed_run）
+    if _completed_run(terminal):
+        return NEXT_DONE
     if _blockers(terminal):
         return NEXT_FAIL if self_checked else NEXT_RETRY
     if terminal.get("autorun") is False:
         return NEXT_READY
     return NEXT_RUN
+
+
+def _completed_run(terminal: Mapping[str, Any]) -> str | None:
+    """生成这一轮里就跑完的那次运行（final.execution.run_id）；不是固定执行那一档、没有运行 id 时为 None。"""
+    execution = terminal.get("execution")
+    if not isinstance(execution, Mapping):
+        return None
+    return str(execution.get("run_id") or "") or None
 
 
 def error_reason(error: Mapping[str, Any]) -> str:
@@ -179,7 +192,7 @@ def has_nodes(graph: Any) -> bool:
     return isinstance(graph, Mapping) and bool(graph.get("nodes"))
 
 
-__all__ = ["EMPTY_FALLBACK", "EMPTY_GENERATION", "MAX_ATTEMPTS", "NEXT_ASKED", "NEXT_FAIL", "NEXT_READY",
+__all__ = ["EMPTY_FALLBACK", "EMPTY_GENERATION", "MAX_ATTEMPTS", "NEXT_ASKED", "NEXT_DONE", "NEXT_FAIL", "NEXT_READY",
            "NEXT_REPLY", "NEXT_RETRY", "NEXT_RUN", "NEXT_STEPS", "QUESTION_FIELD", "RETRY_EMPTY", "RETRY_ERRORS",
            "RETRY_FROM_SCRATCH", "RETRY_USER_WITH_BASE", "RETRY_WITH_BASE", "blocked_reason",
            "empty_retry_instruction", "error_reason", "fill_input", "has_nodes", "next_step", "retry_after_review",

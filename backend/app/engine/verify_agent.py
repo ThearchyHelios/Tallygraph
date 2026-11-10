@@ -63,12 +63,13 @@ from typing import Any
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+from app.capabilities.registry import is_platform_query, query_items, snapshot_owned
 from app.core import artifact_store
 from app.core.errors import describe_exception, not_configured
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.engine import spend
-from app.engine.evidence import build_catalog, cell_eid, compose_doc, query_entry_fields, schema_ledger_entry
+from app.engine.evidence import build_catalog, cell_eid, compose_doc, schema_ledger_entry
 from app.engine.expressions import CellError, column_kind, locate_cell, numeric_text
 from app.engine.judge import FALLBACK_MAX_TOKENS, MAX_TOKENS, _json_in, _tokens, _usd
 from app.engine.masking import SeenValues, _masked_word, _Secrets
@@ -79,7 +80,7 @@ from app.providers import catalog as pricing
 from app.providers.budget import BudgetFallback, budget_refused, cut_off, cut_words, error_usage, truncated_error
 from app.providers.factory import ModelSpec, ProviderNotConfigured, bind_tools_safely, get_chat_model
 from app.tools.datasource import MASKED_VALUES_KEY, QUERY_PREFIX, SCHEMA_PREFIX, build_datasource_tools
-from app.tools.registry import ToolArgsError, ToolContext, Versions, args_model_of, prepare_args
+from app.tools.registry import ToolArgsError, ToolContext, Versions, args_model_of, execution_id_of, prepare_args
 
 logger = logging.getLogger(__name__)
 
@@ -960,7 +961,10 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
                     await _announce(emit, EventType.TOOL_ERROR, tool=name, call_id=call_id, error=str(e), role="verify")
                     messages.append(ToolMessage(content=str(e), tool_call_id=call_id))
                     continue
-            is_query = name.startswith(QUERY_PREFIX)
+            # 平台执行的查询都算「一次查询」：数据源查询、K10 的口径查询（caliber_query，一次交回多条 SQL）都一样按
+            # 调用次数记账。按身份认（is_platform_query），不看结果长得像不像；db_query、db_schema 这些能绑进来的
+            # 工具判出来和按前缀认完全一样，旧行为不变
+            is_query = is_platform_query(name)
             fingerprint = f"{name}\n{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"
             if is_query and fingerprint in done:
                 alias = done[fingerprint]
@@ -977,14 +981,18 @@ async def _verify(state: _State, *, spec: ModelSpec, system: str, task: str, sou
                 stopped = "timeout_s"
                 messages.append(ToolMessage(content="未执行：已达核查的时长上限，不能再查询。", tool_call_id=call_id))
                 continue
-            content = await _run_tool(tool, name, args, call_id, remaining, emit, queries, ledger, owner)
+            before = len(queries)
+            content = await _run_tool(tool, name, args, call_id, remaining, emit, queries, ledger, owner,
+                                      run_id=run_id)
             if content is None:
                 stopped = "timeout_s"
                 content = "查询因核查的时长上限被中断，没有结果。"
             if is_query:
                 attempts += 1
-                if queries and queries[-1]["call_id"] == call_id:
-                    done[fingerprint] = queries[-1]["alias"]
+                # 一模一样的不再执行（done 按工具名 + 参数认）。一次调用交回多条查询（口径查询）时记的是**第一条**
+                # 的编号：交回模型的那句「结果见 Qn」点的是它
+                if len(queries) > before:
+                    done[fingerprint] = queries[before]["alias"]
             messages.append(ToolMessage(content=content, tool_call_id=call_id))
         if not stopped and max_queries is not None and attempts >= max_queries:
             stopped = "max_queries"
@@ -1112,13 +1120,29 @@ def _with_fallback(model: Any, spec: ModelSpec, small: int | None, model_id: str
                           key=(spec.provider, model_id, spec.max_tokens))
 
 
+async def _owned_queries(content: str, name: str, *, run_id: str) -> list[dict[str, Any]]:
+    """这次工具调用交回、**可以作证**的查询条目：按身份摊开（capabilities.registry.query_items——数据源查询一条、
+    K10 的口径查询是 queries 数组里**多条**），逐条认工件（snapshot_owned——口径查询那条必须是这次运行或它明确派生的
+    子运行落下的查询快照，伪造的、别的运行落的、别的种类的一律不要）。不是平台执行的查询返回空：拼一份同样形状的
+    JSON 不算证据。抽取和认工件与 Agent 节点、调用工具节点是同一份，不另写一套按结果长相猜的逻辑。"""
+    if not is_platform_query(name):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in query_items(content, name):
+        artifact = str(item.get("artifact") or "")
+        if artifact and await snapshot_owned(artifact, run_id, name):
+            out.append(item)
+    return out
+
+
 async def _run_tool(tool: Any, name: str, args: dict[str, Any], call_id: str, remaining: float | None,
                     emit: Emit | None, queries: list[dict[str, Any]], ledger: list[dict[str, Any]],
-                    owner: str) -> str | None:
+                    owner: str, run_id: str = "") -> str | None:
     """执行一次工具调用，返回交给模型的内容；整个核查的时长到点、这次被中断时返回 None。
 
-    成功的查询编号（Q1、Q2…）、记进本 agent 自己的台账和查询清单，内容前面加「【证据 Qn】」。
-    """
+    成功的查询编号（Q1、Q2…）、记进本 agent 自己的台账和查询清单，内容前面加「【证据 Qn】」。一次调用交回**多条**查询
+    （K10 的口径查询，结果里是 queries 数组）时逐条编号、逐条记：抽取与认工件走和数据源查询同一份
+    （capabilities.registry.query_items / snapshot_owned），不因为带的是数组就只认第一条。"""
     limit = limit_of(tool, name, args)
     await _announce(emit, EventType.TOOL_START, tool=name, args=args, call_id=call_id, role="verify",
                     **limit_fields(limit))
@@ -1143,28 +1167,44 @@ async def _run_tool(tool: Any, name: str, args: dict[str, Any], call_id: str, re
                         duration_ms=int((time.perf_counter() - began) * 1000), error=message[:300])
         return message
     elapsed = int((time.perf_counter() - began) * 1000)
-    fields = query_entry_fields(content) if name.startswith(QUERY_PREFIX) else None
+    items = await _owned_queries(content, name, run_id=run_id)
     extra: dict[str, Any] = {}
-    if fields is not None:
-        alias = f"Q{len(queries) + 1}"
+    if items:
         data = json.loads(content)
-        schema = fields.get("schema_artifact")
-        seen = schema and any(e.get("kind") == "schema" and e.get("artifact") == schema for e in ledger)
-        frozen = schema_ledger_entry(schema, node_id=owner, exec_no=1) if schema and not seen else None
-        shaped = {"schema_artifact": schema, "tables": fields["tables"]} if seen or frozen else {}
-        ledger.append({"kind": "query", "node_id": owner, "exec": 1, "artifact": fields["artifact"],
-                       "call_id": call_id, "tool": name, "source": fields["source"], "columns": fields["columns"],
-                       "rows": fields["rows"], "truncated": fields["truncated"], **shaped})
-        if frozen:
-            ledger.append(frozen)
-        queries.append({"alias": alias, "call_id": call_id, "tool": name, "source": fields["source"],
-                        "sql": str(data.get("sql") or args.get("sql") or ""), "artifact": fields["artifact"],
-                        "columns": fields["columns"], "rows": data.get("rows") or [], "row_count": fields["rows"],
-                        "truncated": fields["truncated"]})
-        extra = {"query_artifact": fields["artifact"], "alias": alias,
-                 **({"schema_artifact": schema} if schema else {}),
+        aliases: list[str] = []
+        artifacts: list[str] = []
+        for item in items:
+            alias = f"Q{len(queries) + 1}"
+            aliases.append(alias)
+            artifact = str(item["artifact"])
+            artifacts.append(artifact)
+            schema = item.get("schema_artifact")
+            seen = schema and any(e.get("kind") == "schema" and e.get("artifact") == schema for e in ledger)
+            frozen = schema_ledger_entry(schema, node_id=owner, exec_no=1) if schema and not seen else None
+            shaped = {"schema_artifact": schema, "tables": item["tables"]} if seen or frozen else {}
+            # 实际执行的执行身份（K10）：query_id 是逻辑查询、execution_id 是这一次、attempt 是第几次。口径查询那条
+            # 自己带着（K09 算好的），别的按这次调用的 id 算（同 Agent 节点、调用工具节点）
+            identity = {"query_id": item.get("query_id") or owner,
+                        "execution_id": item.get("execution_id") or execution_id_of(owner, attempt=1,
+                                                                                   call_id=call_id, run_id=run_id),
+                        "attempt": item.get("attempt") or 1}
+            ledger.append({"kind": "query", "node_id": owner, "exec": 1, "artifact": artifact,
+                           "call_id": call_id, "tool": name, "source": item.get("source"),
+                           "columns": item["columns"], "rows": item["rows"], "truncated": item["truncated"],
+                           **identity, **shaped})
+            if frozen:
+                ledger.append(frozen)
+            queries.append({"alias": alias, "call_id": call_id, "tool": name, "source": item.get("source"),
+                            "sql": str(data.get("sql") or args.get("sql") or ""), "artifact": artifact,
+                            "columns": item["columns"],
+                            "rows": (data.get("rows") or []) if data.get("artifact") == artifact else [],
+                            "row_count": item["rows"], "truncated": item["truncated"], **identity})
+        first = items[0]
+        extra = {"query_artifact": artifacts[0], "alias": aliases[0],
+                 **({"query_artifacts": artifacts} if len(artifacts) > 1 else {}),
+                 **({"schema_artifact": first["schema_artifact"]} if first.get("schema_artifact") else {}),
                  **({"checks": data["checks"]} if isinstance(data.get("checks"), list) and data["checks"] else {})}
-        content = f"【证据 {alias}】\n{content}"
+        content = f"【证据 {'、'.join(aliases)}】\n{content}"
     await _announce(emit, EventType.TOOL_END, tool=name, call_id=call_id, duration_ms=elapsed, preview=content[:2000],
                     role="verify", **extra)
     if len(content) > _TOOL_CHARS:

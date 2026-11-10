@@ -7,8 +7,8 @@
 - 召回运行：派生图里新旧两版的取数和口径卡各一份（前缀不撞），召回卡里算两版之差；同一份数据上两版各算一次；
 - 收尾：数变了才开 recall 待办（挂在召回运行上，旧值、新值、差值、原答案当时的值都给），推 ledger.recall，消息里没有数；
   数没变的在原答案上记 ledger.recalled（已按 vN 核对，不影响），不开待办；
-- 不能重算的照实记：新版入口要的参数这一组里没有、图里会写外部系统；图里别处有人工节点的照样重算（召回图碰不到它），
-  只是「按新版重新出具」不代人审批；
+- 不能重算的照实记：新版入口要的参数这一组里没有、旧版一侧的同一个问题（旧版取数要的参数绑出来是空串）、图里会写外部
+  系统；图里别处有人工节点的照样重算（召回图碰不到它），只是「按新版重新出具」不代人审批；
 - 待办「按新版重新出具」走按口径出具同一套判法、「知道了」；
 - 目录里影响数字的一项被改了：冻结目录里看得到它的答案标「依据有变」，按新目录多出错误级问题的才开待办；
 - 表结构变了：用过这张表的答案标「依据的表结构已变」，口径试算算不出来才开待办；
@@ -57,6 +57,22 @@ async def engine_up(tmp_path):
 async def client():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c
+
+
+@pytest.fixture
+def executed(monkeypatch) -> list[str]:
+    """这一次测试里真正发给数据库的语句（内联渲染之后的那一条），按先后：参数不完整的那条路一条都不该有。"""
+    from app.tools import datasource
+
+    seen: list[str] = []
+    real = datasource.run_query
+
+    async def spy(source, sql, **kw):
+        seen.append(sql)
+        return await real(source, sql, **kw)
+
+    monkeypatch.setattr(datasource, "run_query", spy)
+    return seen
 
 
 async def ledger_settings(**values) -> None:
@@ -302,6 +318,45 @@ async def test_incompatible_entry_and_side_effects_are_not_recomputed(monkeypatc
     assert view["counts"]["not_recomputable"] == 1 and view["groups"][0]["reason"] == group.problem
     assert view["can_continue"] is False
 
+
+async def test_an_old_side_parameter_this_group_has_no_value_for_is_not_recomputed(monkeypatch, executed):
+    """旧版的取数模板要的参数这一组里没有值（这一组的 SQL 里写的就是 region = ''，空串不是值；旧版又没声明缺省值）：
+
+    计划就照实记「无法重算」，不写「可重算」等召回运行起飞了才失败——不然「还剩几组没算」永远算不完，也看不出为什么。
+    运行时那道兜底照旧在：真按这份计划发起一组，运行的两版取数在发查询前再判一次，一条 SQL 都不发。"""
+    sql = ("SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' AND region = '{{ input.region }}' "
+           "AND paid_at >= '{{ input.start }}' AND paid_at < '{{ input.end }}'")
+    v1 = S.caliber_graph(sql)
+    v1["nodes"][0]["data"]["config"]["fields"] = [
+        {"name": "start", "required": True}, {"name": "end", "required": True}, {"name": "region"}]
+    wf = await S.publish(graph=v1)
+    await S.explore(monkeypatch, "select sum(o.amount) as 销售额 from orders o where o.paid_at >= '2026-09-01' "
+                                 "and o.status = 'paid' and o.region = '' and o.paid_at < '2026-09-08'",
+                    text="本周销售额 [[v:Q1.r0.销售额]]。", origin="chat")
+    await publish_v2(wf)                     # v2 的取数已经不带 region 了：只有旧版一侧要这个参数
+    async with SessionLocal() as session:
+        plan = await recall.build_plan(session, wf, 2)
+    [group] = plan.groups
+    assert group.binding == {"start": "2026-09-01", "end": "2026-09-08"}
+    assert group.problem == ("旧版 v1 的入口要的参数这一组里没有或不合规：参数「region」这次没有值："
+                             "入口字段没给值、也没有缺省值，不能当空串用（missing_parameter）"), group.problem
+    assert plan.todo() == [] and await recall.launch(wf, 2) == []
+    async with SessionLocal() as session:
+        view = await recall.batches(session, wf, 2)
+        assert await recall.recall_runs(session, wf, 2) == []
+    assert view["counts"]["not_recomputable"] == 1 and view["can_continue"] is False
+    assert view["groups"][0]["reason"] == group.problem
+    async with SessionLocal() as session:
+        preview = await recall.preview(session, wf, 2)
+    assert preview["not_recomputable"] == 1 and preview["recomputable"] == 0
+    assert preview["reasons"] == [{"reason": group.problem, "groups": 1}]
+
+    # 兜底还在：照这份计划真发起一次，运行在发查询前被参数完整性拦下（零 SQL）
+    graph, _ = recall.build_graph(group, plan.pairs[group.old_version])
+    sent = len(executed)
+    row = await S.wait((await run_manager.start(graph=graph.graph, input_payload=dict(group.inputs))).id)
+    assert row.status == "failed" and "region" in row.error and "missing_parameter" in row.error, row.error
+    assert executed[sent:] == []
 
 
 async def test_human_node_elsewhere_still_recomputes_but_reissue_refuses(client, monkeypatch):

@@ -30,8 +30,9 @@ from app.engine.deadline import segment
 from app.engine.replay import PROTOCOL, PROTOCOL_KEY, protocol_of
 from app.engine.schema import GraphSpec, NodeType, loop_steps, topology_of, validate_graph
 from app.process.actions import ActionPending
-from app.records.views import scope_entries
+from app.records.views import inherit_scope, scope_entries
 from app.tools.datasource import RUN_VERSIONS_KEY
+from app.tools.registry import RUN_CLASS_KEY, RUN_ORIGIN_KEY, RUN_STARTED_BY_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +290,7 @@ class RunManager:
         started_by: str | None = None,
         approval_default: str | None = None,
         options: dict[str, Any] | None = None,
+        data_versions: dict[str, Any] | None = None,
         schedule_id: str | None = None,
         notes: Sequence[tuple[EventType | str, str | None, dict[str, Any]]] = (),
         origin_kind: str | None = None,
@@ -299,6 +301,9 @@ class RunManager:
         """建运行记录、交给执行任务。options 是这次运行的选项快照，schedule_id 是发起它的定时任务（可空）。
         origin_kind / origin / app_id / app_version 是运行来源（engine/origin.py），由 launch_run 定下，原样记在运行上；
         对应的 run.origin 事件由 launch_run 放进 notes。
+
+        data_versions 给定时照它固定这一次运行的上传表格版本，不再读数据源的当前指针：K10 派生的子运行照父 Run 那一份
+        固定（运行中途有人重传，父子两段查的仍是同一版）。不给照旧按图里用到的源现读当前指针。
 
         notes 是发起时就定下的事件 (类型, node_id, 数据)，比如正式运行按什么级别出具、口径升版怎么处置。它们和
         运行记录同一个事务提交，排在 run.started 前面：写不进去就不建运行，不会出现运行已经在执行、调用方却
@@ -325,9 +330,16 @@ class RunManager:
             # 读上传表格的当前指针到运行记录提交，持着版本存储的锁：中间有人重传的话，发布后的回收
             # 看不到这条还没提交的运行，会把刚固定的快照删掉（table_versions.pin_lock）
             async with pin_lock():
-                data_versions = await _data_versions(session, spec)
-                # 记录表这次运行看哪些行：正式运行看全部，别的按发起人的授权（records/views.scope_entries）
-                await scope_entries(session, data_versions, run_class=run_class, started_by=started_by)
+                if data_versions is not None:
+                    # 调用方（K10 派生的子运行）给了固定的数据版本：照它，不再读当前指针，父子两段查同一版；
+                    # 记录表的行级范围也照父 Run 已授权的那一份**原样带着**，不在这里重算——子运行的类别是
+                    # exploratory，重算会把正式父 Run 的 all 收成 mine/none（views.inherit_scope）
+                    pinned_versions = copy.deepcopy(data_versions)
+                    inherit_scope(pinned_versions)
+                else:
+                    pinned_versions = await _data_versions(session, spec)
+                    # 记录表这次运行看哪些行：正式运行看全部，别的按发起人的授权（records/views.scope_entries）
+                    await scope_entries(session, pinned_versions, run_class=run_class, started_by=started_by)
                 run = Run(
                     workflow_id=workflow_id,
                     workflow_name=workflow_name,
@@ -343,7 +355,7 @@ class RunManager:
                     approval_default=approval_default,
                     tool_trust=tool_trust,
                     agent_limits=agent_limits,
-                    data_versions=data_versions,
+                    data_versions=pinned_versions,
                     options=options,
                     schedule_id=schedule_id,
                     origin_kind=origin_kind,
@@ -377,9 +389,12 @@ class RunManager:
                 approval_default=approval_default,
                 tool_trust=tool_trust,
                 agent_limits=agent_limits,
-                data_versions=data_versions,
+                data_versions=pinned_versions,
                 options=options,
                 origin_kind=origin_kind,
+                run_class=run_class,
+                started_by=started_by,
+                origin=origin,
             )
         )
         return run
@@ -777,6 +792,9 @@ class RunManager:
         resumed: list[str] | tuple[str, ...] = (),
         actors: dict[str, str | None] | None = None,
         origin_kind: str | None = None,
+        run_class: str = "exploratory",
+        started_by: str | None = None,
+        origin: dict[str, Any] | None = None,
     ) -> None:
         from app.cluster import slots
 
@@ -809,11 +827,15 @@ class RunManager:
         fenced = False
         # 先要并发名额（app/cluster/slots.py）。等名额的时候被停止（或者关停）也要照实收尾，见 _stopped_in_queue
         slot = slots.hold(run_id, origin_kind)
+        # K13：这次要并发名额用了多久（毫秒）——要名额前后各量一次。这一段在各段 started_at 之前，既不算 active 也不算
+        # wall，单独记在运行记录的 usage.queue_ms 上；它和等人审批的 wait_ms 是两回事，谁也不冒充谁
+        queued_at = time.perf_counter()
         try:
             await slot.__aenter__()
         except asyncio.CancelledError:
-            await self._stopped_in_queue(run_id)
+            await self._stopped_in_queue(run_id, queue_ms=_elapsed_ms(queued_at))
             raise
+        queue_ms = _elapsed_ms(queued_at)
         try:
             # 执行时长从拿到名额算起：排队等名额的那一段不算执行（墙钟从 started_at 算，started_at 也是拿到名额之后才写）
             started = time.perf_counter()
@@ -869,7 +891,12 @@ class RunManager:
                     extra={"resumed": set(resumed), "actors": dict(actors or {}),
                            RUN_VERSIONS_KEY: dict(data_versions) if data_versions is not None else None,
                            # 同理也是一份拷贝：节点读它，不该改到运行记录那份
-                           RUN_OPTIONS_KEY: copy.deepcopy(options or {})},
+                           RUN_OPTIONS_KEY: copy.deepcopy(options or {}),
+                           # K10：这次运行的类别、发起人与来源。构造 ToolContext 的节点把它们交给工具——caliber_query
+                           # 按 run_class 选用途（formal 走 formal judge）、拿发起人当主体，并把来源带进派生的子运行
+                           RUN_CLASS_KEY: run_class,
+                           RUN_STARTED_BY_KEY: started_by,
+                           RUN_ORIGIN_KEY: copy.deepcopy(origin) if origin else None},
                 )
                 app = compile_graph(spec, run_ctx).compile(checkpointer=self.checkpointer)
                 # 循环按自己声明的轮数另记一份预算，全局上限只管没人把关的环
@@ -980,7 +1007,8 @@ class RunManager:
                 try:
                     if not fenced:
                         await self._finalize(run_id, status, error, final_state, elapsed, terminal=terminal,
-                                             error_node=error_node, end_reason=end_reason, owner=mine)
+                                             error_node=error_node, end_reason=end_reason, owner=mine,
+                                             queue_ms=queue_ms)
                     # 记 action.unknown、安排核实也算收尾：做完才把自己摘掉。以前摘掉之后才做，等运行「不在跑了」
                     # 再去读事件的一方（接口、测试）有一小段读不到这一条；库慢一点（PostgreSQL 满载时）就读不到
                     if pending_action is not None and not fenced:
@@ -1048,9 +1076,11 @@ class RunManager:
             self._tasks.pop(run_id, None)
             self._stopped_by.pop(run_id, None)
 
-    async def _stopped_in_queue(self, run_id: str) -> None:
+    async def _stopped_in_queue(self, run_id: str, *, queue_ms: int = 0) -> None:
         """还在等并发名额时被取消。关停：什么都不写（还是排队中 / 刚认领的样子），照「属主不在了」的规矩由下次启动或别的
-        进程接手（排队的标失败、认领了的标中断）；人点了停止：收成 cancelled，同执行中停止（run.cancelled 带上是谁停的、封存）。"""
+        进程接手（排队的标失败、认领了的标中断）；人点了停止：收成 cancelled，同执行中停止（run.cancelled 带上是谁停的、封存）。
+
+        queue_ms 是这次等到被叫停时已经排了多久（毫秒）：照实记下来，不丢那一段。"""
         try:
             if self._closing:
                 return
@@ -1058,7 +1088,7 @@ class RunManager:
                 return
             actor = self._stopped_by.pop(run_id, None)
             self._finalizing.add(run_id)
-            await self._finalize(run_id, "cancelled", "用户取消", {}, 0,
+            await self._finalize(run_id, "cancelled", "用户取消", {}, 0, queue_ms=queue_ms,
                                  terminal=(EventType.RUN_CANCELLED, {"reason": END_STOPPED, "actor": actor}),
                                  end_reason=END_STOPPED, owner=identity.owner())
         finally:
@@ -1148,12 +1178,16 @@ class RunManager:
         error_node: str | None = None,
         end_reason: str | None = None,
         owner: str | None = None,
+        queue_ms: int = 0,
     ) -> None:
-        """收尾。owner：执行这一段的属主——运行那一行的属主已经不是它（被别的进程当成没了接手了，cluster/fence.py）就什么都不写。"""
+        """收尾。owner：执行这一段的属主——运行那一行的属主已经不是它（被别的进程当成没了接手了，cluster/fence.py）就什么都不写。
+
+        queue_ms：这一段等并发名额等了多久（K13，见 _drive）。它不进 active/wall（那两样从拿到名额之后算起），单独累加成
+        usage.queue_ms 随终态事件一起发出。"""
         usage = dict(state.get("usage") or {})
         output = dict(state.get("output") or {})
         now = datetime.now(timezone.utc)
-        timing = {"wall_ms": elapsed_ms, "active_ms": elapsed_ms, "wait_ms": 0}
+        timing = {"wall_ms": elapsed_ms, "active_ms": elapsed_ms, "wait_ms": 0, "queue_ms": max(0, int(queue_ms))}
 
         # 终态事件和运行记录在同一个事务里提交，提交之后再广播。两边都有人在读：
         # 读到 failed 的一方马上去翻事件，要翻得到 run.failed（报错原因和定位都在
@@ -1177,7 +1211,7 @@ class RunManager:
             if run:
                 app_id = run.app_id
                 run_class, origin_kind = run.run_class, run.origin_kind
-                timing = await _timing(session, run, elapsed_ms, now)
+                timing = await _timing(session, run, elapsed_ms, now, queue_ms=queue_ms)
                 events_usage = await _usage_of_events(session, run_id)
                 inquiry = events_usage.pop("inquiry", None)
                 if status != "succeeded":
@@ -1410,6 +1444,10 @@ def _carried(run: Run) -> dict[str, Any]:
         "options": run.options or {},
         # 并发名额按来源归类（app/cluster/slots.py）：恢复、接着跑的那一段和第一段同一类
         "origin_kind": run.origin_kind,
+        # K10：类别、发起人与来源照运行记录来——恢复、接着跑的那一段里，caliber_query 仍按同一个用途、同一个主体执行
+        "run_class": run.run_class or "exploratory",
+        "started_by": run.started_by,
+        "origin": run.origin if isinstance(run.origin, dict) else None,
     }
 
 
@@ -1432,11 +1470,15 @@ async def _data_versions(session: Any, spec: GraphSpec) -> dict[str, Any]:
     记录表（origin=records，docs/design/normal-user-apps.md N8）同样在这里固定高水位：{"seq": 高水位, …}
     （records/views.pin_entry）。这次运行看哪些行由发起处另外记上（records/views.scope_entries）：按需视图的缓存键
     只要高水位。
+
+    经某个口径（caliber_query 节点点名的那些）固定到的源，项上另记一条 `caliber` = 那份口径的固定目标
+    （querycore.target_key）：之后同一次运行里换了另一份口径目标、而这个源又换过版本时，那一层要照实说冲突
+    （querycore.pin_sources_for_parent），不能悄悄读另一版。
     """
     from app.db.models import DataSource
     from app.records.views import pin_entry
 
-    names, anything = await _bound_sources(session, spec)
+    names, anything, calibers = await _bound_sources(session, spec)
     if not names and not anything:
         return {}
     query = select(DataSource.id, DataSource.name, DataSource.current_snapshot_id).where(
@@ -1454,33 +1496,53 @@ async def _data_versions(session: Any, spec: GraphSpec) -> dict[str, Any]:
     for source in (await session.execute(records)).scalars():
         if (entry := await pin_entry(session, source)) is not None:
             out[source.id] = entry
+    for entry in out.values():
+        if key := calibers.get(str(entry.get("name") or "")):
+            entry["caliber"] = key
     return out
 
 
-async def _bound_sources(session: Any, spec: GraphSpec) -> tuple[set[str], bool]:
-    """图里（含子工作流）绑定的数据源工具指向的源名，以及有没有带模板、发起时定不下来的工具名。
+async def _bound_sources(session: Any, spec: GraphSpec) -> tuple[set[str], bool, dict[str, str]]:
+    """图里（含子工作流）绑定的数据源工具指向的源名、有没有带模板、发起时定不下来的工具名，以及**经口径固定**的
+    源名 → 那份口径的固定目标（`caliber` 标记，只给没有直接绑定的源）。
 
     绑定的取法和发起前检查同一个（engine/launch.py 的 tool_bindings），子工作流照运行时的取法
     读出来接着找：固定了版本的读那一版，没固定的读工作流现在的图。读不到、图不成形的跳过——
     那个节点运行时自己会报错。同一个工作流（同一版）只读一次，互相引用也不会转圈。
+
+    K10 还要多算一样：绑了 `caliber_query` 的节点，它真正读的取数节点**不在本图里**，在它点名的口径那一版图里
+    （`_caliber_sources`）。不在这里先固定，父 Run 的两次调用会各自在派生的子运行里补固定（pin_late），中间有人
+    重传就会一次运行里读两版数据。
     """
     # 在函数里导入：launch 在模块级导入了本模块（它要 run_manager）
     from app.engine.launch import node_setting, tool_bindings
     from app.db.models import WorkflowVersion
+    from app.ledger.querycore import CALIBER_QUERY
     from app.tools.datasource import source_of_tool
 
     names: set[str] = set()
+    direct: set[str] = set()
     anything = False
     seen: set[tuple[str, str]] = set()
+    calibers: dict[str, str] = {}
+    seen_calibers: set[tuple[str, str]] = set()
     queue: list[GraphSpec] = [spec]
     while queue:
         graph = queue.pop(0)
         for _, tool in tool_bindings(graph):
+            if tool == CALIBER_QUERY:
+                continue    # 它的源按节点的参数另认（工具名列表里读不出 workflow / card）
             if "{{" in tool:
                 anything = True
             elif (source := source_of_tool(tool)) is not None:
                 names.add(source)
+                direct.add(source)
         for node in graph.nodes:
+            if _binds_caliber(graph, node):
+                found, unsure = await _caliber_sources(session, graph, node, seen_calibers)
+                names |= set(found)
+                calibers.update(found)
+                anything = anything or unsure
             if node.type != NodeType.SUBGRAPH:
                 continue
             # 和 NodeContext.cfg 一样：节点上没写就取图级 defaults（tool_bindings 读工具也是这个规则）
@@ -1499,7 +1561,70 @@ async def _bound_sources(session: Any, spec: GraphSpec) -> tuple[set[str], bool]
                     queue.append(GraphSpec.model_validate(sub))
             except Exception:  # noqa: BLE001 - 读不到、不成形：子工作流节点运行时会说清楚
                 continue
-    return names, anything
+    # 图里自己直接绑了这个源的：不记口径标记——那份固定首先是为这张图要的，不是为某一份口径
+    return names, anything, {name: key for name, key in calibers.items() if name not in direct}
+
+
+def _binds_caliber(spec: GraphSpec, node: Any) -> bool:
+    """这个节点绑没绑口径查询工具（调用工具节点、Agent、协作成员的成员，取值规则同 tool_bindings）。"""
+    from app.engine.launch import node_setting
+    from app.ledger.querycore import CALIBER_QUERY
+
+    if node.type == NodeType.TOOL:
+        return node_setting(spec, node, "tool") == CALIBER_QUERY
+    if node.type == NodeType.AGENT:
+        return CALIBER_QUERY in [n for n in node_setting(spec, node, "tools") or [] if isinstance(n, str)]
+    if node.type == NodeType.SUPERVISOR:
+        return any(CALIBER_QUERY in [n for n in (member.get("tools") or []) if isinstance(n, str)]
+                   for member in node_setting(spec, node, "agents") or [] if isinstance(member, dict))
+    return False
+
+
+async def _caliber_sources(session: Any, spec: GraphSpec, node: Any,
+                           seen: set[tuple[str, str]]) -> tuple[dict[str, str], bool]:
+    """绑了 `caliber_query` 的节点会读到哪些源、以及这些源是为**哪一份口径目标**固定的（K10）。
+
+    按它点名的口径**那一版**（推荐版）图里的取数节点认（`querycore.card_sources`）。发起时就把它们固定进父 Run 的
+    data_versions：父 Run 的同一次运行里两次调用口径查询，读的还是同一版数据，中间有人重传也不会让后一次读到新的
+    一版；项上另记 `caliber` = 这份目标（`querycore.target_key`），之后换了另一份目标、源又换过版本时那一层会
+    照实说冲突。
+
+    定不下来的一律返回「说不准」（anything=True，发起时把启用的上传源、记录表全部固定上）：口径是 Agent 挑的
+    （工具名在参数里，模型运行时才写）、workflow / card 写的是模板、图不成形——多固定几个只是多留几个旧版本，
+    漏一个就会让同一次运行前后两段查到两版数据。认得到工作流但还没有推荐版、认不到工作流或卡时返回 False：那种
+    调用会在 QueryCore 那一层被拒（没有发布版 / 清单核不过），一条数据都不会读，不必把全部源都固定上。"""
+    from app.apps import publications
+    from app.db.models import Workflow
+    from app.engine.launch import node_setting
+    from app.ledger.querycore import card_sources, target_key
+
+    if node.type != NodeType.TOOL:
+        # Agent / 协作成员：workflow、card、metric_ids 都是模型在这一轮里挑的，发起时说不出它会读哪个源
+        return {}, True
+    raw = node_setting(spec, node, "args")
+    args = raw if isinstance(raw, dict) else {}
+    ref, card = str(args.get("workflow") or "").strip(), str(args.get("card") or "").strip()
+    if not ref or not card or "{{" in ref or "{{" in card:
+        return {}, True
+    key = (ref, card)
+    if key in seen:
+        return {}, False
+    seen.add(key)
+    workflow = await session.get(Workflow, ref)
+    if workflow is None:
+        rows = list((await session.execute(select(Workflow).where(Workflow.name == ref))).scalars())
+        if len(rows) != 1:
+            return {}, False             # 认不到：这一次调用会被 QueryCore 拒（找不到工作流）
+        workflow = rows[0]
+    row = await publications.recommended(session, workflow)
+    if row is None:
+        return {}, False                 # 还没有推荐版：这一次调用会被拒（没有可执行的发布版）
+    graph = row.graph if isinstance(row.graph, dict) else None
+    if not graph:
+        return {}, True                  # 这一版图读不出来：说不准它读什么，按最保守的处置
+    names, _sure = card_sources(graph, card)
+    pinned_for = target_key(workflow.id, row.version, card)
+    return {name: pinned_for for name in names}, False
 
 
 async def _agent_limits(session: Any) -> dict[str, Any]:
@@ -1799,15 +1924,26 @@ def _spent(state_usage: dict[str, Any], events_usage: dict[str, Any]) -> dict[st
     return out
 
 
-async def _timing(session: Any, run: Run, elapsed_ms: int, now: datetime) -> dict[str, int]:
-    """wall：从第一次开始到现在的墙钟；active：各段执行时长之和；wait：等人审批的总时长。
+def _elapsed_ms(since: float) -> int:
+    """从 perf_counter 的那一刻到现在过了多少毫秒（K13 的排队计时用）。"""
+    return max(0, int((time.perf_counter() - since) * 1000))
+
+
+async def _timing(session: Any, run: Run, elapsed_ms: int, now: datetime, queue_ms: int = 0) -> dict[str, int]:
+    """wall：从第一次开始到现在的墙钟；active：各段执行时长之和；wait：等人审批的总时长；
+    queue：从要并发名额到拿到名额的总时长（K13）。
 
     等待按事件算：每段从 run.interrupted 到下一条 run.resumed。服务重启挂起的那段
     没有 run.interrupted，不算等审批；失败后到接着跑之间也不算。
+
+    queue 是各段**拿到名额之前**那一下（_drive 量的：等别人放名额 + 发名额那一下的开销）之和：那一截在 started_at
+    之前，既不在 wall 里也不在 active 里，所以单独记。它和 wait（等人）是两回事，互相不冒充；加这一项之前跑完的
+    老运行没有这个键。
     """
     prev = run.usage or {}
     before = prev.get("active_ms", prev.get("duration_ms", 0))
     active = int(before or 0) + elapsed_ms
+    queued = int(prev.get("queue_ms") or 0) + max(0, int(queue_ms or 0))
 
     rows = await session.execute(
         select(RunEvent.type, RunEvent.ts)
@@ -1826,7 +1962,8 @@ async def _timing(session: Any, run: Run, elapsed_ms: int, now: datetime) -> dic
         waited += max(0.0, now.timestamp() - since)
 
     wall = int((now - run.started_at).total_seconds() * 1000) if run.started_at else active
-    return {"wall_ms": max(wall, active), "active_ms": active, "wait_ms": int(waited * 1000)}
+    return {"wall_ms": max(wall, active), "active_ms": active, "wait_ms": int(waited * 1000),
+            "queue_ms": queued}
 
 
 run_manager = RunManager()

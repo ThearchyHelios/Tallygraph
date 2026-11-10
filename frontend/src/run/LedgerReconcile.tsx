@@ -67,6 +67,8 @@ export function ReconcileDialog({ runId, action, related, onClose }: {
 
   const launch = async () => {
     if (options && !chosen.length) { setProblem(LEDGER_UI.reconcile.pairEmpty); return }
+    // 服务端没给身份的那一项（未授权）不该走到这里：真到了也只照实说，不发一个 workflow_id/version 空着的请求
+    if (!action.workflow_id || action.version == null) { setProblem(LEDGER_UI.reconcile.notAvailable); return }
     setBusy(true)
     setProblem('')
     const body: LedgerReconcileIn = { query: action.query, workflow_id: action.workflow_id, version: action.version }

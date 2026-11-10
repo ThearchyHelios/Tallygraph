@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import logging
 import math
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -114,14 +116,19 @@ def _tool_catalog(rows: list[Any], *, builtins: frozenset[str] | None = None, an
 
 async def _look_service(session: AsyncSession, payload: GenerateIn, sources: list[Any], *,
                         graph: dict[str, Any] | None, kinds: tuple[str, ...] = ("table", "capability"),
-                        catalog_view: Any = None) -> Any:
+                        catalog_view: Any = None, caliber: str = copilot_context.CALIBER_LOOK,
+                        actor: Any = None) -> Any:
     """这一轮的查看服务（copilot_context.look_service）。挑选模型用同一个助手模型，第一次要挑时才拿。catalog_view：表详情
-    里给哪一份数据目录（data/catalog_view.py），不给是当前目录。"""
+    里给哪一份数据目录（data/catalog_view.py），不给是当前目录。
+
+    caliber 是这一轮口径这一档怎么用（copilot_context.CALIBER_*）：问数据里搭建者及以上是 compose（look 之后 use_caliber）、
+    普通使用者是 query（look 之后让 agent 调口径查询工具，K14）。actor 是这次是谁：口径清单按资产授权收窄（普通使用者只看
+    得到有授权的版本）。"""
     spec = await copilot_model_spec(session, payload, max_tokens=copilot_context.PICK_MAX_TOKENS)
     return await copilot_context.look_service(sources, spec=spec, graph=graph, kinds=kinds,
                                               answer=payload.intent == "answer", catalog_view=catalog_view,
                                               trail={"conversation_id": getattr(payload, "conversation_id", None)},
-                                              session=session)
+                                              session=session, actor=actor, caliber=caliber)
 
 
 NODE_REFERENCE = """\
@@ -445,9 +452,15 @@ class GenerateIn(BaseModel):
     conversation_id: str | None = None
     #: 这一轮只查这几个数据源（id 或名字）。不传或空表示不限
     datasource_ids: list[str] | None = None
+    #: 这一轮在对话里是哪一轮（问数据那一轮：conversations.ConversationTurn.id）。固定执行起的那次运行要用它记来源
+    #: （和问数据自己发起的运行记同一份：chat/job.ChatDriver.generate_in）；画布、评测没有这一项
+    turn_id: str | None = None
     #: 问数据里用户原本问的那句话。自动重来、重试本轮时 instruction 是带着原因的那段话（「上一次运行没有成功：…」），
     #: 自查按问题判分析意图（app/analysis/intent）时用这一句；不传就用 instruction
     question: str | None = None
+    #: Ask Data 的固定请求（K12，app/ledger/nlchange.py）：已经明确 workflow/card/metric_ids/inputs 的请求直接进
+    #: QueryCore，不经模型的解析/规划；没匹配口径就进探索、含糊业务条件先澄清，不静默换计算规则。不传就是原来的问数据路径
+    fixed_request: dict[str, Any] | None = None
 
 
 def _question_of(payload: GenerateIn) -> str | None:
@@ -971,8 +984,11 @@ _CHAT_USER_PROMPT = (
     "2. tool 节点和 agent 都只能用 db_query__<数据源>、db_schema__<数据源> 和上面列出的内置工具：取数用 tool 节点"
     "（tool 写 db_query__<数据源>，args.sql 写好 SQL）或 agent（tools 里绑定这两种数据源工具）。不要用 http_request、"
     "records_append 这类写入或连外部的工具，工具名不要用 {{ }} 拼\n"
-    "3. 查询一律只读，不要写改数据的 SQL\n"
-    "4. 任何节点、图级 defaults、tool 节点的 args 里都不要写 memory_scope、collection：记忆范围和知识库由平台定"
+    "3. 上面工具清单里有 caliber_query（口径查询）：用户问的数只要在已发布口径里对得上，就照 look 交回的「取数写法」调它"
+    "取数（在 agent 的 prompt 里写清要调它、参数照抄），交回的指标值写进报告。**不要**自己拿 db_query__ 拼一份差不多的 SQL，"
+    "口径的 SQL 你也看不到、不要照着抄；没有对得上的口径时才自己查表\n"
+    "4. 查询一律只读，不要写改数据的 SQL\n"
+    "5. 任何节点、图级 defaults、tool 节点的 args 里都不要写 memory_scope、collection：记忆范围和知识库由平台定"
 )
 
 
@@ -1870,6 +1886,291 @@ async def generate_stream(payload: GenerateIn):
     )
 
 
+#: 这次执行走的是哪条路（final / error 的 execution.via）
+FIXED_VIA = "querycore"
+#: 这一次跑完了、但没算成（遮罩、空值、部分结果、超时）时给普通 user 的机器码
+RESULT_FAILED = "caliber_result_failed"
+#: 普通 user 看到的安全白话：内部的失败原话可能带着卡 id / 版本号 / 工作流引用与查询细节，不原样外发
+USER_FAILED = "这次没能按这份固定口径算出可用的数：可以换一种问法，或让搭建者检查这份口径是不是能用了"
+#: 普通 user 看得到的指标字段（id、质量检查、参数、查询引用这些内部材料一律不给）
+_USER_METRIC_KEYS = ("name", "value", "value_type", "rendered", "unit", "status", "masked", "decimals", "format")
+#: 结果摊平时认的属性名（两种实现交回的对象都按这一份读，见 _outcome_data）
+_OUTCOME_KEYS = ("run_id", "status", "ok", "workflow_id", "card_id", "version", "purpose", "publication",
+                 "selection", "parameters", "metrics", "queries", "data", "quality", "problems")
+
+
+def _outcome_data(outcome: Any) -> dict[str, Any]:
+    """这次固定执行的结果摊平成一份字典：两条路（搭建者的进程内固定执行、普通 user 的父图口径工具那条路）都认。"""
+    made = getattr(outcome, "as_dict", None)
+    if callable(made):
+        return dict(made())
+    if isinstance(outcome, Mapping):
+        return dict(outcome)
+    return {key: value for key in _OUTCOME_KEYS if (value := getattr(outcome, key, None)) is not None}
+
+
+def _user_metrics(data: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """普通 user 看到的指标值：只留业务上的名字与值，不留 id 与内部材料。"""
+    out: list[dict[str, Any]] = []
+    for metric in data.get("metrics") or ():
+        if isinstance(metric, Mapping):
+            out.append({key: metric[key] for key in _USER_METRIC_KEYS if metric.get(key) is not None})
+    return out
+
+
+def _user_execution(data: Mapping[str, Any]) -> dict[str, Any]:
+    """普通 user 看得到的那一段回执：via / run_id / status 与必要指标值。
+
+    没有卡 id、工作流 id、版本号、发布清单、选择、表、参数与查询引用（「不要让用户看到内部 ID」）。"""
+    made: dict[str, Any] = {"via": FIXED_VIA}
+    for key in ("run_id", "status"):
+        if data.get(key) is not None:
+            made[key] = data[key]
+    metrics = _user_metrics(data)
+    if metrics:
+        made["metrics"] = metrics
+    return made
+
+
+def _as_text(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def _user_error(message: str, code: str, data: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """普通 user 的失败结局：一句安全白话 + via / run_id / status + 已经拿到的指标值，不带任何内部引用。"""
+    failed = {"op": "error", "message": message, "code": code, "reason": message}
+    if data:
+        failed["execution"] = _user_execution(data)
+    return failed
+
+
+def _terminal(failed: dict[str, Any]) -> list[dict[str, Any]]:
+    """终止型结局：error（必要时带 execution）+ next。命中了但没授权、或者命中了执行失败，都走这里——不换路、不重来。"""
+    from app.chat import turn
+
+    return [{**failed, "next": turn.next_step(failed)}]
+
+
+def _not_permitted_ops(code: str) -> list[dict[str, Any]]:
+    """命中但没授权：终止型结局（error + next=fail），照实说没有授权，**不回退旧的 Agent 路径**。
+
+    说法和 `nlchange.auto_route` 的拒绝同一条（nlchange.NOT_PERMITTED）：两个字面出口共用一句，不出现任何内部引用。"""
+    from app.ledger import nlchange
+
+    return _terminal(_user_error(nlchange.NOT_PERMITTED, code))
+
+
+def _failed_ops(code: str, *, detail: str, ordinary: bool, data: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+    """命中之后的失败（清单、参数、绑定、超时……）：终止型结局。
+
+    搭建者及以上照实给内部原话（detail）；普通 user 只给安全白话——detail 里可能带着卡 id、版本号、工作流引用与查询
+    细节，一概不外发（投影点在这里）。"""
+    if ordinary:
+        return _terminal(_user_error(USER_FAILED, code, data))
+    return _terminal({"op": "error", "message": detail, "code": code, "reason": detail})
+
+
+def _builder_final(payload: GenerateIn, data: Mapping[str, Any]) -> dict[str, Any]:
+    """搭建者及以上看到的那条 final：全部依据（via / workflow / card / version / manifest / selection 引用）。"""
+    graph = payload.base_graph or {"nodes": [], "edges": []}
+    values = "、".join(f"{m.get('name') or m.get('id')} {_as_text(m.get('rendered'))}".strip()
+                      for m in data.get("metrics") or ())
+    return {"op": "final", "graph": graph, "issues": [], "autorun": False, "layout": {},
+            "explanation": f"QueryCore 按固定口径（v{data.get('version')}）算好了" + (f"：{values}" if values else ""),
+            "run_id": data.get("run_id"),
+            "execution": {"via": FIXED_VIA, "run_id": data.get("run_id"), "ok": data.get("ok"),
+                          "status": data.get("status"), "workflow_id": data.get("workflow_id"),
+                          "card_id": data.get("card_id"), "version": data.get("version"),
+                          "metrics": [dict(m) for m in data.get("metrics") or ()],
+                          "problems": [dict(p) for p in data.get("problems") or ()],
+                          "publication": dict(data.get("publication") or {}),
+                          "selection": dict(data.get("selection") or {})}}
+
+
+def _user_final(payload: GenerateIn, data: Mapping[str, Any]) -> dict[str, Any]:
+    """普通 user 看到的那条 final：安全白话 + via / run_id / status + 必要指标值。
+
+    这是投影点：口径身份（工作流 / 卡 / 版本）、发布清单与选择、表、参数、查询与哈希一概不出这个门——使用者看到的数是
+    「按这份口径算出来的」，不是「哪一版哪张卡哪条 SQL」（遮罩由执行那条路在工具边界保证）。"""
+    metrics = _user_metrics(data)
+    values = "、".join(text for text in (
+        f"{m.get('name') or ''} {_as_text(m.get('rendered') if m.get('rendered') is not None else m.get('value'))}"
+        .strip() for m in metrics) if text)
+    final = {"op": "final", "graph": payload.base_graph or {"nodes": [], "edges": []}, "issues": [],
+             "autorun": False, "layout": {},
+             "explanation": "按这份固定口径算好了" + (f"：{values}" if values else ""),
+             "execution": _user_execution(data)}
+    if data.get("run_id") is not None:
+        final["run_id"] = data["run_id"]
+    return final
+
+
+def _querycore_final(payload: GenerateIn, outcome: Any) -> dict[str, Any]:
+    """按固定口径算成之后的那条 final——固定请求接缝与自动路由**共用同一形状**（前端不必为多一条路改）。
+
+    搭建者及以上照旧清楚标出这是 QueryCore 的固定执行（via / workflow / card / version / manifest / selection 引用）和
+    这次的 run_id；普通 user 只给安全白话与 via / run_id / status / 必要指标值（见 _user_final）。autorun=false（运行
+    已经发生）。"""
+    from app.api.deps import restricted
+    from app.chat import turn
+
+    data = _outcome_data(outcome)
+    final = _user_final(payload, data) if restricted() else _builder_final(payload, data)
+    final["next"] = turn.next_step(final)
+    return final
+
+
+def _caller() -> tuple[Any, str | None]:
+    """这次请求的人：完整身份 + 主体名（关登录时是自报署名，可能为空）。"""
+    from app.api.deps import current_principal
+
+    principal = current_principal()
+    return principal, (principal.username or None)
+
+
+async def _allowed_calibers(session: AsyncSession, principal: Any) -> Any:
+    """这个人按**资产授权**能用的口径版本：{(工作流, 版本): 角色}；搭建者及以上不限（None）。
+
+    普通 user 只看「授权给它的应用当前版本钉住的那些口径版本」（app/apps/access.usable_calibers：AppGrant 的 use 及以上
+    加上当前 AppVersion.pins）。builder / admin / 关登录由调用方**显式放行**：它们本来就能直接按口径执行，不按资产授权
+    收窄，也不把它们的角色写进那个只认授权的函数里。"""
+    from app.api.deps import restricted
+    from app.apps import access
+
+    if not restricted():
+        return None
+    return await access.usable_calibers(session, principal)
+
+
+def _run_origin(payload: GenerateIn) -> dict[str, Any]:
+    """这条固定执行起的那次运行记在**哪一轮问数据**上（execute_prepared 的 origin）：对话 + 这一轮，和问数据自己发起的
+    运行记同一份（chat/job.ChatDriver.launch_args）。
+
+    运行靠它回溯到哪一轮（ledger/issue._conversation_of 取出具来源、证据与页面重载按它认「这次运行是哪一轮的」）；
+    没有对话时（画布上直接调、评测）不留空键，origin_kind 那一项照样是 chat（这次是问数据来源）。"""
+    origin = {"conversation_id": payload.conversation_id, "turn_id": payload.turn_id}
+    return {key: value for key, value in origin.items() if value}
+
+
+async def _prepared_execute(session: AsyncSession, *, request: Mapping[str, Any], purpose: str,
+                            actor: str | None, origin: Mapping[str, Any] | None = None) -> Any:
+    """普通 user 的执行：走 prepare 好的父图 + 真实 `caliber_query` 工具那条路（`querycore.execute_prepared`）。
+
+    遮罩与只读由那条路保证（父图按使用者的那一档发起，同他自己发起的问数据运行）：这里把这次的口径身份、指标与入口取值，
+    **当前认证主体**（记进运行来源，遮罩按它判）与**这次是哪段对话的哪一轮**（origin，见 `_run_origin`）交过去——那次运行
+    因此归属这一轮、能重载查看，不是一条来路不明的运行。purpose 是宿主常量那一档（普通问数 = compose，不要求正式验证
+    审阅）。按它的形参表筛一遍再调：那一边不收的键（比如 purpose，那条路自己固定成 compose）不塞进去——**只筛一次，
+    不重试**：重试等于再发一次运行。"""
+    from app.ledger import querycore
+
+    given: dict[str, Any] = {"workflow_id": request.get("workflow_id"), "card_id": request.get("card_id"),
+                             "metric_ids": list(request.get("metric_ids") or []),
+                             "inputs": dict(request.get("inputs") or {}), "version": request.get("version"),
+                             "purpose": purpose, "actor": actor, "origin_kind": "chat",
+                             "origin": dict(origin or {})}
+    parameters = inspect.signature(querycore.execute_prepared).parameters
+    if not any(item.kind == item.VAR_KEYWORD for item in parameters.values()):
+        given = {key: value for key, value in given.items() if key in parameters}
+    if not given.get("origin"):
+        given.pop("origin", None)          # 那一边不收空 origin（没有对话时不留一个空壳来源）
+    return await querycore.execute_prepared(session, **given)
+
+
+async def _execute_route(session: AsyncSession, *, request: Mapping[str, Any], purpose: str, actor: str | None,
+                         prepared: bool, payload: GenerateIn) -> Any:
+    """按一条已经定下来的固定请求执行：普通 user 走父图 + 真实 caliber_query 工具那条路，搭建者及以上直接固定执行。"""
+    if prepared:
+        return await _prepared_execute(session, request=request, purpose=purpose, actor=actor,
+                                       origin=_run_origin(payload))
+    from app.ledger import querycore
+
+    return await querycore.execute(session, purpose=purpose, **request)
+
+
+async def _fixed_request_ops(payload: GenerateIn):
+    """K12 的固定请求路由接缝（Ask Data）：确定请求**直接按固定口径执行**（内部 LLM 仍为 0），不经模型的解析/规划。
+
+    含糊业务条件先澄清（reply）、没有匹配口径就进探索（reply），绝不静默换计算规则；能确定的直接按固定口径执行一次，
+    交一条 final（autorun=false，运行已经发生）。普通 user 走**同一道授权闸**（app/apps/access.caliber_role：授权给它的
+    应用当前版本钉住的那些口径版本）与同一条执行路：没授权、或者执行失败（清单/参数/绑定/超时）都照实回一条终止型
+    结局（error + next=fail），**不降级成 Agent 路径**，也不绕过遮罩；数和说法只给安全白话。这一段不取助手模型、不读
+    目录、不拼历史——路由本身零模型。"""
+    from app.api.deps import restricted
+    from app.apps import access
+    from app.db.base import SessionLocal
+    from app.ledger import nlchange, querycore
+
+    ordinary = restricted()
+    principal, actor = _caller()
+    async with SessionLocal() as session:
+        routed = await nlchange.route(session, request=payload.fixed_request or {})
+        if routed.mode != nlchange.ROUTE_EXECUTE:
+            lines = [routed.reason]
+            lines += [item.question for item in routed.clarifications]
+            yield {"op": "reply", "text": "\n".join(line for line in lines if line)}
+            return
+        if ordinary:
+            # 和自动路由同一道闸：授权范围里没有这一版就到此为止，既不执行也不换路
+            role = await access.caliber_role(session, principal, str(routed.request.get("workflow_id") or ""),
+                                             int(routed.request.get("version") or 0))
+            if not access.at_least(role, "use"):
+                for op in _not_permitted_ops(nlchange.ROUTE_NOT_PERMITTED):
+                    yield op
+                return
+        request = {key: value for key, value in routed.request.items() if key != "purpose"}
+        purpose = str(routed.request.get("purpose") or querycore.DEFAULT_PURPOSE)
+        try:
+            outcome = await _execute_route(session, request=request, purpose=purpose, actor=actor, prepared=ordinary,
+                                     payload=payload)
+        except querycore.QueryCoreRefused as e:
+            for op in _failed_ops(e.code, detail=e.message, ordinary=ordinary):
+                yield op
+            return
+    data = _outcome_data(outcome)
+    if ordinary and data.get("ok") is False:
+        for op in _failed_ops(RESULT_FAILED, detail=USER_FAILED, ordinary=True, data=data):
+            yield op
+        return
+    yield _querycore_final(payload, outcome)
+
+
+async def _auto_route_ops(payload: GenerateIn) -> list[dict[str, Any]] | None:
+    """普通问数（intent=answer）的**保守默认路由**：高置信确定的请求直接按固定口径执行，未经模型。
+
+    搭建者及以上匹配之后直接进程内固定执行；普通 user 先过**资产授权**这道闸（app/apps/access.usable_calibers：授权给它
+    的应用当前版本钉住的那些口径版本）——命中了但没授权是**终止型结局**（照实说没有授权，不回退旧的 Agent 路径：那条路
+    会去翻底表），有权则走 prepare 好的父图 + 真实 caliber_query 工具那条路（遮罩与只读由它保证）。命中之后执行失败
+    （清单/权限/参数/绑定/超时等）**原样报错、绝不静默回退旧 Agent**；未命中（没匹配到、歧义、参数不全）交回 None，
+    调用方照旧走模型那条路，不向用户多说什么、也不澄清。这一段不取助手模型、不读目录、不拼历史——判定本身零模型。"""
+    from app.api.deps import restricted
+    from app.db.base import SessionLocal
+    from app.ledger import nlchange, querycore
+
+    ordinary = restricted()
+    principal, actor = _caller()
+    async with SessionLocal() as session:
+        # 和旧路径同一道门：请求带的对话读不了先照旧拒（不因为要自动路由就少判一次）
+        await _ensure_conversation_access(session, payload.conversation_id)
+        allowed = await _allowed_calibers(session, principal)
+        routed = await nlchange.auto_route(session, question=_question_of(payload) or payload.instruction,
+                                           allowed=allowed)
+        if routed is None:
+            return None
+        if routed.mode == nlchange.ROUTE_REFUSED:
+            return _not_permitted_ops(routed.code)
+        request = {key: value for key, value in routed.request.items() if key != "purpose"}
+        purpose = str(routed.request.get("purpose") or querycore.DEFAULT_PURPOSE)
+        try:
+            outcome = await _execute_route(session, request=request, purpose=purpose, actor=actor, prepared=ordinary,
+                                     payload=payload)
+        except querycore.QueryCoreRefused as e:
+            return _failed_ops(e.code, detail=e.message, ordinary=ordinary)
+    data = _outcome_data(outcome)
+    if ordinary and data.get("ok") is False:
+        return _failed_ops(RESULT_FAILED, detail=USER_FAILED, ordinary=True, data=data)
+    return [_querycore_final(payload, outcome)]
+
+
 async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_tools: bool = True):
     """生成过程：按需求起草、按需查看、自查修正、排版校验，逐条交出操作（op dict）。问数据页（经 SSE）和评测（直接迭代）
     走的是这同一条路（细案 01 做法 2）。
@@ -1887,17 +2188,41 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_
     的、有分析卡的、嵌套的子工作流里用了分析能力的，照「绑定的工具不存在」那一套挡回去改（_analysis_off_issues）。缺省为真，
     和以前一字不差。
 
-    final 带 next（chat/turn.next_step：run 运行、ready 只建不跑、fail 判失败），问数据页照它走。最后多交一条 usage
-    （providers/usage.py）：{op: usage, by_model, input_tokens, output_tokens, calls, cost_usd,
+    final 带 next（chat/turn.next_step：run 运行、ready 只建不跑、done 这一轮已经有了跑完的运行、fail 判失败），问数据页
+    照它走；运行不在这里发生（本函数只建图），固定执行那两条接缝的 final 带 execution，由 driver 收下那次运行。最后多交一条
+    usage（providers/usage.py）：{op: usage, by_model, input_tokens, output_tokens, calls, cost_usd,
     unpriced_calls}——这一轮助手建图（含挑表、接着写、自查修正）花了多少。前面每一条和抽出来之前逐条一样。运行不在这里，
     不计。
+
+    K12 两条接缝在取模型之前：带了 fixed_request 就按它走（见 _fixed_request_ops）；intent=answer、没带 fixed_request 时，
+    先试一次**保守默认路由**（app/ledger/nlchange.auto_route）——高置信确定的请求直接按固定口径执行，命中就交一条与固定
+    请求同形状的 final（见 _auto_route_ops），未命中什么都不做、照旧走下面那条路。普通 user 也走这条接缝，只是先过资产
+    授权那道闸（见 _allowed_calibers）：命中了但没授权是终止型结局，不回退、也不替它翻底表。
+
+    「什么时候该看」「看什么」按身份分（K14）：搭建者及以上的问数据能看已发布口径并用 use_caliber 选用；**普通使用者也
+    能看**（只列它有授权的版本），但用的是口径查询工具那条路（见 look 那一段与 copilot_context.LOOK_WHEN_QUERY_PROMPT）。
     """
-    from app.api.deps import restricted
+    from app.api.deps import current_principal, restricted
     from app.chat import turn
     from app.data.catalog_view import CatalogView
     from app.data.sqlcheck import load_checkers
     from app.db.base import SessionLocal
     from app.providers import usage
+
+    # K12 固定请求接缝：带了固定请求就按它走，不取模型、不读目录、不拼历史（见 _fixed_request_ops）
+    if payload.fixed_request:
+        async for op in _fixed_request_ops(payload):
+            yield op
+        return
+
+    # K12 保守默认路由：普通问数里高置信确定的请求直接按固定口径执行，不经模型。未命中什么都不做，照旧走下面那条路；
+    # 普通 user 也试，但先过资产授权那道闸——命中了但没权是终止型结局，不回退旧的 Agent 路径（见 _auto_route_ops）
+    if payload.intent == "answer":
+        auto = await _auto_route_ops(payload)
+        if auto is not None:
+            for op in auto:
+                yield op
+            return
 
     view = CatalogView.parse(catalog_view)
     async with SessionLocal() as session:
@@ -1926,16 +2251,20 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_
         baseline = copy.deepcopy(
             (payload.base_graph or {}).get("nodes") or (prev_graph or {}).get("nodes") or [])
         # 查看服务：读目录、读能力登记在开流之前做完。现有工作流（画布上的原图、问数据追问时上一轮的图）查过的表列在概览里。
-        # 问数据另看已发布口径、可以 use_caliber 选用（next-round 02 做法 4）：只给搭建者及以上——使用者的图里看得到拷进来的
-        # 取数 SQL（口径的 SQL 可能写着遮罩值），这一波不给
-        kinds = ("table", "capability", "caliber") if payload.intent == "answer" and not chat_user \
-            else ("table", "capability")
+        # 问数据另看已发布口径（next-round 02 做法 4），两档按身份分（K14）：搭建者及以上 look 之后可以用 use_caliber 把口径
+        # 带进图（服务端把它的取数节点拷过来，图里因此看得到拷进来的 SQL）；**普通使用者也看**，但只列它有授权的那些版本
+        # （look/calibers 按 actor 收窄），且不给 use_caliber——改用口径查询工具，提示与工具绑定都引导到 caliber_query
+        kinds = ("table", "capability", "caliber") if payload.intent == "answer" else ("table", "capability")
+        caliber = copilot_context.CALIBER_QUERY if chat_user else copilot_context.CALIBER_COMPOSE
         looks = await _look_service(session, payload, sources, graph=payload.base_graph if (
-            payload.base_graph or {}).get("nodes") else prev_graph, catalog_view=view, kinds=kinds)
+            payload.base_graph or {}).get("nodes") else prev_graph, catalog_view=view, kinds=kinds,
+            caliber=caliber if payload.intent == "answer" else copilot_context.CALIBER_LOOK,
+            actor=current_principal())
     # 这一份 system 一直用到最后：接着写、自查修正都沿用，不换
     system = _graph_system(sources, scope, await copilot_context.section(looks), looks, chat_user=chat_user,
                            analysis_tools=analysis_tools)
-    applier = GraphApplier(nodes, edges, composer=copilot_context.composer(looks))
+    # 使用者看得见口径但不能选用（K14）：模型发了 use_caliber 时照实拒收、自查交回它改用口径查询工具（见 GraphApplier）
+    applier = GraphApplier(nodes, edges, composer=copilot_context.composer(looks), no_compose=chat_user)
     started = time.monotonic()
     gen = Generation(model, system=system, applier=applier, looks=looks, started=started,
                      checker=GraphChecker(applier, scope=scope, sources=sources, baseline=baseline, checkers=checkers,

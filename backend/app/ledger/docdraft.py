@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import re
 from collections.abc import Iterable, Mapping
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 #: 草稿的状态（机器判别的落点，接口按它返回）。界面上只看得到四种阶段（STAGES）：草稿在写、待审、已丢弃、失败。
 #: ready 是主路径的常态：图已生成（含取数 SQL）、没有未决问题、可试跑可签字发布；questions_open 有图也有数，只是问题
@@ -45,6 +48,15 @@ def stage_of(status: str) -> str:
 MAX_INPUT_CHARS = 40000
 #: 引用归一化之后少于这么多字，说明它指不出一句完整的话，丢掉
 MIN_QUOTE_CHARS = 8
+
+#: 来源快照的工件种类与格式版本（存进 app/core/artifact_store 的内容寻址工件）。名字不带 source_snapshots：
+#: 那是数据源上传快照的表（app/db/models.SourceSnapshot），和「一次抽取读到的文档材料」不是一回事。
+SNAPSHOT_KIND = "caliber_source_snapshot"
+SNAPSHOT_VERSION = 1
+#: 抽取提示词的版本。改了 _SYSTEM（怎么抽、要求怎么写引用）就 +1：草稿里记下这一版，历史结果才知道是按哪一版抽的。
+PROMPT_VERSION = 1
+#: 解析与归一化的版本。改了 parse_reply / normalize_metrics（引用核对、字段清洗的规则）就 +1。
+PARSE_VERSION = 1
 
 #: 指标对象里固定出现的字段（提示词和归一化都按这一份）
 METRIC_FIELDS = ("name", "synonyms", "unit", "grain", "time_field", "filters", "numerator", "denominator",
@@ -415,10 +427,13 @@ def _fit(docs: list[dict], chunks: dict[str, dict], guidance: str,
 
 async def extract(session: Any, *, docs: list[dict], chunks: dict[str, dict], guidance: str = "",
                   datasource: dict | None = None, model: Any = None) -> dict:
-    """一次模型调用，返回 {"metrics", "dropped", "open_questions", "truncated", "model_id"}。
+    """一次模型调用，返回 {"metrics", "dropped", "open_questions", "truncated", "model_id",
+    "visible_chunk_ids", "prompt_version", "parse_version"}。
 
     不落库。model 可注入（测试用假对象：有 async ainvoke(messages)，回复有 .content）；不给就按设置解析，
     模型不可用时抛 DraftUnavailable，reason 原样给人看。输入超限按 chunk 截断，truncated 交调用方在界面上说清楚。
+    visible_chunk_ids 是**实际进了这次提示**的段落（按 ordinal 排）：被 _fit 丢掉的段落不在里面，引用它也核不上——
+    引用核对只认实际可见的材料，核对用的正是这里交出去的这一份。
     """
     from app.engine.state import message_text
 
@@ -450,6 +465,9 @@ async def extract(session: Any, *, docs: list[dict], chunks: dict[str, dict], gu
         "open_questions": questions if isinstance(questions, list) else [],
         "truncated": truncated,
         "model_id": model_id,
+        "visible_chunk_ids": _order(kept),
+        "prompt_version": PROMPT_VERSION,
+        "parse_version": PARSE_VERSION,
     }
 
 
@@ -597,8 +615,99 @@ def merge_definition(card_metrics: list[dict], draft_metrics: list[dict]) -> tup
 salvage_metrics = _salvage_metrics
 
 
+# ==========================================================================
+# 来源快照（K05：提取那一刻就把原文和材料存下来，草稿只记引用）
+# ==========================================================================
+
+
+def source_snapshot(*, documents: list[Any], chunks: Mapping[str, Any], datasource: Any = None,
+                    catalog: str = "", guidance: str = "", fixed_filters: str = "") -> dict:
+    """把这次抽取实际读到的来源材料收成一份**可还原**的快照：逐份原文、逐段原文，以及会改变模型看到什么的那几样
+    （数据目录文本、用户补充要求、固定条件、数据源）。调用方把它存进 app/core/artifact_store，草稿里只记返回的 id。
+
+    **为什么不能只存哈希。** 哈希只说明「还是那一份」，说不出内容是什么；重导入要比对的是「上次被接受的导入值」
+    （任务书 B），只有哈希就还原不了 B。所以原文整份进快照，chunk 的可见单位就是段。
+
+    **为什么按内容寻址。** 同一份材料只存一份，工件 id 就是规范化 JSON 的 sha256；快照因此不可变，也不会因为草稿
+    后来被改而跟着变。文档被重新切块、chunk id 换了一批，这份快照照旧读得回来（它按 id 认内容，不按名字）。
+
+    **这不是字段基线。** 快照只保证「当时的材料还原得出来」，字段级的 B 要等接受重导入时按字段推进（见 K11）。
+    """
+    from app.core.artifact_store import content_hash
+
+    def text(value: Any) -> str:
+        return value if isinstance(value, str) else ""
+
+    docs: list[dict[str, Any]] = []
+    for doc in documents if isinstance(documents, list) else []:
+        item = doc if isinstance(doc, Mapping) else {}
+        content = text(item.get("content"))
+        docs.append({"document_id": str(item.get("document_id") or item.get("id") or ""),
+                     "title": text(item.get("title")), "source": text(item.get("source")),
+                     "collection": text(item.get("collection")),
+                     "content": content, "content_hash": content_hash(content)})
+    kept: dict[str, dict[str, Any]] = {}
+    for chunk_id, chunk in (chunks if isinstance(chunks, Mapping) else {}).items():
+        item = chunk if isinstance(chunk, Mapping) else {}
+        content = text(item.get("content"))
+        ordinal = item.get("ordinal")
+        kept[str(chunk_id)] = {"document_id": str(item.get("document_id") or ""),
+                               "ordinal": ordinal if isinstance(ordinal, int) else None,
+                               "content": content, "content_hash": content_hash(content)}
+    return {"kind": SNAPSHOT_KIND, "version": SNAPSHOT_VERSION, "documents": docs, "chunks": kept,
+            "datasource": dict(datasource) if isinstance(datasource, Mapping) else None,
+            "catalog": text(catalog), "guidance": text(guidance), "fixed_filters": text(fixed_filters)}
+
+
+def snapshot_ref(artifact_id: str, snapshot: Mapping[str, Any]) -> dict:
+    """草稿 payload 里放的那一份引用：工件 id（= 内容的 sha256）、格式版本、这份快照收了哪些文档和段落。
+
+    原文不在 payload 里再抄一遍——草稿页按这份引用回工件库读，读到的是当初那一份，不会随草稿改动。
+    """
+    return {"artifact_id": str(artifact_id or ""), "kind": snapshot.get("kind") or SNAPSHOT_KIND,
+            "version": snapshot.get("version") or SNAPSHOT_VERSION, "content_hash": str(artifact_id or ""),
+            "documents": [str(d.get("document_id")) for d in snapshot.get("documents") or []
+                          if isinstance(d, Mapping)],
+            "chunk_ids": sorted(str(c) for c in (snapshot.get("chunks") or {}))}
+
+
+def source_baseline(payload: Any) -> dict[str, Any]:
+    """这份草稿的来源基线是什么状态：known（有**读得回来**的来源快照）/ baseline_unknown（没有，或读不回来）。
+
+    **旧草稿一律 baseline_unknown。** 保存来源快照之前起草的草稿没有这份引用，它当时的导入内容是什么已经无法
+    还原；不能拿它现在的内容冒充历史基线（B 是「上次被接受的导入值」，不是「现在长什么样」）。这份引用也不是
+    字段基线——字段级 B 要等接受重导入时按字段落（K11）。
+
+    **有引用不等于有基线。** 这里会把工件真的读一遍（load 会复验哈希）：工件不在、内容被改过、或种类不对，都照实
+    说 baseline_unknown 并把 readable 标成 false——「快照坏了」不能报成 known，也不能在读草稿时抛出去把页面弄崩。
+    读的时候现算，不拿 payload 里存过的那份状态：改了口径内容不改变来源快照，但工件被删被改必须看得出来。
+    """
+    ref = payload.get("source_snapshot") if isinstance(payload, Mapping) else None
+    artifact_id = ref.get("artifact_id") if isinstance(ref, Mapping) else None
+    if not (isinstance(artifact_id, str) and artifact_id):
+        return {"status": "baseline_unknown", "readable": False,
+                "reason": "这份草稿没有可还原的来源快照（保存快照之前起草的，或这次落库失败）：当时的导入内容无法还原，"
+                          "不能拿当前内容当作历史基线"}
+    try:
+        from app.core.artifact_store import load
+
+        snapshot = load(artifact_id)
+    except Exception as e:  # noqa: BLE001 - 工件被改过（哈希不符）也算读不出来，照实说，不让读草稿失败
+        logger.warning("来源快照工件读不出来（%s）：%s", artifact_id, e)
+        snapshot = None
+    if not isinstance(snapshot, Mapping) or snapshot.get("kind") != SNAPSHOT_KIND:
+        return {"status": "baseline_unknown", "readable": False, "artifact_id": artifact_id,
+                "version": ref.get("version") or SNAPSHOT_VERSION,
+                "reason": "来源快照工件读不回来（不在、内容与哈希不符，或不是来源快照）：当时的导入内容无法还原，"
+                          "不能拿当前内容当作历史基线"}
+    return {"status": "known", "readable": True, "artifact_id": artifact_id,
+            "version": ref.get("version") or SNAPSHOT_VERSION,
+            "chunk_ids": sorted(str(c) for c in (snapshot.get("chunks") or {}))}
+
+
 __all__ = [
     "DEFINITION_FIELDS", "DraftUnavailable", "FORBIDDEN_FIELDS", "MAX_INPUT_CHARS", "METRIC_FIELDS",
-    "MIN_QUOTE_CHARS", "STAGES", "STATUSES", "alignment", "extract", "merge_definition", "normalize_metrics",
-    "parse_reply", "prompt", "salvage_metrics", "stage_of", "verify_quote",
+    "MIN_QUOTE_CHARS", "PARSE_VERSION", "PROMPT_VERSION", "SNAPSHOT_KIND", "SNAPSHOT_VERSION", "STAGES",
+    "STATUSES", "alignment", "extract", "merge_definition", "normalize_metrics", "parse_reply", "prompt",
+    "salvage_metrics", "snapshot_ref", "source_baseline", "source_snapshot", "stage_of", "verify_quote",
 ]

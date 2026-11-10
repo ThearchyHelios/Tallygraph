@@ -38,6 +38,8 @@ from app.data.engine import SnapshotTampered, masked_columns, query_timeout, run
 from app.data.guard import QueryLimits, SqlRejected, check, is_write
 from app.data.tabular import UNSHAPED_NOTE
 from app.db.models import DataSource
+from app.ledger.bindings import SNAPSHOT_KEY as CALIBER_BINDING_SNAPSHOT_KEY
+from app.ledger.params import SNAPSHOT_KEY
 from app.tools.registry import ToolContext, Versions
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,11 @@ LATE_PIN_CODE = "data_version_pinned"
 #: agent（engine/verify_agent.py）放进去，打开了遮罩开关的查询工具按它们按值遮，再把每次遮掉的值并进去。只在内存里给
 #: 调用方按值遮用，不进快照、不交给模型
 MASKED_VALUES_KEY = "masked_values"
+#: 参数材料在 ToolContext.extra 里的键（就是 ledger/params.SNAPSHOT_KEY 的别名，engine/nodes/tools.run_tool 放，_run 读）
+SQL_PARAMETERS_KEY = SNAPSHOT_KEY
+#: K04 的绑定材料（ledger/bindings.SNAPSHOT_KEY 的别名，engine/nodes/tools.run_tool 放，_run 读）：这条 SQL 是哪份
+#: 受控绑定的哪一次展开（业务值 + 绑定指纹），只在实际语句正好是它展开出来的时候才有
+CALIBER_BINDING_KEY = CALIBER_BINDING_SNAPSHOT_KEY
 
 #: 每次查询之后基于数据目录的 SQL 检查最多等这么久。正常一条 SQL 几毫秒；等不到就放弃这一次检查，
 #: 查询结果照常交回——检查是附加的，不能拖慢查询
@@ -743,7 +750,12 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
             # - masked_whole：这条 SQL 的写法认不全，整份结果查询时都遮了（masked_at_query 是全部的列），格子引用指到它时
             #   照实说写法认不全，不说成取自遮罩列；
             # - data_version：上传表格查的是哪个快照，事后据此认得出这个数出自哪一版数据。
-            # 手工源、没设遮罩的，快照和原来一字不差
+            # 以及（K01，ledger/params）参数材料：这条 SQL 来自哪份源模板（模板哈希；有正文的时候连正文一起——组合式
+            # 问数拷进来的节点上不写正文，见 ledger/params.marker）、这次参数的规范化输入哈希、参数契约、每个参数的类型
+            # 和写在 SQL 的哪儿、承载方式（内联文本替换，不是驱动绑定）。绑定值不另存一份——它就是内联进实际语句里的
+            # 那些字，实际语句（payload["sql"]）本身在快照里。没有参数的查询不写这一项，快照和原来一字不差
+            # 以及（K04，ledger/bindings）绑定材料：这条 SQL 是哪份受控绑定的哪一次展开（业务值 + 绑定指纹），
+            # 只在实际语句正好是它展开出来的时候才有；没有绑定的取数照旧不写这一项
             extra: dict[str, Any] = {}
             if mask:
                 extra["mask_columns"] = mask
@@ -755,6 +767,12 @@ def _make_query_tool(source: Any, ctx: ToolContext, *, fixed: bool = False,
                 extra["masked_whole"] = True
             if version := getattr(source, "snapshot_id", None):
                 extra["data_version"] = version
+            if material := (ctx.extra or {}).get(SQL_PARAMETERS_KEY):
+                extra["parameters"] = material
+            if binding_material := (ctx.extra or {}).get(CALIBER_BINDING_KEY):
+                # K04：这条 SQL 是哪份受控绑定的哪一次展开（binder/版本、业务域与映射版本、当时的业务值、绑定指纹）。
+                # 只有实际语句正好是这份绑定展开出来的时候才记；不给模板和 snippets——实际语句本身就在快照里
+                extra["binding"] = binding_material
             # 记录表（records/views.py）：查的是第几条以内、看的是谁的行。不写进 data_version：那一项是上传表格的快照
             # id，出处链按它找快照文件
             if getattr(source, "origin", None) == "records" and getattr(source, "prelude", None):

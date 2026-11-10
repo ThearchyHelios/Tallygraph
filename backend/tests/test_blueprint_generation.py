@@ -231,7 +231,9 @@ async def test_look_caliber_lists_published_cards_and_how_to_reuse():
         assert [(i.metric_id, i.name, i.version) for i in mine] == [("gmv", "销售额", 1), ("aov", "客单价", 1)]
         assert mine[1].reuse() == {"workflow_id": wf_id, "version": 1, "node_id": "kpi", "metric_id": "aov",
                                    "inputs": [{"node": "fetch", "tool": "db_query__shop", "columns": ["gmv", "order_cnt"]}]}
-        assert any(wf_name in line for line in await kind.overview())
+        # 概览一行一个工作流、最多列 30 个（OVERVIEW_WORKFLOWS）：测试会话共用一个库，积累多了这一个不一定排得进前
+        # 30 行，所以按**点名的那一份**看它确实在清单里（index 列的是全部，不收窄）
+        assert wf_name in await kind.index([wf_name])
         looks = LookService([kind])
         result = await looks.look({"op": "look", "need": "客单价", "targets": [
             {"kind": "caliber", "source": wf_name, "name": "客单价"}, {"kind": "caliber", "name": "不存在的指标"}]},

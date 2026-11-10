@@ -3376,6 +3376,91 @@ await section('分析卡：节点库认得、卡片摘要、检查器按方法�
   check('全程页面没有报错', errors.length === 0, errors.slice(0, 2).join('；'))
 })
 
+// ================================================================ 保存遇上并发修改（K02）
+await section('保存被拒（有人先改过同一张图）：不丢本地编辑、不自动重发、人点一下就能存进去', async () => {
+  const base = FAKES['st-main'].version
+  const latest = base + 1
+  let inflight = 0
+  let maxInflight = 0
+  const hits = []
+  const { page, errors, state } = await open({
+    // 覆盖夹具的 PATCH：按基准版本答——不是服务端现在那一版就 409 stale_revision（和真服务端同一形状）
+    before: async (p) => {
+      await p.route(/\/api\/workflows\/st-main$/, async (route) => {
+        const req = route.request()
+        if (req.method() !== 'PATCH') return route.fallback()
+        const body = req.postDataJSON()
+        state.patches.push(body)
+        hits.push(body.expected_revision)
+        inflight += 1
+        maxInflight = Math.max(maxInflight, inflight)
+        await new Promise((r) => setTimeout(r, 150))
+        inflight -= 1
+        if (body.expected_revision !== latest) {
+          return route.fulfill({
+            status: 409, contentType: 'application/json',
+            body: JSON.stringify({
+              detail: `这份内容基于 v${body.expected_revision}，现在已经是 v${latest}：有人先改过，请刷新后再改，`
+                + '你刚才的修改还在页面上，可以改完再存',
+              code: 'stale_revision', current_version: latest }),
+          })
+        }
+        return route.fulfill({ status: 200, contentType: 'application/json',
+          body: JSON.stringify({ ...FAKES['st-main'], ...body, version: latest, status: 'draft' }) })
+      })
+    },
+  })
+  check('画布打开着，页面没有报错', errors.length === 0, errors.slice(0, 2).join('；'))
+
+  const edit = () => S(page, () => window.__studio.getState().updateNode('lookup', { label: '背景检索（我改的）' }))
+  const snap = () => S(page, () => {
+    const s = window.__studio.getState()
+    return { stale: s.staleSave, dirty: s.dirty, version: s.workflow?.version,
+      label: s.nodes.find((n) => n.id === 'lookup')?.data.label }
+  })
+
+  await edit()
+  await blur(page)
+  check('改完是「未保存」', (await snap()).dirty)
+
+  // 第一次保存：被拒
+  await page.keyboard.press(`${MOD}+s`)
+  await page.waitForTimeout(700)
+  const refused = await snap()
+  check('被拒之后本地编辑一个字没丢，还是「未保存」',
+    refused.dirty && refused.label === '背景检索（我改的）', JSON.stringify(refused))
+  check('被拒之后没有自动重发（只发了那一次 PATCH）', hits.length === 1, `${hits.length} 次：${hits.join(',')}`)
+  const banner = page.locator('[data-stale-save]')
+  check('横幅明确写出「你基于哪一版、服务端现在是哪一版」',
+    (await banner.innerText().catch(() => '')).includes(`你基于 v${base}`)
+    && (await banner.innerText().catch(() => '')).includes(`现在是 v${latest}`), await banner.innerText().catch(() => ''))
+  check('横幅给出两条明确的路', await banner.locator('[data-stale-save-rebase]').count() === 1
+    && await banner.locator('[data-stale-save-reload]').count() === 1)
+
+  // 第二次：人明确点「用最新版本再保存」
+  await banner.locator('[data-stale-save-rebase]').click()
+  await page.waitForTimeout(700)
+  const saved = await snap()
+  check('第二次按服务端现在这一版为基准发出', hits[1] === latest, hits.join(','))
+  check('存进去的是画布上这一份（本地编辑没丢）',
+    state.patches[1]?.graph?.nodes?.find((n) => n.id === 'lookup')?.data.label === '背景检索（我改的）')
+  check('存完不是「未保存」，横幅也收了', !saved.dirty && saved.stale === null, JSON.stringify(saved))
+  check('版本跟到服务端那一版', saved.version === latest, saved.version)
+
+  // ⌘S 连按：不会拿同一个基准版本并发发两次（请求一次只有一个在路上，第二次连按不再多发一趟）
+  maxInflight = 0
+  hits.length = 0
+  await S(page, () => window.__studio.getState().updateNode('lookup', { label: '背景检索（连按）' }))
+  await blur(page)
+  await page.keyboard.press(`${MOD}+s`)
+  await page.keyboard.press(`${MOD}+s`)
+  await page.waitForTimeout(800)
+  check('⌘S 连按：同时只有一个保存在路上', maxInflight === 1, `最多 ${maxInflight} 个`)
+  check('⌘S 连按：连按一次只发一次请求', hits.length === 1, `${hits.length} 次：${hits.join(',')}`)
+  check('⌘S 连按都用最新基准版本', hits.every((v) => v === latest), hits.join(','))
+  check('全程页面没有报错', errors.length === 0, errors.slice(0, 2).join('；'))
+})
+
 check('整个检查没有弹出原生 confirm / prompt', dialogs === 0, `${dialogs} 次`)
 check('检查没有写库（兜底拦下的写请求）', writes.length === 0, writes.slice(0, 4).join('、'))
 

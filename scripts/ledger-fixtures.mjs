@@ -70,13 +70,27 @@ export const RECALL = {
   tasks: [{ id: 'tk-recall-1', reason: 'caliber', to_version: 2 }],
 }
 
-/** 看差多少（s8 那条查询、订单口径）：参数是推断的，要先核对 */
+/**
+ * 看差多少（s8 那条查询、订单口径）：参数是推断的，要先核对。
+ * `available: true` 是服务端**确实给了身份**（workflow_id / version）的那一项：界面据此摆按钮。
+ */
 export const RECONCILE = {
   kind: 'reconcile', query: 'q-orders', caliber: ORDERS.caliber, workflow_id: ORDERS.workflow_id, version: 1, node_id: 'fetch',
-  workflow_name: '订单口径', level_text: '已发布', needs_check: true, check_reason: '参数按这次的 SQL 推断，请核对',
+  workflow_name: '订单口径', level_text: '已发布', available: true, needs_check: true, check_reason: '参数按这次的 SQL 推断，请核对',
   binding: [{ field: 'start', value: '2026-09-01' }], fallback: false,
   fields: [{ name: 'start', required: true, has_default: false }, { name: 'store', required: false, has_default: true }],
 }
+
+/**
+ * 当前这个身份**没有使用授权**的那一项：服务端只给说明，不把口径身份带出来（view._action_view 对 available 为假的那几项
+ * 把 workflow_id / version 抹掉）。界面照旧写清是哪份口径、差在哪，但不摆按钮——也就发不出一个 workflow_id / version
+ * 空着的请求。base 是原来那一项（默认订单口径那一项），要换一份口径就给 over 覆盖 caliber / query 这些。
+ */
+export const noAccessReconcile = (base = RECONCILE, over = {}) => {
+  const { workflow_id, version, ...rest } = base
+  return { ...rest, ...over, available: false }
+}
+export const RECONCILE_NO_ACCESS = noAccessReconcile()
 
 /** 按口径正式出具（整题等价于周报口径）：搭建者能一键，不自动的原因写在 auto_reason */
 export const ISSUE = {

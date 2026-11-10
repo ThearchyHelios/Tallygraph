@@ -459,12 +459,21 @@ def _cell_name(alias: Any, locator: dict[str, Any]) -> str:
     return f"{alias}.r{locator['row']}.{locator['column']}"
 
 
-def _query_alias(catalog: dict[str, Any], artifact: Any) -> str | None:
-    """这份快照在报告目录里的全局编号。agent 字段的 ref 是那个节点内部的编号，靠工件对上。"""
+def _query_alias(catalog: dict[str, Any], artifact: Any, entry: dict[str, Any] | None = None) -> str | None:
+    """这份快照在报告目录里的全局编号。agent 字段的 ref 是那个节点内部的编号，靠工件对上。
+
+    entry 是已知的那一条目录条目（引用就是它）时优先用它的编号：同一份快照被执行两次（循环、两个节点写同一
+    条 SQL）时 artifact 一样，只按 artifact 找会把 Q2 也认成 Q1。
+    """
     if not artifact:
         return None
-    return next((alias for alias, e in catalog.items() if e.get("kind") == "query" and e.get("artifact") == artifact),
-                None)
+    if isinstance(entry, dict):
+        alias = entry.get("alias")
+        found = catalog.get(alias) if isinstance(alias, str) else None
+        if isinstance(found, dict) and found.get("kind") == "query" and found.get("artifact") == artifact:
+            return alias
+    return next((alias for alias, e in catalog.items() if isinstance(e, dict) and e.get("kind") == "query"
+                 and e.get("artifact") == artifact), None)
 
 
 def _input_cell(item: dict[str, Any], catalog: dict[str, Any]) -> str:
@@ -841,7 +850,7 @@ async def _chain(seg: dict[str, Any], doc: dict[str, Any], sealed: _Sealed,
         # 只有直接引用的单元格才可能推断来源（P4-SPEC 2.8.2）。指标链里的查询步骤不带：指标片段的推断来源只会
         # 回「不是单元格」，带上提示等于让界面白发一次请求
         return await _query_steps(str(entry.get("artifact") or ""), [(locator.get("row"), locator.get("column"))],
-                                  doc, sealed, masks, hint=doc.get("provenance") == DOC_PROVENANCE)
+                                  doc, sealed, masks, hint=doc.get("provenance") == DOC_PROVENANCE, entry=entry)
     if cite.get("kind") == "input":
         name = (cite.get("locator") or {}).get("field")
         inputs = _input_payloads(sealed)
@@ -1126,7 +1135,7 @@ async def _analysis_inputs(alias: str, result: dict[str, Any], catalog: dict[str
                         **({"phrase": parent.get("phrase")} if parent else {}))
             steps.append(step)
             continue
-        query = sealed.queries.get(artifact)
+        query = sealed.query_at(artifact, node_id=item.get("node_id"), execution_id=item.get("execution_id"))
         step.update(query=_catalog_alias_of(catalog, artifact), node_id=(query or {}).get("node_id"),
                     sealed=sealed.trusted and query is not None)
         if role in totals and totals[role] in values:
@@ -2785,8 +2794,11 @@ def _leaf_of(leaf: Any) -> Any:
 
 
 async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str, Any], sealed: _Sealed,
-                      masks: _Masks, *, hint: bool = False) -> dict[str, Any]:
+                      masks: _Masks, *, hint: bool = False, entry: dict[str, Any] | None = None) -> dict[str, Any]:
     """查询步骤：被引用的格所在的行加前后各 WINDOW 行，高亮那几格，遮掉数据源设了遮罩的列。
+
+    entry 是引用落到的那条目录条目：同一份快照被执行两次（循环、两个节点写同一条 SQL）时 artifact 一样，
+    按 entry 的编号与执行身份（node_id / exec / execution_id）认这一次，别把 Q2 认成 Q1。
 
     快照只认封存范围内的事件交回过的那些（tool.end.query_artifact、node.finished.evidence 的
     query 条目）；目录里写着、事件里追不到的，照实说不认，一行都不给。
@@ -2798,11 +2810,17 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
     checks：快照里记下的 SQL 检查结果（数据目录阶段 2B，见 _query_checks），只在查出问题时有这个键。
     """
     catalog = doc.get("catalog") or {}
-    alias = _query_alias(catalog, artifact)
-    entry = catalog.get(alias, {}) if alias else {}
-    info = sealed.queries.get(artifact) if artifact else None
+    alias = _query_alias(catalog, artifact, entry)
+    entry = catalog.get(alias, {}) if alias else (entry or {})
+    # 第几次执行：新条目可能把「第几次」记在 attempt 上（老条目记 exec），两个都认
+    nth = entry.get("exec") if entry.get("exec") is not None else entry.get("attempt")
+    info = sealed.query_at(artifact, node_id=entry.get("node_id"), exec_no=nth,
+                           execution_id=entry.get("execution_id")) if artifact else None
     rows_hit = sorted({r for r, _ in cells if isinstance(r, int)})
     cols_hit = list(dict.fromkeys(str(c) for _, c in cells if c))
+    # 执行身份（K10）：只给新条目的那几项（query_id / execution_id / attempt）——exec 老条目也有，
+    # 露出来等于改了老运行、老文档的形状。未封存的步骤同样一个键都不加
+    identity = {k: info.get(k) for k in ("query_id", "execution_id", "attempt")} if info is not None else {}
     step: dict[str, Any] = {
         "step": "query", "alias": alias, "artifact": artifact or None,
         "node_id": (info or {}).get("node_id") or entry.get("node_id"),
@@ -2813,6 +2831,9 @@ async def _query_step(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str
         "highlight": {"rows": rows_hit, "cols": cols_hit,
                       "cells": [[r, str(c)] for r, c in dict.fromkeys(cells) if isinstance(r, int) and c]},
         "masked": [], "hash_ok": None, "sealed": False,
+        # 执行身份（K10）：同一份快照被执行两次时，靠这三样才说得出这一格是哪一次查的。老运行、老条目
+        # （一个都没有）不加这几个键，步骤形状和以前一字不差
+        **{k: v for k, v in identity.items() if v is not None},
     }
     if info is None:
         return {**step, "note": UNSEALED_QUERY}
@@ -2970,13 +2991,15 @@ MERGE_DEPTH = 4
 
 
 async def _query_steps(artifact: str, cells: list[tuple[Any, Any]], doc: dict[str, Any], sealed: _Sealed,
-                       masks: _Masks, *, hint: bool = False, depth: int = 0) -> list[dict[str, Any]]:
+                       masks: _Masks, *, hint: bool = False, depth: int = 0,
+                       entry: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """查询步骤；快照是合并结果时，后面接上被引用的格追到的那几个输入的查询步骤（高亮追到的那一格）。
 
     追不到的格不接任何输入步骤：合并步骤的 merge.traced 里照实写「没有逐格来历」，只给表级来历。输入步骤带
     merged_into（合并结果的编号），界面据此标明它是哪次合并的输入。不是合并结果的快照，返回的就是原来那一个步骤。
+    entry 指这次引用落到的那条目录条目（同一份快照被执行两次时用来认是哪一次）。
     """
-    step = await _query_step(artifact, cells, doc, sealed, masks, hint=hint)
+    step = await _query_step(artifact, cells, doc, sealed, masks, hint=hint, entry=entry)
     traced = [t for t in (step.get("merge") or {}).get("traced") or [] if t.get("input")]
     if not traced or depth >= MERGE_DEPTH:
         return [step]

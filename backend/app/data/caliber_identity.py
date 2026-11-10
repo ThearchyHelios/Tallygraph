@@ -25,10 +25,11 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-#: 指标的语义字段：只有这几样算定义，运行时值（value、rendered、inputs……）不参与哈希
+#: 指标的语义字段：只有这几样算定义，运行时值（value、rendered、inputs……）不参与哈希。
+#: time_role / refund_rule 是 K04 的业务定义字段（统计时间口径、退款处理）：改了定义身份就变，绑定同步状态跟着重判。
 SEMANTIC_FIELDS = ("id", "name", "expression", "unit", "decimals", "format", "kind", "definition", "params", "external",
                    "rule", "assessment", "grain", "time_field", "numerator", "denominator", "dimensions", "filters",
-                   "contract")
+                   "contract", "time_role", "refund_rule")
 
 
 def _blank(value: Any) -> bool:

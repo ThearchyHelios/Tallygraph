@@ -53,15 +53,18 @@ async def test_layout_save_keeps_trial_evidence_but_sql_change_invalidates(clien
     async with SessionLocal() as session:
         workflow = await session.get(Workflow, body["workflow_id"])
         graph = copy.deepcopy(workflow.graph)
+        revision = workflow.version
     graph["nodes"][0]["position"] = {"x": 100, "y": 200}
-    saved = await client.patch(f"/api/workflows/{body['workflow_id']}", json={"graph": graph})
+    saved = await client.patch(f"/api/workflows/{body['workflow_id']}",
+                               json={"graph": graph, "expected_revision": revision})
     assert saved.status_code == 200
     assert saved.json()["same_as_published"] is True
     result = (await client.get(f"/api/ledger/drafts/{body['id']}/trial")).json()
     assert result["status"] == "succeeded" and result["version"] == 1
     fetch = next(n for n in graph["nodes"] if n["id"] == "fetch")
     fetch["data"]["config"]["args"]["sql"] = "SELECT 9 AS refund_rate FROM orders"
-    changed = await client.patch(f"/api/workflows/{body['workflow_id']}", json={"graph": graph})
+    changed = await client.patch(f"/api/workflows/{body['workflow_id']}",
+                                 json={"graph": graph, "expected_revision": saved.json()["version"]})
     assert changed.json()["same_as_published"] is False
     result = (await client.get(f"/api/ledger/drafts/{body['id']}/trial")).json()
     assert result["status"] == "stale" and result["metrics"] == []

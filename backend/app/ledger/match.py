@@ -5,9 +5,9 @@
 放在封存之前，外部的口径表就混进了运行自身的封存事实。正式运行不比 SQL——它本身就是某一版的承诺，账本按 Run.workflow_id /
 version 记。系统派生的运行（评测、对账、召回）不比：它们是服务端为了量、为了比替人跑的（engine/origin.SYSTEM_ORIGINS）。
 
-**和谁比。** 每个工作流最新的已发布、未退役版本（apps/versions.latest_published，和 look 的 caliber、蓝图复用口径同一种说法，
-拍板 L4：受管、已发布都算，标签写明级别）里查库的调用工具节点。先按同一个数据源、SQL 里的表有交集预筛，每条查询最多比
-MAX_CANDIDATES 份（按工作流、版本、节点排好的先后）。
+**和谁比。** 每个工作流**推荐发布版**里的口径取数（K07：Workflow.published_version，和 look 的 caliber、蓝图复用口径
+同一种说法；最高已发布版只在升级发现里用），拍板 L4：受管、已发布都算，标签写明级别）里查库的调用工具节点。先按同一个
+数据源、SQL 里的表有交集预筛，每条查询最多比 MAX_CANDIDATES 份（按工作流、版本、节点排好的先后）。
 
 **怎么比。** data/sql_semantics.match_template：先绑定参数（只是启发），再按绑定渲染口径的取数 SQL 交 explain_sql_diff 证明。
 
@@ -248,19 +248,26 @@ def caliber_of(workflow_id: str, row: Any) -> Caliber | None:
 
 
 async def load_calibers(session: Any) -> list[Caliber]:
-    """每个工作流最新的已发布、未退役版本里的口径取数（apps/versions.is_published，同 latest_published 的说法）。先只读版本号
-    和级别挑出每个工作流的那一版，再读这几版的图。"""
+    """每个工作流**推荐发布版**里的口径取数（K07：默认调用读推荐版 Workflow.published_version；最高已发布版只在
+    升级发现里用）。先只读版本号和级别挑出每个工作流的那一版，再读这几版的图。"""
     from app.apps.versions import is_published
 
     rows = (await session.execute(
         select(WorkflowVersion.id, WorkflowVersion.workflow_id, WorkflowVersion.version, WorkflowVersion.level,
                WorkflowVersion.retired_at, Workflow.published_version)
         .join(Workflow, Workflow.id == WorkflowVersion.workflow_id))).all()
-    latest: dict[str, tuple[int, str]] = {}
+    published: dict[str, list[tuple[int, str]]] = {}
+    recommended: dict[str, int | None] = {}
     for vid, wid, version, level, retired, current in rows:
         probe = _VersionProbe(version, level, retired)
-        if is_published(probe, current=current) and version > latest.get(wid, (0, ""))[0]:
-            latest[wid] = (version, vid)
+        recommended[wid] = current
+        if is_published(probe, current=current):
+            published.setdefault(wid, []).append((version, vid))
+    latest: dict[str, tuple[int, str]] = {}
+    for wid, found in published.items():
+        current = recommended.get(wid)
+        pick = next((item for item in found if item[0] == current), None)
+        latest[wid] = pick or max(found)
     if not latest:
         return []
     ids = [vid for _, vid in latest.values()]

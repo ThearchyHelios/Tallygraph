@@ -47,7 +47,10 @@ function summaryOf(data: RunLedger) {
   return { ...counts, calibers, total: labels.length }
 }
 
-/** 对账的入口：每条查询、每份相关口径一项；差在哪取那条查询上的比对 */
+/**
+ * 对账的入口：每条查询、每份相关口径一项；差在哪取那条查询上的比对。
+ * 服务端只给「确实能发起」的那一项口径身份（available）：不能发起的那几项只是说明，界面上单独写一行、不摆按钮。
+ */
 function reconcileEntries(data: RunLedger): { action: LedgerReconcileAction; related?: LedgerRelated }[] {
   return (data.actions ?? []).filter((a): a is LedgerReconcileAction => a.kind === 'reconcile').map((action) => ({
     action,
@@ -112,11 +115,19 @@ export function LedgerTurn({ runId, runClass, done, readOnly = false }: {
         <div className="flex flex-wrap items-start gap-1.5" data-ledger-actions="">
           {issue && <IssueControl runId={runId} action={issue} slot={slot} readOnly={readOnly} />}
           {reconciles.map(({ action, related }) => (
-            <button key={`${action.query}|${action.caliber}`} type="button" className="btn btn-xs" disabled={readOnly}
-                    title={readOnly ? LEDGER_UI.reconcile.readOnly : undefined}
-                    onClick={() => setDialog({ action, related })} data-ledger-turn-reconcile={action.caliber}>
-              <Scale size={11} aria-hidden /> {LEDGER_UI.reconcile.turnButton(caliberOf(action))}
-            </button>
+            // 服务端只给「确实能发起」的那一项身份：没有身份的那些是说明，不摆按钮（也就不发 undefined 的请求）
+            action.available === false ? (
+              <p key={`${action.query}|${action.caliber}`} className="text-2xs text-dim"
+                 data-ledger-turn-reconcile-refused={action.caliber} title={LEDGER_UI.reconcile.unavailableHint}>
+                {LEDGER_UI.reconcile.unavailable(caliberOf(action))}
+              </p>
+            ) : (
+              <button key={`${action.query}|${action.caliber}`} type="button" className="btn btn-xs" disabled={readOnly}
+                      title={readOnly ? LEDGER_UI.reconcile.readOnly : undefined}
+                      onClick={() => setDialog({ action, related })} data-ledger-turn-reconcile={action.caliber}>
+                <Scale size={11} aria-hidden /> {LEDGER_UI.reconcile.turnButton(caliberOf(action))}
+              </button>
+            )
           ))}
         </div>
       )}

@@ -792,3 +792,98 @@ async def test_a_failing_ledger_is_reported_not_raised(monkeypatch, shop):
            {"value": {"alias": "Q1", "row": 0, "column": "total"}, "verdict": "一致", "rationale": "x"})
     out = await run(name)
     assert out.result is None and out.error
+
+
+# --------------------------------------------------------------------------
+# K10：一次调用交回多条查询（口径查询）时的抽取、认工件与执行身份
+# --------------------------------------------------------------------------
+
+
+class _FakeQueryTool:
+    """交回一段固定内容的查询工具：`_run_tool` 按名字认身份、按结果摊条目，工具本身是什么不重要。"""
+
+    name = "caliber_query"
+
+    def __init__(self, payload: object) -> None:
+        self.payload = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+
+    async def ainvoke(self, args: dict) -> str:
+        return self.payload
+
+
+async def _snapshot(run_id: str, *, column: str, node_id: str) -> str:
+    """一份查询快照工件，归属 run_id（内容寻址：列不同就是不同的工件）。"""
+    from app.data.catalog import QUERY_SNAPSHOT_KIND
+
+    return await artifact_store.put_json({"columns": [column], "rows": [[1]], "sql": f"SELECT {column}"},
+                                         kind=QUERY_SNAPSHOT_KIND, run_id=run_id, node_id=node_id)
+
+
+async def test_a_multi_query_result_is_registered_item_by_item():
+    """口径查询一次交回多条：逐条编号、逐条进核查自己的台账，执行身份照它自己带着的那一份。"""
+    run_id = uuid.uuid4().hex
+    first = await _snapshot(run_id, column="gmv", node_id="sales")
+    second = await _snapshot(run_id, column="peak", node_id="shared")
+    payload = {"tool": "caliber_query", "kind": "caliber_query", "ok": True, "run_id": "child-run", "queries": [
+        {"artifact": first, "columns": ["gmv"], "row_count": 1, "truncated": False, "source": "shop",
+         "query_id": "wf:sales", "execution_id": "child-run:sales#e1", "attempt": 1},
+        {"artifact": second, "columns": ["peak"], "row_count": 1, "truncated": False, "source": "shop",
+         "query_id": "wf:shared", "execution_id": "child-run:shared#e1", "attempt": 1}]}
+    queries: list[dict] = []
+    ledger: list[dict] = []
+    out = await verify_agent._run_tool(_FakeQueryTool(payload), "caliber_query", {}, "c1", None, None,
+                                       queries, ledger, "check", run_id=run_id)
+    assert out.startswith("【证据 Q1、Q2】"), "多条查询逐条编号（以前一条都认不出来）"
+    assert [q["alias"] for q in queries] == ["Q1", "Q2"]
+    assert [q["artifact"] for q in queries] == [first, second]
+    assert [e["artifact"] for e in ledger] == [first, second] and len(ledger) == 2, "两条都进台账"
+    # 执行身份照抄口径查询自己带着的那一份：逻辑查询、这一次执行、第几次
+    assert [q["query_id"] for q in queries] == ["wf:sales", "wf:shared"]
+    assert [q["execution_id"] for q in queries] == ["child-run:sales#e1", "child-run:shared#e1"]
+    assert [q["attempt"] for q in queries] == [1, 1]
+    assert all(q["row_count"] == 1 and q["truncated"] is False and q["tool"] == "caliber_query" for q in queries)
+    # 交回结果里的样子不变：老消费方按这几个键读（outcome 的 shown、_Cells、_QUERY_KEYS）
+    assert all({"alias", "artifact", "sql", "row_count", "truncated", "source", "tool", "call_id"} <= set(q)
+               for q in queries)
+
+
+async def test_a_forged_or_other_runs_query_does_not_enter_the_ledger():
+    """名字对了工件也得对：伪造的、别的运行落的、不是查询快照的工件都不编号、不进台账。"""
+    run_id = uuid.uuid4().hex
+    real = await _snapshot(run_id, column="gmv", node_id="sales")
+    item = {"artifact": real, "columns": ["gmv"], "row_count": 1, "truncated": False, "source": "shop",
+            "query_id": "wf:sales", "execution_id": "child-run:sales#e1", "attempt": 1}
+    payload = {"tool": "caliber_query", "kind": "caliber_query", "ok": True, "run_id": "child-run",
+               "queries": [{**item, "artifact": "a" * 64}, item]}
+    queries: list[dict] = []
+    ledger: list[dict] = []
+    out = await verify_agent._run_tool(_FakeQueryTool(payload), "caliber_query", {}, "c1", None, None,
+                                       queries, ledger, "check", run_id=run_id)
+    assert out.startswith("【证据 Q1】") and [q["artifact"] for q in queries] == [real]
+
+    # 同一份真工件，换一个运行 id：不是这次运行（也不是它派生的子运行）落的，整条都不认，原话交回模型
+    text = json.dumps(payload, ensure_ascii=False)
+    other: list[dict] = []
+    other_ledger: list[dict] = []
+    out = await verify_agent._run_tool(_FakeQueryTool(text), "caliber_query", {}, "c1", None, None,
+                                       other, other_ledger, "check", run_id=uuid.uuid4().hex)
+    assert out == text and not other and not other_ledger, "别的运行落的查询快照一条都不记"
+
+
+async def test_a_single_db_query_keeps_its_old_shape():
+    """单条数据源查询照旧：一个 Qn、内容前面一行编号，台账条目与查询清单的键一个不少（另加执行身份）。"""
+    payload = {"artifact": "b" * 64, "columns": ["total"], "rows": [[1]], "truncated": False, "source": "shop",
+               "sql": "SELECT 1"}
+    text = json.dumps(payload)
+    queries: list[dict] = []
+    ledger: list[dict] = []
+    out = await verify_agent._run_tool(_FakeQueryTool(text), "db_query__shop", {"sql": "SELECT 1"}, "c1", None, None,
+                                       queries, ledger, "check", run_id="run-1")
+    assert out == f"【证据 Q1】\n{text}"
+    [query] = queries
+    assert query["alias"] == "Q1" and query["row_count"] == 1 and query["rows"] == [[1]] and query["sql"] == "SELECT 1"
+    [entry] = ledger
+    assert entry["kind"] == "query" and entry["artifact"] == "b" * 64 and entry["exec"] == 1
+    assert entry["source"] == "shop" and entry["columns"] == ["total"] and entry["rows"] == 1
+    # 执行身份按这次调用的 id 算（同 Agent 节点、调用工具节点）；逻辑查询就是本节点
+    assert entry["query_id"] == "check" and entry["execution_id"] == "run-1:check#c1" and entry["attempt"] == 1

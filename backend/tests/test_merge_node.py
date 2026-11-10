@@ -294,6 +294,44 @@ def test_labels_and_governance_know_the_type():
 # --------------------------------------------------------------------------
 
 
+#: 服务端按维度值拼好的对齐语句（ledger/reconcile.align_sql）：值来自查询结果，可能就是带 {{ }} 的文本
+LITERAL_MERGE_SQL = ("SELECT s.日期, s.门店, s.订单数, s.销售额, v.到店人数, '{{ vars.region }}' AS 备注 "
+                     "FROM s JOIN v ON s.日期 = v.日期 AND s.门店 = v.门店 ORDER BY s.日期, s.门店")
+
+
+async def test_a_server_built_merge_statement_is_not_templated_again(monkeypatch, sources):
+    """服务端拼好的合并语句（带参数契约，哈希对得上）：里面的 {{ }} 是数据，运行时不再渲染一遍。
+
+    对账图里按维度值对齐的那条语句由服务端拼成字面 SQL，维度值直接来自查询结果。真被当模板渲染一遍，这里那句
+    `'{{ vars.region }}'` 会被换成空串（图里根本没有这个变量），合并执行的就不再是服务端拼的那条语句了（K01 的二次渲染）。"""
+    from app.ledger import params
+
+    graph = store_graph(merge_sql=LITERAL_MERGE_SQL, report=False)
+    merge = next(n for n in graph["nodes"] if n["id"] == "merge")["data"]["config"]
+    merge[params.KEY] = params.marker(rendered=merge["sql"], source={"kind": "reconcile", "node_id": "merge"})
+    assert params.literal_keys(merge, "merge") == ("sql",)
+    row = await run_graph(monkeypatch, graph)
+    assert row.status == "succeeded", row.error
+    [done] = await events(row.id, "merge.end", "merge")
+    assert "'{{ vars.region }}'" in done["sql"] and done["rows"] == 4
+
+
+async def test_editing_the_merge_sql_after_a_copy_drops_the_contract(monkeypatch, sources):
+    """复制一个服务端拼好的合并节点、改过它的 SQL：契约作废，按普通模板走——带 {{ }} 的语句不会被原样发出去。
+
+    改过之后图里的变量校验恢复了（`{{ vars.region }}` 没人产出 → 运行发起前就拦下），一条 SQL 都不发。"""
+    from app.ledger import params
+
+    graph = store_graph(merge_sql=LITERAL_MERGE_SQL, report=False)
+    merge = next(n for n in graph["nodes"] if n["id"] == "merge")["data"]["config"]
+    merge[params.KEY] = params.marker(rendered=merge["sql"], source={"kind": "reconcile", "node_id": "merge"})
+    merge["sql"] = merge["sql"].replace("ORDER BY", "-- 复制过来改了 --\nORDER BY")
+    assert params.literal_keys(merge, "merge") == ()
+    with pytest.raises(ValueError) as caught:
+        await run_manager.start(graph=graph, input_payload={})
+    assert "vars.region" in str(caught.value) and "没有任何节点产出" in str(caught.value)
+
+
 async def test_end_to_end_two_databases(monkeypatch, sources, client):
     row = await run_graph(monkeypatch)
     assert row.status == "succeeded", row.error

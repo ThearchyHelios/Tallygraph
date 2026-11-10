@@ -153,8 +153,8 @@ class ChatDriver(TurnDriver):
         from app.api.copilot import GenerateIn
 
         return GenerateIn(instruction=instruction, base_graph=base_graph, intent="answer",
-                          conversation_id=self.execution.conversation_id, datasource_ids=self.datasource_ids or None,
-                          question=self.question)
+                          conversation_id=self.execution.conversation_id, turn_id=self.execution.turn_id,
+                          datasource_ids=self.datasource_ids or None, question=self.question)
 
     async def on_op(self, op: dict[str, Any]) -> None:
         kind = op.get("op")
@@ -220,7 +220,10 @@ class ChatDriver(TurnDriver):
                                            "turn_id": self.execution.turn_id}}
         if restricted():
             try:
-                args["memory_scope"], args["options"] = user_chat_run(graph, self.execution.actor)
+                # 第三项是这次要发起的图：使用者的口径查询工具由 chat/launch 补上（有授权的口径那一份），
+                # drive._launch 认 args 里的 graph，发起用的是补过的那一张（见 chat/launch 模块说明）
+                args["memory_scope"], args["options"], args["graph"] = await user_chat_run(
+                    session, graph, self.execution.actor)
             except ChatRunRefused as e:
                 raise LaunchRefused(403, str(e)) from e
         return args
@@ -807,7 +810,13 @@ async def _settled(driver: ChatDriver, execution: ChatTurnExecution
     output = run.output if isinstance(run.output, dict) else {}
     review = driver.last_review if driver.late_review is None else None
     rewritten = (review or {}).get("answer") if (review or {}).get("verdict") != "ok" else None
-    fields.update(status="done", answer=rewritten or record.answer_text(output), review=review or {})
+    answer = rewritten or record.answer_text(output)
+    if (term.get("execution") or {}).get("run_id") and term.get("explanation"):
+        # 这一轮的运行是**生成这一轮里就跑完的固定执行**（chat/turn.NEXT_DONE）：运行照常归属这一轮、能重载查看（上面那一段），
+        # 但它的成果不是自由生成的报告（服务端按固定口径搭的那张图），答案用 final 里那句白话——使用者看到的数与说法就是
+        # api/copilot 投影出来的那一份（builder 的详细依据、user 的安全白话都在里面）
+        answer = str(term["explanation"])
+    fields.update(status="done", answer=answer, review=review or {})
     meta.update(issuance=record.slim_issuance(output.get("_issuance")),
                 evidence=True if record.has_evidence(output) else None)
     return fields, meta, "done", output, usage

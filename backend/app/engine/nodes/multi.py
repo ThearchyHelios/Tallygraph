@@ -18,6 +18,7 @@ from app.db.models import Workflow
 from app.engine.context import (
     LABEL_PREFIX_KEY, PREFIX_KEY, STREAM_KEY, NodeContext, NodeError, stream_writer,
 )
+from app.engine.evidence import ledger_enabled, next_exec
 from app.engine.lineage import whole_ref
 from app.engine.state import GraphState, message_text, template_context
 from app.engine.toolcalls import (
@@ -316,8 +317,9 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     async def _member(name: str, instruction: str, progress: str,
                       tally: dict[str, Any]) -> dict[str, Any]:
         cfg = agent_map[name]
-        # 绑了分析工具的成员：这一次执行自己的分析容器（同 Agent 节点）。查询结果照 Agent 的写法编成「【证据 Qn】」，分析结论
-        # 编成「【分析 An】」；协作节点不记证据台账，这些编号只给成员自己接着分析、下钻用
+        # 绑了分析工具的成员：这一次执行自己的分析容器（同 Agent 节点）。查询结果照 Agent 的写法编成「【证据 Qn】」（一次
+        # 调用交回多条时逐条编号），分析结论编成「【分析 An】」；协作节点不记证据台账，这些编号只给成员自己接着分析、
+        # 下钻用——每个编号对应的逻辑查询与执行身份记在这次调用的调用记录里，随团队产出一起封存
         scope = (AnalysisScope(node_id=ctx.node.id, snapshot=run_snapshot(ctx.run))
                  if any(is_analysis_tool(t) for t in cfg.get("tools", []) or []) else None)
         async with SessionLocal() as session:
@@ -329,6 +331,11 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     max_tokens=int(cfg.get("max_tokens") or 4096),
                 ),
             )
+            # K10：这次运行的类别、发起人与来源照运行记录来——成员绑的 caliber_query 和调用工具节点、Agent、别条路
+            # 上拿到同一个答案（formal 父 Run 走 formal judge、用发起人当主体、把固定的数据版本与选项带进派生的子运行）
+            from app.engine.runner import RUN_OPTIONS_KEY
+            from app.tools.registry import RUN_CLASS_KEY, RUN_ORIGIN_KEY, RUN_STARTED_BY_KEY
+
             tool_ctx = ToolContext(
                 run_id=ctx.run.run_id,
                 node_id=f"{ctx.node.id}:{name}",
@@ -343,6 +350,10 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 catalog_view=catalog_view.of_run(ctx.run),
                 # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
                 emit=ctx.emit,
+                run_class=ctx.run.extra.get(RUN_CLASS_KEY),
+                started_by=ctx.run.extra.get(RUN_STARTED_BY_KEY),
+                run_options=dict(ctx.run.extra.get(RUN_OPTIONS_KEY) or {}),
+                origin=ctx.run.extra.get(RUN_ORIGIN_KEY),
                 extra={ANALYSIS_SCOPE_KEY: scope} if scope is not None else {},
             )
             tools = await build_tools(cfg.get("tools", []) or [], tool_ctx, session=session)
@@ -357,6 +368,12 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             HumanMessage(content=f"团队目标：{goal}\n\n已有进展：\n{progress or '(无)'}\n\n你的任务：{instruction}"),
         ]
         calls: list[dict[str, Any]] = []
+        # K10 收尾：成员这一次查到的数进不进运行封存证据（子工作流转发那一套的同一个位置：node.finished 的 evidence）。
+        # 升级前发起的运行一个字都不加（ledger_enabled，同 tools/llm 的 evidence_on）；模版拼出来的普通工具调用
+        # （calculator 这类）不是平台执行的查询，entry 一个都不产生，产出与以前一字不差
+        evidence_on = ledger_enabled(ctx.run)
+        entries: list[dict[str, Any]] = []
+        exec_no = next_exec(state, ctx.node.id) if evidence_on else 0
         # 和 agent 节点同一个硬顶：成员上配多少步都过不去 max_agent_steps
         max_steps = min(int(cfg.get("max_steps") or 4), settings.max_agent_steps)
         nudged = False
@@ -372,12 +389,13 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 text = message_text(reply)
                 snippet = leaked_markup(text)
                 if not snippet:
-                    return {"text": text, "tool_calls": calls}
+                    return {"text": text, "tool_calls": calls, **_member_evidence(entries)}
                 # 把工具调用写成了文字：这一步什么都没查到。纠正一次，还这样就记为失败，
                 # 原因交给调度者——以前这段标记会被当成这个成员的结论交上去
                 if nudged:
                     return {"text": f"（{name} 这一步执行失败：{MEMBER_MARKUP_FAILED}）",
-                            "tool_calls": calls, "failed": True, "error": MEMBER_MARKUP_FAILED}
+                            "tool_calls": calls, "failed": True, "error": MEMBER_MARKUP_FAILED,
+                            **_member_evidence(entries)}
                 nudged = True
                 ctx.emit(EventType.LOG, level="warn", code="tool_markup_leak",
                          message=f"{markup_warning(snippet, name)}，已要求模型重试一次")
@@ -471,9 +489,13 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                              reason_code=analysis["result"].get("reason_code"),
                              reason=analysis["result"].get("reason"),
                              message=f"{name} 的 {tname} 没有做成：{analysis['result'].get('reason') or '原因未知'}")
-                calls.append({"tool": tname, "args": targs, "result": content[:2000]})
-                if scope is not None and not failure and tname in tool_map:
-                    content = await _numbered(scope, tname, content, analysis, ctx.run.run_id, ctx.node.id)
+                record = {"tool": tname, "args": targs, "result": content[:2000]}
+                if not failure and tname in tool_map and (scope is not None or evidence_on):
+                    content = await _numbered(scope, tname, content, analysis, ctx.run.run_id, ctx.node.id,
+                                              call_id=cid, member=name, exec_no=exec_no,
+                                              record=record if evidence_on else None,
+                                              ledger=entries if evidence_on else None)
+                calls.append(record)
                 messages.append(ToolMessage(content=content, tool_call_id=cid))
 
         # 步数用完了：最后一步一定是要了工具的，模型从没拿到过"说结论"的那一轮。
@@ -500,7 +522,8 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         if snippet := leaked_markup(text):
             if not calls:
                 return {"text": f"（{name} 这一步执行失败：{MEMBER_MARKUP_FAILED}）",
-                        "tool_calls": calls, "failed": True, "error": MEMBER_MARKUP_FAILED}
+                        "tool_calls": calls, "failed": True, "error": MEMBER_MARKUP_FAILED,
+                        **_member_evidence(entries)}
             # 真调过工具，只是收尾轮还想接着查：取它之前说过的话，和 agent 节点一样
             ctx.emit(EventType.LOG, level="warn", code="tool_markup_leak",
                      message=f"{markup_warning(snippet, name)}：已达步数上限，收尾时仍试图调用工具")
@@ -509,7 +532,8 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                          and not leaked_markup(t)), "")
         ctx.emit(EventType.LOG, level="warn", code="step_limit_settled",
                  message=f"{name} 已用完 {max_steps} 步上限，结论基于已查到的部分")
-        return {"text": text or f"（{name} 已用完 {max_steps} 步上限，未给出结论）", "tool_calls": calls}
+        return {"text": text or f"（{name} 已用完 {max_steps} 步上限，未给出结论）", "tool_calls": calls,
+                **_member_evidence(entries)}
 
     progress_lines: list[str] = []
     final_text = ""
@@ -517,6 +541,10 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     #: 失败说明是写给调度者看的，不是结论
     delivered: list[tuple[str, str]] = []
     rounds_meta: list[dict[str, Any]] = []
+    #: 成员实际查到的数：这一次执行里各成员交回的 query 条目（K10 收尾）。随这个节点的 node.finished 进运行封存证据，
+    #: 让证据面板、导出包、运行对比、双盲复算读得到成员查过什么。从**缓存下来的成员产出**里取（work 是 task）：重放
+    #: 拿到的还是同一批条目，不会因为重跑一次多记或少记。普通成员（没查过库）一条都没有，产出与以前一字不差
+    ledger: list[dict[str, Any]] = []
     #: 调度者最后一轮给的理由，以及派过活的成员。轮数用完时报错要说清卡在哪、谁从没上过场
     last_reason = ""
     dispatched: set[str] = set()
@@ -561,6 +589,10 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             if spent:
                 _accumulate(spent)
             each_ms = int(outcome.pop("duration_ms", 0) or 0)
+            # 成员的查询条目交给这个节点去记（不进 transcript：产出里那一条已经带着编号与执行身份）
+            found = outcome.pop("evidence", None)
+            if isinstance(found, list):
+                ledger += [e for e in found if isinstance(e, dict)]
             sum_ms += each_ms
             progress_lines.append(f"【{name}】{outcome['text']}")
             transcript.append(
@@ -641,6 +673,13 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         "nodes": {ctx.node.id: result},
         "usage": usage_total,
     }
+    if ledger:
+        # 成员查到的数进运行封存证据：node.finished 的 evidence（这一份进封存范围，封存读取、导出包的来源与遮罩判断、
+        # 运行对比、双盲复算都从这里认），条目带成员的节点前缀（「协作节点 id:成员名」，和成员查库时记在工件上的那个
+        # 节点一致）。不带「协作节点 id/成员名」那种前缀：那是子工作流转发的写法，_own_evidence 会把它当成子图里节点
+        # 自己记过的、从这个节点的事件里滤掉（engine/compiler.py），这些条目就没进封存；而 _own_evidence 放行的又必须
+        # 是祖先节点或「祖先/…」，所以「节点:成员」既进封存、又不进报告目录的 Q 编号（见 _numbered 的说明）
+        updates["evidence"] = ledger
     if ctx.cfg("emit_message", True):
         updates["messages"] = [AIMessage(content=final_text or "（空）")]
     var_name = ctx.cfg("assign_to", "")
@@ -649,23 +688,90 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     return updates
 
 
-async def _numbered(scope: AnalysisScope, tool: str, content: str, analysis: dict[str, Any] | None, run_id: str,
-                   node_id: str) -> str:
-    """绑了分析工具的协作成员：一次成功的工具调用交回成员的内容。数据源查询（平台执行的，端点读取另核工件是这次运行落下
-    的）编号「【证据 Qn】」并放进分析容器；分析结论编号「【分析 An】」、换成给模型看的那一段。别的工具原样。"""
-    from app.capabilities.registry import is_platform_query, snapshot_owned
-    from app.engine.evidence import query_entry_fields
+def _member_evidence(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """成员这一次执行记下的查询条目（没有就一个键都不加：普通成员的产出与以前一字不差）。"""
+    return {"evidence": list(entries)} if entries else {}
+
+
+async def _platform_queries(content: str, tool: str, run_id: str) -> list[dict[str, Any]]:
+    """这次工具调用交回、**可以作证**的查询条目：按身份摊开（capabilities.registry.query_items——数据源查询一条、
+    口径查询是 queries 数组里**多条**），逐条认工件（snapshot_owned：数据源查询的快照由数据层自己落，照旧放行；口径
+    查询那条必须是这次运行或它明确派生的子运行落下的查询快照）。不是平台执行的查询返回空——拼一份同样形状的 JSON
+    不算证据；伪造的、别的运行落的、别的种类的一律不要。抽取与认工件和 Agent 节点、调用工具节点是同一份。"""
+    from app.capabilities.registry import is_platform_query, query_items, snapshot_owned
+
+    if not is_platform_query(tool):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in query_items(content, tool):
+        artifact = str(item.get("artifact") or "")
+        if artifact and await snapshot_owned(artifact, run_id, tool):
+            out.append(item)
+    return out
+
+
+async def _numbered(scope: AnalysisScope | None, tool: str, content: str, analysis: dict[str, Any] | None,
+                   run_id: str, node_id: str, *, call_id: str = "", member: str = "", exec_no: int = 0,
+                   record: dict[str, Any] | None = None, ledger: list[dict[str, Any]] | None = None) -> str:
+    """一次成功的工具调用交回成员的内容。平台执行的查询（数据源查询、K10 的口径查询 caliber_query、登记里声明了表格的
+    端点读取）编号「【证据 Qn】」并放进成员自己的分析容器（scope 给了才做——绑了分析工具的成员才有容器，没绑的成员看到的
+    内容一个字不改）；分析结论编号「【分析 An】」、换成给模型看的那一段。别的工具原样。
+
+    **一次调用交回多条查询**（口径查询的结果里是 queries 数组）时逐条编号、逐条放进容器：抽取与认工件走和数据源查询、
+    Agent 节点、调用工具节点**同一份**（_platform_queries），不另写一套按结果长相猜的逻辑，也不因为带的是数组就只认
+    第一条。伪造的、别的运行落的、不是查询快照的工件一律不进容器、不进台账。
+
+    ledger 给了就逐条往它上面记一条运行台账的 query 条目（和 tools/llm 记的那一种同形：工件、来源、列与行数、截断、
+    query_id/execution_id/attempt，口径查询那条另带 origin/parameters，另带 member＝哪个成员），由调用方作为这个节点的
+    evidence 交出去、随 node.finished 进封存。条目上的节点 id 是「协作节点 id:成员名」——带成员归属，又不会被
+    engine/compiler 的 _own_evidence 当成子工作流转发的条目滤掉（那种前缀是「协作节点 id/成员名」，滤掉就进不了封存）。
+    封存读取（engine/evidence_reader 的 queries / query_records / entries）、导出包的来源与遮罩判断、运行对比、双盲复算
+    的原始编号都从这里认；报告目录按祖先收证据（report.report_catalog 的 allowed）不收它，所以报告里的全局 Q 编号与
+    面板按报告引用的那一份一个字不变，成员查到的数是**附加**在封存证据上的（证据面板按报告引用列的那份仍只有报告引过的）。
+
+    record 是这次调用的调用记录（进团队产出、随运行封存）：编号只活在成员自己的容器里，记下 alias / query_id /
+    execution_id / attempt 才看得出这个 Qn 是哪一次执行的哪条查询。执行身份同 tools/registry.execution_id_of。"""
+    from app.tools.registry import execution_id_of
 
     if analysis is not None:
         return reply_text(scope.add_result(analysis["result"], analysis["artifact"]), analysis["result"])
-    if not is_platform_query(tool):
+    items = await _platform_queries(content, tool, run_id)
+    if not items:
         return content
-    fields = query_entry_fields(content)
-    if fields is None or not await snapshot_owned(fields["artifact"], run_id, tool):
-        return content
-    alias = f"Q{len(scope.queries) + 1}"
-    scope.add_query(alias, input_snapshot(json.loads(content), ref=alias, artifact=fields["artifact"], node_id=node_id))
-    return f"【证据 {alias}】\n{content}"
+    data = json.loads(content)
+    aliases: list[str] = []
+    traced: list[dict[str, Any]] = []
+    owner = f"{node_id}:{member}" if member else node_id
+    for item in items:
+        artifact = str(item["artifact"])
+        alias = ""
+        if scope is not None:
+            alias = f"Q{len(scope.queries) + 1}"
+            aliases.append(alias)
+            scope.add_query(alias, input_snapshot(data if isinstance(data, dict) else {}, ref=alias,
+                                                 artifact=artifact, node_id=node_id))
+        # 实际执行的执行身份（K10）：query_id 是逻辑查询、execution_id 是这一次、attempt 是第几次。口径查询那条自己
+        # 带着（K09 算好的），别的按这次调用的 id 算
+        identity = {"query_id": item.get("query_id") or node_id,
+                    "execution_id": item.get("execution_id") or execution_id_of(node_id, attempt=exec_no,
+                                                                               call_id=call_id, run_id=run_id),
+                    "attempt": item.get("attempt") or exec_no or 1}
+        traced.append({"artifact": artifact, **({"alias": alias} if alias else {}), **identity})
+        if ledger is not None:
+            # 运行台账的 query 条目：和 tools/llm 记的那一种同形（工件、来源、列与行数、截断、执行身份），
+            # 口径查询那条另带 origin（哪一版、哪张图、哪个取数节点）与 parameters（输入/模板哈希，值本身不在）
+            ledger.append({
+                "kind": "query", "node_id": owner, "exec": exec_no or 1, "artifact": artifact,
+                "call_id": call_id, "tool": tool, "member": member,
+                "source": item.get("source"), "columns": [str(c) for c in item.get("columns") or []],
+                "rows": int(item.get("rows") or 0), "truncated": bool(item.get("truncated")), **identity,
+                **({"origin": dict(item["origin"])} if isinstance(item.get("origin"), dict) else {}),
+                **({"parameters": dict(item["parameters"])} if isinstance(item.get("parameters"), dict) else {}),
+            })
+    if record is not None:
+        record.update(artifact=str(items[0]["artifact"]), queries=traced,
+                      **({"alias": traced[0]["alias"]} if traced[0].get("alias") else {}))
+    return f"【证据 {'、'.join(aliases)}】\n{content}" if aliases else content
 
 
 # --------------------------------------------------------------------------

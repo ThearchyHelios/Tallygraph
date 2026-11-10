@@ -29,6 +29,8 @@ from app.api import (
 )
 # 编排完善第 1 波（docs/design/orchestration-round §1）：问数据的一轮在服务端跑
 from app.api import chat_turns as chat_turns_api
+# 增量重导入（K11）：建一次导入、看工作项和冲突、接受选定字段、拒绝、人工对齐、恢复
+from app.api import caliber_import as caliber_import_api
 from app.api.coded import CodedHTTPException, coded_handler
 from app.api.deps import chat_scope, evidence_scope, private_run_scope, require_role, role_by_method, run_scope
 from app.auth.keys import key_gate
@@ -143,9 +145,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         from app.chat import job as chat_job
         from app.eval import runner as eval_runner, snapshots as eval_snapshots
 
-        from app.ledger import jobs as draft_jobs
+        from app.ledger import jobs as draft_jobs, reimport as import_jobs
 
         await draft_jobs.manager.shutdown()
+        await import_jobs.manager.shutdown()
         await catalog_jobs.manager.shutdown()
         await catalog_profile_jobs.manager.shutdown()
         await introspect_jobs.manager.shutdown()
@@ -246,7 +249,7 @@ def _register_reapers() -> None:
     from app.data import catalog_jobs, catalog_profile_jobs, introspect_jobs
     from app.eval import runner as eval_runner, snapshots as eval_snapshots
     from app.process import actions, tasks
-    from app.ledger import jobs as draft_jobs
+    from app.ledger import jobs as draft_jobs, reimport as import_jobs
 
     async def documents(live: Any) -> int:
         return await _reap_documents(live)
@@ -255,6 +258,7 @@ def _register_reapers() -> None:
         ("运行", run_manager.reap),
         ("处理中的文档", documents),
         ("口径起草任务", lambda live: draft_jobs.startup(live=live)),
+        ("口径增量导入", lambda live: import_jobs.startup(live=live)),
         ("数据目录起草任务", lambda live: catalog_jobs.startup(live=live)),
         ("数据剖析任务", lambda live: catalog_profile_jobs.startup(live=live)),
         ("探查任务", lambda live: introspect_jobs.startup(live=live)),
@@ -424,6 +428,8 @@ for router, guard in (
     (shares_api.router, []),
     (notify_api.router, _USER),
     (ledger_api.router, _BUILDER),
+    # 增量重导入（K11）：和 /api/ledger 其余写接口同一道门（搭建者）；访问密钥不开放（不登记 KEY_ROUTES）
+    (caliber_import_api.router, _BUILDER),
     # 下一轮第 2 波：评测只给搭建者；访问密钥登录即可，接口里再按本人 / 管理员判
     (evals_api.router, _BUILDER),
     # 口径账本里按答案出具、对账的（第 3 波）：登录即可，接口里按运行和应用授权判

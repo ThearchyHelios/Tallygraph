@@ -487,6 +487,12 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # 工作进程登记的代码版本、库结构版本（app/cluster/version.py：不许新旧版本混跑）
     ("cluster_workers", "code_version", "VARCHAR(200)"),
     ("cluster_workers", "schema_version", "VARCHAR(64)"),
+    # 发布依据（K07）：发布这一刻这份资产要不要证明。存量事件行回填 0（模型是 NOT NULL，所以迁移里带 DEFAULT）；
+    # 判定改成「事件行这么说，或现在仍接管着」，回填 0 不会放松——存量事件照旧看当前的接管状态
+    ("workflow_publications", "required", "BOOLEAN DEFAULT 0"),
+    # 增量重导入的持久对齐键（K11）：存量工作项回填空串——空串不参与按对齐键的匹配，
+    # 不会被误当成「同一项」串上旧决定（宁可不匹配，也不按位置猜）
+    ("caliber_import_items", "align_key", "VARCHAR(64) DEFAULT ''"),
 ]
 
 #: 迁移补上的列要建的索引：(索引名, 表, 列或多列)。create_all 不碰已有的表，表上新列的索引也就不会建。
@@ -503,6 +509,8 @@ _INDEX_MIGRATIONS: list[tuple[str, str, str | tuple[str, ...]]] = [
     ("ix_conversations_created_by", "conversations", "created_by"),
     # 口径账本按种类反查工件（kind=caliber_match，next-round 02 做法 2）
     ("ix_artifacts_kind", "artifacts", "kind"),
+    # 增量重导入的工作项按持久对齐键认（K11）：候选顺序、条数变了也要认得出同一个工作项
+    ("ix_caliber_import_items_align_key", "caliber_import_items", "align_key"),
 ]
 
 

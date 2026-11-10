@@ -227,5 +227,21 @@ def cache_token(entry: Any) -> Any:
     return [entry.get("seq"), older] if older else entry.get("seq")
 
 
+def inherit_scope(versions: dict[str, Any] | None) -> None:
+    """派生的子运行**继承**父 Run 已授权的 data_versions 时，记录表的行级范围原样带着，不重算（K10）。
+
+    重算是错的：子运行按 exploratory 重算，一个正式父 Run 的 all 会被收成 mine/none——父已授权、子看得更少，
+    同一次口径查询算出来的数就和父 Run 自己的不一样了；父 Run 发起之后管理员改了授权，同一次运行的前后两段
+    也会看到不同的行。范围在父 Run 发起时定下（records.access.scope_of_run），子运行既不放大也不缩小。
+    缺 rows 的项（升级前发起的运行、手工拼的）按最窄的 none 算，绝不当成 all。"""
+    from app.records.access import SCOPES
+
+    for entry in (versions or {}).values():
+        if not isinstance(entry, dict) or entry.get("origin") != RECORDS_ORIGIN:
+            continue
+        if entry.get("rows") not in SCOPES:
+            entry["rows"] = "none"
+
+
 def is_records(source: Any) -> bool:
     return (getattr(source, "origin", None) or "manual") == RECORDS_ORIGIN

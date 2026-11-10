@@ -8,10 +8,13 @@
 
 - 生成：generate_in 给这一次生成的请求（问数据带对话、限定的数据源；评测带变体的助手模型），catalog_view 给读哪一份数据目录
   （评测按变体，问数据是当前目录）。每一条操作都先交给 on_op（问数据写进这一轮的事件日志，评测不管），思考和心跳不进结局判断。
-- 结局：reply 直接回答、asked 反问、ready 只建不跑、build_failed 建图失败、retry 带着原因重来（次数照 MAX_ATTEMPTS）、run 运行。
-  每次重来前调 on_retry（问数据记一条「重来」，把换下来的运行的用量并进这一轮）。
+- 结局：reply 直接回答、asked 反问、ready 只建不跑、build_failed 建图失败、retry 带着原因重来（次数照 MAX_ATTEMPTS）、run 运行、
+  done 这一轮的运行已经在生成里跑完（固定执行的 final 带 execution.run_id：不发起第二次，收下那次运行——记进这一轮、接上
+  证据、页面能重载查看；不再整轮复核，那次运行是服务端按固定口径搭的取数图，它的成果不是自由生成的答案）。每次重来前调
+  on_retry（问数据记一条「重来」，把换下来的运行的用量并进这一轮）。
 - 运行：prepare_graph 改图（评测按变体写进写作模型）、run_input 填入口（问数据带前几轮的问答，评测单轮）、launch_args 给来源、
-  选项、发起人（遮罩、只读、目录视图照各自现有的规则），发起之后调 on_launched。
+  选项、发起人（遮罩、只读、目录视图照各自现有的规则；也可以连带交回改过的 graph：普通使用者的口径查询工具是 chat/launch
+  补上的），发起之后调 on_launched。
 - 终态：停在审批上交给 on_interrupted——评测取消（不代批），问数据照旧等人（这是两边唯一的流程差别）；被驳回的记 rejected，
   失败、被停止记 run_failed。
 - 复核：_review（评测一直等、复核自己出错照实记一条失败的复核；问数据最多等 25 秒，见 chat/job.py）。给了
@@ -182,11 +185,15 @@ class TurnDriver:
         return policy.fill_input(graph, self.question, "")
 
     async def launch_args(self, session: Any, graph: dict[str, Any]) -> dict[str, Any]:
-        """launch_run 的其余参数：来源、选项、发起人……可以抛 LaunchRefused（照发起被拒记）。"""
+        """launch_run 的其余参数：来源、选项、发起人……可以抛 LaunchRefused（照发起被拒记）。
+
+        准备阶段要改图时就带一项 `graph` 回来（普通使用者的口径查询工具是 chat/launch 补上的）：`_launch` 用交回的那一张
+        发起，别的调用方不带这一项，用的仍是 prepare_graph 出来的图。"""
         raise NotImplementedError
 
     async def on_launched(self, run: Any) -> None:
-        """运行发起了。"""
+        """运行发起了。**这一轮收下的一次已经跑完的运行**（NEXT_DONE 那一档）也走这里：问数据据此把它记进这一轮（run_id 那一列、
+        run 事件、meta），页面能重载查看；评测那一档不改（基类空实现）。"""
 
     async def on_interrupted(self, run_id: str, row: Any) -> Any | None:
         """运行停在断点上（审批、服务重启挂起）：交回接着等到的运行记录，或者记好路径、交回 None。"""
@@ -238,9 +245,12 @@ class TurnDriver:
         graph = self.prepare_graph(graph)
         try:
             async with SessionLocal() as session:
+                # 准备阶段的其余参数：launch_args 可能连图一起改（普通使用者的口径查询工具是服务端在 chat/launch 里补上的，
+                # 见那一段说明）——它交回 graph 这一项就用它，别的调用方照旧用 prepare_graph 出来的那一张
+                args = await self.launch_args(session, graph)
+                graph = args.pop("graph", graph)
                 inputs = payload if payload is not None else await self.run_input(session, graph)
-                run = await launch_run(session, graph=graph, input_payload=inputs,
-                                       **(await self.launch_args(session, graph)))
+                run = await launch_run(session, graph=graph, input_payload=inputs, **args)
         except LaunchRefused as e:
             self.launch_refused = e
             self.turn.path, self.turn.reason = "run_failed", f"运行没有发起：{e.message}"
@@ -322,6 +332,8 @@ class TurnDriver:
         instruction = instruction or self.question
         # 不建图、直接运行这张图（graph），或者不发起、接着等这次运行（run_id）：只有第一圈这样，重来还是照常建图
         direct, follow = graph, run_id
+        #: 这一轮的运行是在**生成这一轮里**就跑完的那一次（固定执行）：跟它一次，收下它，不再整轮复核（见模块说明）
+        fixed = False
         try:
             while True:
                 if direct is None and follow is None:
@@ -384,6 +396,15 @@ class TurnDriver:
                     if step == policy.NEXT_READY:
                         t.path, t.reason = "ready", "助手只建了图、没有运行（它判断用户要的是流程本身）"
                         return t
+                    if step == policy.NEXT_DONE:
+                        # 这一轮的运行已经在生成里跑完了（固定执行）：不发起第二次，收下它（下面那一圈走 follow 那一支：
+                        # 记进这一轮、等它收尾、接上证据），也不再整轮复核
+                        running = str((terminal.get("execution") or {}).get("run_id") or "")
+                        if not running:
+                            t.path, t.reason = "build_failed", "这一轮的固定执行没有交出运行"
+                            return t
+                        fixed, follow = True, running
+                        continue
                     direct = built
 
                 await self._phase("run")
@@ -391,6 +412,11 @@ class TurnDriver:
                     t.runs.append(follow)
                     t.run_id = t.current_run = follow
                     row = await self._follow(follow)
+                    if row is not None and fixed:
+                        # 收下这一次已经跑完的运行：记进这一轮（run_id 那一列、run 事件、meta），页面据此重载查看
+                        await self.on_launched(row)
+                        t.path = "ran"
+                        return t
                 else:
                     row = await self._run(direct)
                 direct = follow = None

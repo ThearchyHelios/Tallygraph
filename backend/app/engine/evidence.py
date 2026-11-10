@@ -118,6 +118,12 @@ class EvidenceEntry(TypedDict, total=False):
     via: str                  # 外层包装的工件（query_snapshot 外面的 tool_snapshot）
     call_id: str              # agent 工具记下的那次调用（查询、分析）
     tool: str
+    #: query 专有（K10）：这次执行的执行身份。query_id 是**逻辑**查询身份（同一个节点/别名执行多次都一样），
+    #: execution_id 是**这一次执行**的身份（唯一），attempt 是第几次尝试（和 exec 一个意思，老条目只有 exec）。
+    #: 同一份快照被两次执行时内容一样、工件 id 相同，靠这三样才分得出是哪一次；老条目一个都没有，退回按 artifact 认。
+    query_id: str
+    execution_id: str
+    attempt: int
     #: analysis 专有（app/analysis/contract.ledger_entry）：算子、模式、算成没算成（ok / refused）、判定码、输入快照的
     #: sha256（去重、保序）；分析卡来的另记那一项的 id（item），agent 工具来的记 call_id
     op: str
@@ -233,6 +239,29 @@ def cell_eid(artifact: str | None, row: int, column: str) -> str:
     """查询快照里一格的 eid。报告的 [[v:]]、agent 字段的出处、口径卡的 cell() 都按它算，
     同一格在三处是同一个标识。column 一律是列名（列号先换成列名）。"""
     return make_eid("cell", artifact, {"row": row, "column": column})
+
+
+#: 新 query 台账条目带的执行身份（K10，见 EvidenceEntry 的那几行）
+QUERY_EXECUTION_KEYS = ("query_id", "execution_id", "attempt")
+
+
+def query_identity(entry: dict[str, Any] | None) -> dict[str, Any]:
+    """一条查询台账条目的执行身份：新条目带 query_id / execution_id / attempt，老条目一个都没有（空 dict）。"""
+    if not isinstance(entry, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in QUERY_EXECUTION_KEYS:
+        value = entry.get(key)
+        if value not in (None, ""):
+            out[key] = value
+    return out
+
+
+def query_eid(kind: str, artifact: str | None, entry: dict[str, Any] | None) -> str:
+    """query / retrieval 条目的 eid。带了执行身份（新条目）就把它算进去：同一份快照被两次执行**各得一个
+    eid**，目录里是两条点得开的记录；老条目没有执行身份，和以前一字不差地按 artifact 算（不要把所有旧
+    eid 重算）。定位子（locator）还是空：这一点归条目的身份，不归工件里的某个格子。"""
+    return make_eid(kind, artifact, query_identity(entry))
 
 
 # --------------------------------------------------------------------------
@@ -1028,10 +1057,13 @@ def build_catalog(
         else:
             continue
         catalog[alias] = {
-            "alias": alias, "kind": kind, "eid": make_eid(kind, entry.get("artifact"), {}),
+            # 同一份快照被两次执行（循环里、两个节点写同一条 SQL）时 artifact 一样：eid 把执行身份也算进去，
+            # Q1、Q2 各有各的 eid；旧条目没有执行身份，算出来和以前一字不差。身份也照抄进条目，消费方据此
+            # 认得出这次引用的是哪一次执行（sealed.query_at、apps/resolve._query_artifact）
+            "alias": alias, "kind": kind, "eid": query_eid(kind, entry.get("artifact"), entry),
             "locator": {},
             **{k: entry[k] for k in ("node_id", "exec", "artifact", "via", "call_id", "tool", "source",
-                                     "columns", "rows", "truncated") if k in entry},
+                                     "columns", "rows", "truncated", *QUERY_EXECUTION_KEYS) if k in entry},
             "label": label,
         }
     if schemas or shaped:

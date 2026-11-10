@@ -3,7 +3,7 @@ import {
   addEdge, applyEdgeChanges, applyNodeChanges,
   type Connection, type Edge, type EdgeChange, type Node, type NodeChange,
 } from '@xyflow/react'
-import { api, streamCopilot, streamRun } from '../api/client'
+import { api, ApiError, streamCopilot, streamRun } from '../api/client'
 import { copilotReceipt, mergeNodeConfig, toolChangesOf } from '../canvas/copilotMerge'
 import { connectMergeInput, isQueryNode } from '../canvas/mergeInputs'
 import { connectAnalysisInput } from '../canvas/analysisItems'
@@ -519,6 +519,11 @@ interface StudioState {
   edges: Edge[]
   selectedId: string | null
   dirty: boolean
+  /**
+   * 保存被服务端按 stale_revision 拒了（K02：同一张图有人先改过）：记下「我基于哪一版、服务端现在是哪一版」。
+   * 本地图一个字没动、dirty 仍是 true，也不会自动重发；页面上给两条明确的路：用最新版本再保存 / 载入最新版本
+   */
+  staleSave: { base: number; current: number | null } | null
   /** 校验出来的 error / warning。info 级的建议不在这里，在 advice */
   issues: ValidationIssue[]
   /**
@@ -656,8 +661,10 @@ interface StudioState {
   pasteClipboard: () => number
   selectAll: () => void
   select: (id: string | null) => void
-  /** note 不传时用 pendingNote（恢复旧版本时自动填的那句） */
-  save: (note?: string) => Promise<void>
+  /** note 不传时用 pendingNote（恢复旧版本时自动填的那句）。opts.expectedRevision 只在「用最新版本再保存」时给 */
+  save: (note?: string, opts?: { expectedRevision?: number }) => Promise<void>
+  /** 「先不改了」：冲突横幅收起来（本地图照旧、还是未保存） */
+  clearStaleSave: () => void
   validate: () => Promise<void>
   analyzeNow: () => Promise<void>
   undo: () => void
@@ -1058,6 +1065,9 @@ async function saveUpgrade(set: SetFn, get: () => StudioState): Promise<boolean>
 /** 上次保存（或打开）时的图。撤销回这个样子时「未保存」要消失 */
 let savedSig = ''
 
+/** 正在排队的保存：同一时刻只跑一次，⌘S 连按不会拿同一个基准版本并发发两次（K02） */
+let pendingSave: Promise<void> | null = null
+
 /**
  * 把一组节点从现在的位置滑到 targets，约 320ms，结束时 done()。
  *
@@ -1200,6 +1210,7 @@ export const useStudio = create<StudioState>((set, get) => ({
   analysisError: null,
   getViewportCenter: null,
   pendingNote: '',
+  staleSave: null,
 
   load: (workflow) => {
     const { nodes, edges } = workflow ? toFlow(workflow.graph) : { nodes: [] as FlowNode[], edges: [] as Edge[] }
@@ -1237,7 +1248,7 @@ export const useStudio = create<StudioState>((set, get) => ({
       copilotConversationId: null,
       copilotMemory: { past: [], total: 0, turns: 0 },
       // 撤销栈属于这张图：撤回去撤出另一张图的节点，比没有撤销更糟
-      past: [], future: [], pendingNote: '',
+      past: [], future: [], pendingNote: '', staleSave: null,
     })
     if (!workflow) return
     void ensureCanvasConversation(workflow.id, set, get)
@@ -1608,21 +1619,52 @@ export const useStudio = create<StudioState>((set, get) => ({
     set({ selectedId: id, nodes: next })
   },
 
-  save: async (note) => {
-    const { workflow, nodes, edges, pendingNote } = get()
-    if (!workflow) return
-    const graph = toGraph(nodes, edges)
-    const text = (note ?? pendingNote).trim()
-    const updated = await api.workflows.update(workflow.id, { graph, ...(text ? { note: text } : {}) })
-    savedSig = JSON.stringify(graph)
-    // 请求在途时又改了的话，那部分还没存：不能把「未保存」清掉
-    set({ workflow: updated, dirty: graphSig(get().nodes, get().edges) !== savedSig, pendingNote: '' })
-    // 升级落到画布上之后没存上（存失败、要存时锁着），这回平常的保存（⌘S、工具栏）存上了：画布上是什么就存了什么，
-    // 升级要么跟着存进去了、要么已经撤销掉了，「草稿没保存上」都不再是真的。留着的话再点「重试保存」
-    // 会多存一版，版本说明还写着「升级为可追溯结构」
-    const u = get().upgrade
-    if (u?.status === 'ready' && upgradeUnsaved(u.apply)) set({ upgrade: null })
+  save: (note, opts) => {
+    // 同一时刻只跑一次保存（K02）：⌘S 连按、工具栏和助手同时点，都不会拿同一个基准版本并发发两次。排在后面的
+    // 那一次等前面那次回来之后再发，用的是前面那次之后 store 里的基准版本；图没变时服务端也不新增版本
+    const queued = (pendingSave ?? Promise.resolve()).then(async () => {
+      const { workflow, nodes, edges, pendingNote, dirty } = get()
+      if (!workflow) return
+      const graph = toGraph(nodes, edges)
+      const text = (note ?? pendingNote).trim()
+      // 没有未保存的修改（⌘S 连按的第二次、刚存完又按了一下）、也没有版本说明：没有要写的东西，不发这一趟请求。
+      // 下面的收尾照旧做——画布现在这一份就是已经存着的那一份（dirty 为假），「升级没存上」这类状态该跟着清掉
+      const write = dirty || !!text || opts?.expectedRevision != null
+      if (write) {
+        // 基准版本（K02 的乐观锁）：默认用读到的 Workflow.version；「用最新版本再保存」才用服务端刚回的当前版本。
+        // 已接管的资产（文档起草的口径卡）服务端要求它，别的资产也照同一条走——两个页面先后保存旧图时，后一个
+        // 被拒（409 stale_revision），而不是盖掉前一个
+        const base = opts?.expectedRevision ?? workflow.version
+        try {
+          const updated = await api.workflows.update(workflow.id, {
+            graph, expected_revision: base, ...(text ? { note: text } : {}),
+          })
+          savedSig = JSON.stringify(graph)
+          // 请求在途时又改了的话，那部分还没存：不能把「未保存」清掉
+          set({ workflow: updated, dirty: graphSig(get().nodes, get().edges) !== savedSig, pendingNote: '',
+                staleSave: null })
+        } catch (e) {
+          // 有人先改过同一张图：画布上的修改一个字不动（dirty 一直是 true），也不自动重发；只把服务端现在的版本
+          // 记下来，页面上给两条明确的路让人选（用最新版本再保存 / 载入最新版本）
+          if (e instanceof ApiError && e.status === 409 && e.code === 'stale_revision') {
+            const told = Number((e.body as { current_version?: unknown } | undefined)?.current_version)
+            set({ staleSave: { base, current: Number.isFinite(told) ? told : null }, dirty: true })
+          }
+          throw e
+        }
+      }
+      // 升级落到画布上之后没存上（存失败、要存时锁着），这回平常的保存（⌘S、工具栏）存上了：画布上是什么就存了什么，
+      // 升级要么跟着存进去了、要么已经撤销掉了，「草稿没保存上」都不再是真的。留着的话再点「重试保存」
+      // 会多存一版，版本说明还写着「升级为可追溯结构」
+      const u = get().upgrade
+      if (u?.status === 'ready' && upgradeUnsaved(u.apply)) set({ upgrade: null })
+    })
+    // 队列只用来排队：一次失败不该把后面的保存卡住（真正的失败照旧抛给调用方去提示）
+    pendingSave = queued.then(() => undefined, () => undefined)
+    return queued
   },
+
+  clearStaleSave: () => set({ staleSave: null }),
 
   /**
    * 校验 + 变量分析。名字保留 validate，因为图一变就该重算的地方有八处，

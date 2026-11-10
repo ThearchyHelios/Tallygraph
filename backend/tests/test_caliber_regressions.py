@@ -65,7 +65,8 @@ async def test_draft_edit_preserves_published_snapshot_and_updates_canvas(client
     _, before = await snapshots(wid)
     metrics = copy.deepcopy(body["metrics"])
     metrics[0]["expression"] += " * 100"
-    changed = await client.patch(f"/api/ledger/drafts/{did}", json={"metrics": metrics})
+    changed = await client.patch(f"/api/ledger/drafts/{did}",
+                                 json={"metrics": metrics, "expected_revision": body["revision"]})
     assert changed.status_code == 200, changed.text
     workflow, after = await snapshots(wid)
     assert [v.version for v in after] == [1, 2]
@@ -82,7 +83,8 @@ async def test_trial_is_invalidated_by_edit_and_late_results_cannot_replace_new_
     did = body["id"]
     metrics = copy.deepcopy(body["metrics"])
     metrics[0]["expression"] += " * 100"
-    changed = (await client.patch(f"/api/ledger/drafts/{did}", json={"metrics": metrics})).json()
+    changed = (await client.patch(f"/api/ledger/drafts/{did}",
+                                  json={"metrics": metrics, "expected_revision": body["revision"]})).json()
     assert changed["trial"]["status"] == "stale"
     assert not next(c for c in changed["checks"] if c["key"] == "trial")["ok"]
     old = (await client.get(f"/api/ledger/drafts/{did}/trial")).json()
@@ -117,11 +119,13 @@ async def test_metric_edits_preserve_canvas_sql_and_node_ids(client, documents, 
     graph = copy.deepcopy(workflow.graph)
     cfg(graph, "fetch_2")["args"]["sql"] = "SELECT SUM(amount) * 2 AS gmv FROM orders"
     cfg(graph, "start")["fields"].append({"name": "region", "type": "string", "required": True})
-    saved = await client.patch(f"/api/workflows/{wid}", json={"graph": graph})
+    saved = await client.patch(f"/api/workflows/{wid}",
+                               json={"graph": graph, "expected_revision": workflow.version})
     assert saved.status_code == 200, saved.text
     kept = copy.deepcopy(body["metrics"][1])
     kept["name"] = "编辑第二组"
-    patched = await client.patch(f"/api/ledger/drafts/{did}", json={"metrics": [kept]})
+    patched = await client.patch(f"/api/ledger/drafts/{did}",
+                                 json={"metrics": [kept], "expected_revision": saved.json()["version"]})
     assert patched.status_code == 200, patched.text
     workflow, versions = await snapshots(wid)
     latest = versions[-1].graph
@@ -131,7 +135,8 @@ async def test_metric_edits_preserve_canvas_sql_and_node_ids(client, documents, 
     assert cfg(latest, "card")["metrics"][0]["expression"] == kept["expression"]
     assert validate_graph(GraphSpec.model_validate(latest)).ok
     assert cfg(latest, "out")["contract"]["required"] == [kept["id"]]
-    empty = await client.patch(f"/api/ledger/drafts/{did}", json={"metrics": []})
+    empty = await client.patch(f"/api/ledger/drafts/{did}",
+                               json={"metrics": [], "expected_revision": patched.json()["revision"]})
     assert empty.status_code == 200 and empty.json()["metrics"] == [], empty.text
 
 
@@ -141,7 +146,8 @@ async def test_draft_list_counts_current_canvas_metrics(client, documents, datas
     graph = copy.deepcopy(workflow.graph)
     metrics = cfg(graph, "card")["metrics"]
     metrics.append({**metrics[0], "id": "m2", "name": "另一个指标"})
-    saved = await client.patch(f"/api/workflows/{workflow.id}", json={"graph": graph})
+    saved = await client.patch(f"/api/workflows/{workflow.id}",
+                               json={"graph": graph, "expected_revision": workflow.version})
     assert saved.status_code == 200
     items = (await client.get("/api/ledger/drafts")).json()["drafts"]
     assert next(item for item in items if item["id"] == body["id"])["metric_count"] == 2
@@ -239,7 +245,8 @@ async def test_real_trial_runs_current_canvas_version(client, documents, datasou
     workflow, _ = await snapshots(body["workflow_id"])
     graph = copy.deepcopy(workflow.graph)
     cfg(graph, "card")["metrics"][0]["expression"] += " * 100"
-    saved = await client.patch("/api/workflows/" + body["workflow_id"], json={"graph": graph})
+    saved = await client.patch("/api/workflows/" + body["workflow_id"],
+                               json={"graph": graph, "expected_revision": workflow.version})
     assert saved.status_code == 200 and saved.json()["version"] == 2, saved.text
     monkeypatch.setattr(api_ledger, "_run_trial", REAL_RUN_TRIAL)
     result = await client.post("/api/ledger/drafts/" + body["id"] + "/trial", json={"inputs": {}})

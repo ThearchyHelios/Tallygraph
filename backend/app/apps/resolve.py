@@ -1354,7 +1354,16 @@ async def pin_upgrade(session: AsyncSession, app_id: str, version: AppVersion,
 
 
 def _query_artifact(source: Source, node_id: str, exec_no: Any = None) -> str | None:
-    """这个节点在封存范围内交回的查询快照：默认最后一次，exec 给了取第几次（从 1 数）。"""
+    """这个节点在封存范围内交回的查询快照：默认最后一次，exec 给了取第几次（从 1 数）。
+
+    按**执行顺序**逐次取（sealed.query_records_of）：同一份快照被执行两次时内容一样、工件 id 相同，
+    按 artifact 去重会把两次并成一条，exec=2 就永远取不到第二次。
+    """
+    records = source.sealed.query_records_of(node_id)
+    if records:
+        if isinstance(exec_no, int) and not isinstance(exec_no, bool) and 1 <= exec_no <= len(records):
+            return str(records[exec_no - 1].get("artifact") or "") or None
+        return str(records[-1].get("artifact") or "") or None
     found = [a for a, info in source.sealed.queries.items() if info.get("node_id") == node_id]
     if not found:
         return None

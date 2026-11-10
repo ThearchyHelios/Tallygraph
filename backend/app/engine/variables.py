@@ -11,6 +11,10 @@
 - **引用早于产出** —— 变量确实存在，但那个节点在它之后才跑，这时候取到的是空
 - **产出了没人用** —— 不一定是错，但常常是改图改了一半的残留
 
+例外只有一种：带参数契约的节点（ledger/params 的 marker，组合式问数拷进来的取数节点、对账图里服务器拼的对齐语句），
+它的 args / sql 是服务端已经渲染好的**字面**语句——里面的 `{{ }}` 是数据，不按变量引用判（见 _live_strings）。这条例外
+要**核对过契约里的哈希**才算：节点被复制、args / sql 改过之后契约作废，改过的内容照常扫。
+
 顺带把"这张图里到底有哪些变量"列出来，界面上的变量表和输入补全都用它。
 """
 
@@ -179,6 +183,21 @@ def _iter_strings(value: Any, prefix: str = "") -> list[tuple[str, str]]:
         for i, v in enumerate(value):
             out.extend(_iter_strings(v, f"{prefix}[{i}]"))
     return out
+
+
+def _live_strings(cfg: dict[str, Any], node_type: str) -> list[tuple[str, str]]:
+    """节点配置里**还该当活模板看**的字符串：带参数契约的节点（ledger/params 的 marker），args / sql 是服务端已经按参数
+    渲染好的字面语句，里面的 {{ }} 是数据（取数结果、维度值），不是变量引用——跳过那几个键。
+
+    只有契约里的 rendered_hash 与当前那一项对得上才跳（见 params.literal_keys）：节点被复制、args / sql 改过之后契约作废，
+    改过的内容照常全扫——那时它是作者写的模板，写错了仍然要在跑之前说破。
+
+    别的节点、别的键照旧全扫：正常模板写错了（{{ vars.quesiton }}）仍然要在跑之前说破。"""
+    from app.ledger import params
+
+    rendered = params.literal_keys(cfg, node_type)
+    live = {k: v for k, v in cfg.items() if k not in rendered} if rendered else cfg
+    return _iter_strings(live)
 
 
 def _root_of(expr: str) -> tuple[str, str]:
@@ -376,7 +395,7 @@ def analyze(spec: GraphSpec) -> VariableReport:
                     target.refs.append(VarRef(node_id=node.id, node_label=label, field=f"inputs.{alias}",
                                               expr=f"nodes.{source}"))
 
-        for field, text in _iter_strings(cfg):
+        for field, text in _live_strings(cfg, str(node.type)):
             for m in _TEMPLATE_RE.finditer(text):
                 expr = m.group(1).strip()
                 if not expr:

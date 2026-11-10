@@ -66,6 +66,106 @@ async def test_trial_refuses_missing_required_inputs_and_unknown_fields(client):
     assert unknown.status_code == 422 and "nope" in unknown.text
 
 
+@pytest.fixture
+def executed(monkeypatch) -> list[str]:
+    """这一次测试里真正发给数据库的语句（数据源适配器内联渲染之后的那一条），按先后。"""
+    from app.tools import datasource
+
+    seen: list[str] = []
+    real = datasource.run_query
+
+    async def spy(source, sql, **kw):
+        seen.append(sql)
+        return await real(source, sql, **kw)
+
+    monkeypatch.setattr(datasource, "run_query", spy)
+    return seen
+
+
+async def trial_runs() -> list[str]:
+    """这次运行记录里由试跑发起的那些（别的来源不算），按运行 id。"""
+    from sqlalchemy import select
+
+    async with SessionLocal() as session:
+        runs = (await session.execute(select(Run))).scalars().all()
+    return [r.id for r in runs if (r.origin or {}).get("kind") == "caliber_trial"]
+
+
+async def test_trial_refuses_an_incomplete_parameter_before_any_sql(client, executed):
+    """可选、没有缺省值的参数这次没给：试跑在**发起运行之前**回结构化 422，一条 SQL 都不发（K01）。"""
+    sql = ("SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' AND region = '{{ input.store }}' "
+           "AND paid_at >= '{{ input.start }}' AND paid_at < '{{ input.end }}'")
+    graph = S.caliber_graph(sql=sql)
+    graph["nodes"][0]["data"]["config"]["fields"] = [{"name": "start", "required": True},
+                                                     {"name": "end", "required": True},
+                                                     {"name": "store"}]
+    wf = await S.publish(graph=graph)
+    before = await trial_runs()
+    res = await client.post(f"/api/ledger/calibers/{wf}/1/card/trial",
+                            json={"inputs": {"start": "2026-09-01", "end": "2026-09-08"}})
+    assert res.status_code == 422, res.text
+    body = res.json()
+    assert body["code"] == "missing_parameter" and "store" in body["detail"]
+    assert "不能当空串用" in body["detail"]
+    [problem] = body["problems"]
+    assert (problem["code"], problem["name"], problem["node_id"]) == ("missing_parameter", "store", "fetch")
+    assert executed == [] and await trial_runs() == before
+
+
+async def test_trial_reports_an_undeclared_parameter_as_a_structured_422(client, executed):
+    """取数模板引用了入口没声明的字段：结构化 422（undeclared_parameter），连逐条由于 problems 一起交回，不发 SQL、不起运行。"""
+    wf = await S.publish(graph=S.caliber_graph(
+        sql="SELECT SUM(amount) AS gmv FROM orders WHERE region = '{{ input.nope }}'"))
+    before = await trial_runs()
+    res = await client.post(f"/api/ledger/calibers/{wf}/1/card/trial",
+                            json={"inputs": {"start": "2026-09-01", "end": "2026-09-08"}})
+    assert res.status_code == 422, res.text
+    body = res.json()
+    assert body["code"] == "undeclared_parameter" and "nope" in body["detail"]
+    [problem] = body["problems"]
+    assert (problem["code"], problem["name"], problem["node_id"]) == ("undeclared_parameter", "nope", "fetch")
+    assert executed == [] and await trial_runs() == before
+
+
+async def test_trial_treats_an_explicit_empty_string_as_missing_not_empty(client, executed):
+    """显式传空串、字段又没有缺省值：按缺参数拒（结构化 422），不拿空串去发 SQL。
+
+    空串不是值，是省略——这条和组合式问数同一套（ledger/params.provided）；声明了 `default=""` 的字段照声明走（见下一条）。"""
+    sql = ("SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' AND region = '{{ input.store }}' "
+           "AND paid_at >= '{{ input.start }}' AND paid_at < '{{ input.end }}'")
+    graph = S.caliber_graph(sql=sql)
+    graph["nodes"][0]["data"]["config"]["fields"] = [{"name": "start", "required": True},
+                                                     {"name": "end", "required": True},
+                                                     {"name": "store"}]
+    wf = await S.publish(graph=graph)
+    before = await trial_runs()
+    res = await client.post(f"/api/ledger/calibers/{wf}/1/card/trial",
+                            json={"inputs": {"start": "2026-09-01", "end": "2026-09-08", "store": ""}})
+    assert res.status_code == 422, res.text
+    body = res.json()
+    assert body["code"] == "missing_parameter" and "store" in body["detail"]
+    assert executed == [] and await trial_runs() == before
+
+
+async def test_trial_keeps_the_authors_declared_empty_default(client, executed):
+    """作者声明了 `default=""` 的可选参数（模板里写成「空值不过滤」）：照声明当空串跑，不算缺参数。"""
+    sql = ("SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' "
+           "AND ('{{ input.store }}' = '' OR region = '{{ input.store }}') "
+           "AND paid_at >= '{{ input.start }}' AND paid_at < '{{ input.end }}'")
+    graph = S.caliber_graph(sql=sql)
+    graph["nodes"][0]["data"]["config"]["fields"] = [{"name": "start", "required": True},
+                                                     {"name": "end", "required": True},
+                                                     {"name": "store", "default": ""}]
+    wf = await S.publish(graph=graph)
+    res = await client.post(f"/api/ledger/calibers/{wf}/1/card/trial",
+                            json={"inputs": {"start": "2026-09-01", "end": "2026-09-08"}})
+    assert res.status_code == 200, res.text
+    assert res.json()["status"] == "succeeded", res.json()
+    # 参数渲染进去了（不是原样带着 {{ }} 发出去）：声明成空串的那一处就是 ''，日期照常
+    [sql] = executed
+    assert "{{" not in sql and "('' = '' OR region = '')" in sql and "'2026-09-01'" in sql
+
+
 async def test_trial_queries_mask_the_configured_columns_and_never_return_sql(client):
     """试跑结果集把数据源设了遮罩的列换成「已遮罩」（改了名字的结果列也认）；响应里不出现 SQL，SQL 里可能写着遮罩值。"""
     from sqlalchemy import select

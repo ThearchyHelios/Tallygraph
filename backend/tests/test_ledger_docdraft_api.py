@@ -103,7 +103,11 @@ async def client():
 
 @pytest.fixture(autouse=True)
 async def fake_trial(monkeypatch):
-    """试跑换成写一行 succeeded 的运行：不启动引擎、不查库，接口和 payload 的形状照真的一样。"""
+    """试跑换成写一行 succeeded 的运行：不启动引擎、不查库，接口和 payload 的形状照真的一样。
+
+    和在跑的 `_run_trial` 一样，这里只把这次试跑先在 payload 里置成 running（替换旧指针），**终态留给调用方保存**
+    （extract / POST 试跑都在拿到返回值之后调 _save_trial）。终态由调用方落库，试跑带没带固定期望（K05）才不会被
+    这里的提前保存吞掉。"""
     made: list[str] = []
 
     async def start(*, draft_id, workflow_id, graph, values, started_by, entry_fields=(), version=1):
@@ -115,10 +119,10 @@ async def fake_trial(monkeypatch):
                                     "workflow_id": workflow_id, "version": version}))
             await session.commit()
         made.append(run_id)
-        trial = {**api_ledger._trial_binding(version, graph, values),
-                 "run_id": run_id, "status": "succeeded", "error": ""}
-        await api_ledger._save_trial(draft_id, trial, replace=True)
-        return trial
+        binding = {**api_ledger._trial_binding(version, graph, values), "trial_id": uuid.uuid4().hex}
+        await api_ledger._save_trial(draft_id, {**binding, "run_id": run_id, "status": "running", "error": ""},
+                                     replace=True)
+        return {**binding, "run_id": run_id, "status": "succeeded", "error": ""}
 
     monkeypatch.setattr(api_ledger, "_run_trial", start)
     yield made
@@ -243,8 +247,10 @@ async def test_extract_produces_a_ready_draft_with_a_graph_and_a_trial(client, d
     assert validate_graph(GraphSpec.model_validate(workflow.graph)).ok
 
     # 试跑只读接口：契约里的形状（queries 是取数节点交回的查询快照；这次是假试跑，没有快照）
+    # trial_id 是真试跑本来就有的一项（_run_trial 建 binding 时写），老的必填键一个不改，validation 里另并进 K05 的记录
     trial = (await client.get(f"/api/ledger/drafts/{body['draft_id']}/trial")).json()
-    assert set(trial) == {"run_id", "status", "metrics", "queries", "error", "version", "graph_hash", "execution_hash", "inputs_hash", "validation"}
+    assert set(trial) == {"run_id", "status", "metrics", "queries", "error", "version", "graph_hash",
+                          "execution_hash", "inputs_hash", "trial_id", "validation"}
     assert trial["run_id"] == made["trial"]["run_id"] and trial["status"] == "succeeded"
     assert trial["queries"] == []
 
@@ -344,9 +350,11 @@ async def test_patch_replaces_metrics_and_clears_resolved_questions(client, docu
     draft_id = (await extract(client, doc, source_id))["draft_id"]
 
     fixed = {**copy.deepcopy(json.loads(plan_reply(f"{doc}-2"))["metrics"][0]), "name": "已支付退款率（按支付日）"}
+    # 已接管的草稿：写要带上读到的基准版本（K02）
+    revision = (await client.get(f"/api/ledger/drafts/{draft_id}")).json()["revision"]
     res = await client.patch(f"/api/ledger/drafts/{draft_id}",
                              json={"title": "退款率口径", "metrics": [fixed],
-                                   "resolved": ["按哪个时区结算"]})
+                                   "resolved": ["按哪个时区结算"], "expected_revision": revision})
     assert res.status_code == 200, res.text
     made = res.json()
     assert made["title"] == "退款率口径" and made["status"] == "ready"
@@ -363,14 +371,16 @@ async def test_patch_replaces_metrics_and_clears_resolved_questions(client, docu
     assert [m["name"] for m in card["data"]["config"]["metrics"]] == ["已支付退款率（按支付日）"]
 
     # 结构不对的指标 422，草稿不动
-    bad = await client.patch(f"/api/ledger/drafts/{draft_id}", json={"metrics": [{"synonyms": ["x"]}]})
+    bad = await client.patch(f"/api/ledger/drafts/{draft_id}",
+                             json={"metrics": [{"synonyms": ["x"]}], "expected_revision": made["revision"]})
     assert bad.status_code == 422
     still = (await client.get(f"/api/ledger/drafts/{draft_id}")).json()
     assert [m["name"] for m in still["metrics"]] == ["已支付退款率（按支付日）"]
 
     # 还有问题（只换指标、带着新问题）→ questions_open
     res = await client.patch(f"/api/ledger/drafts/{draft_id}",
-                             json={"metrics": [{**fixed, "open_questions": ["按哪个门店口径"]}]})
+                             json={"metrics": [{**fixed, "open_questions": ["按哪个门店口径"]}],
+                                   "expected_revision": made["revision"]})
     assert res.json()["status"] == "questions_open" and res.json()["question_count"] == 1
 
 
@@ -381,9 +391,10 @@ async def test_draft_view_reads_the_graph_so_canvas_edits_show_up(client, docume
     fake_model(monkeypatch, plan_reply(f"{doc}-2"))
     draft_id = (await extract(client, doc, source_id))["draft_id"]
 
-    # 必须走画布的真实保存接口：它新增 v2，不能直接覆盖 v1 来模拟
+    # 必须走画布的真实保存接口：它新增 v2，不能直接覆盖 v1 来模拟。已接管的资产要带基准版本（K02）
     async with SessionLocal() as session:
         draft = await session.get(CaliberDraft, draft_id)
+        workflow = await session.get(Workflow, draft.workflow_id)
         row = (await session.execute(select(WorkflowVersion).where(
             WorkflowVersion.workflow_id == draft.workflow_id,
             WorkflowVersion.version == 1))).scalars().one()
@@ -393,8 +404,9 @@ async def test_draft_view_reads_the_graph_so_canvas_edits_show_up(client, docume
                 node["data"]["config"]["metrics"][0]["name"] = "已支付退款率（画布改过）"
             if node["type"] == "tool" and (node["data"]["config"].get("args") or {}).get("sql"):
                 node["data"]["config"]["args"]["sql"] = "SELECT 1 AS refund_rate"
-        workflow_id = draft.workflow_id
-    saved = await client.patch(f"/api/workflows/{workflow_id}", json={"graph": graph})
+        workflow_id, revision = draft.workflow_id, workflow.version
+    saved = await client.patch(f"/api/workflows/{workflow_id}",
+                               json={"graph": graph, "expected_revision": revision})
     assert saved.status_code == 200 and saved.json()["version"] == 2, saved.text
 
     made = (await client.get(f"/api/ledger/drafts/{draft_id}")).json()
@@ -417,7 +429,8 @@ async def test_resolving_a_metric_question_writes_it_back_to_the_graph(client, d
     assert made["status"] == "questions_open"
     assert made["metrics"][0]["open_questions"] == ["按哪个门店口径"]
 
-    res = await client.patch(f"/api/ledger/drafts/{draft_id}", json={"resolved": ["按哪个门店口径"]})
+    res = await client.patch(f"/api/ledger/drafts/{draft_id}",
+                             json={"resolved": ["按哪个门店口径"], "expected_revision": made["revision"]})
     assert res.status_code == 200, res.text
     fixed = res.json()
     assert fixed["status"] == "ready" and fixed["question_count"] == 0
@@ -442,6 +455,7 @@ async def test_trial_validates_against_graph_entry_fields_after_canvas_edit(
 
     async with SessionLocal() as session:
         draft = await session.get(CaliberDraft, draft_id)
+        workflow = await session.get(Workflow, draft.workflow_id)
         row = (await session.execute(select(WorkflowVersion).where(
             WorkflowVersion.workflow_id == draft.workflow_id,
             WorkflowVersion.version == 1))).scalars().one()
@@ -451,8 +465,9 @@ async def test_trial_validates_against_graph_entry_fields_after_canvas_edit(
                 node["data"]["config"]["fields"].append(
                     {"name": "region", "type": "string", "required": True, "default": "",
                      "description": "区域"})
-        workflow_id = draft.workflow_id
-    saved = await client.patch(f"/api/workflows/{workflow_id}", json={"graph": graph})
+        workflow_id, revision = draft.workflow_id, workflow.version
+    saved = await client.patch(f"/api/workflows/{workflow_id}",
+                               json={"graph": graph, "expected_revision": revision})
     assert saved.status_code == 200 and saved.json()["version"] == 2, saved.text
 
     missing = await client.post(f"/api/ledger/drafts/{draft_id}/trial", json={"inputs": {}})
@@ -520,7 +535,7 @@ async def test_trial_endpoint_returns_metric_values_from_the_run(client, documen
     res = await client.get(f"/api/ledger/drafts/{draft_id}/trial")
     assert res.status_code == 200, res.text
     body = res.json()
-    assert body == {"run_id": body["run_id"], "status": "succeeded", "version": 1,
+    assert body == {"run_id": body["run_id"], "status": "succeeded", "version": 1, "trial_id": body["trial_id"],
                     "graph_hash": body["graph_hash"], "execution_hash": body["execution_hash"],
                     "validation": body["validation"], "inputs_hash": body["inputs_hash"],
                     "metrics": [{"id": "m1", "name": "已支付退款率", "rendered": "3.2%", "value": 0.032}],

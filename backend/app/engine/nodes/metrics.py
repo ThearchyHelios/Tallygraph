@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import re
+from collections.abc import Iterable, Mapping
 from datetime import date, timedelta
 from typing import Any
 
@@ -74,6 +75,21 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         caliber_raw, caliber_version = pinned["caliber"], pinned["caliber_version"]
     if not definitions:
         raise NodeError(ctx.node.id, "口径卡没有定义任何指标")
+    # K08：卡上的指标 ID 要唯一——重复了不取第一条静默执行（下游按 ID 与位置取数，会分不清是哪一条）。带选择时
+    # _pinned_caliber 的 require_selection 已经在过滤前拦过；这里管整卡（本地卡、转抄卡没给选择）那一路
+    if duplicates := duplicate_metric_ids(definitions):
+        raise NodeError(ctx.node.id, f"口径卡上的指标 ID 重复了：{'、'.join(f'「{d}」' for d in duplicates)}。"
+                                     "同一张卡上的指标 ID 要唯一——下游按 ID 与位置取数，重复了分不清是哪一条，"
+                                     "不能取第一条静默执行")
+    # K04：拿**实际生效的定义**和这张图里**真正要执行的那几个取数节点**上的受控绑定比。源头卡就是本地的指标；
+    # 转抄卡（caliber_from）是钉住那一版的定义，而且式子已经按 caliber_from.nodes 的源→本地映射改写到本图的节点 id
+    # （_pinned_caliber 的 rename_definition），所以本地那句被手工改过、还停在旧写法的 SQL 会被判中。对不上就在
+    # 算数之前停：那条 SQL 算出来的是旧定义下的数，不能冒充新定义
+    from app.ledger import bindings
+
+    alignment = bindings.analyze(ctx.run.spec.model_dump(mode="json"), ctx.node.id, definitions)
+    if alignment.blocked:
+        raise NodeError(ctx.node.id, "口径卡的业务定义和取数 SQL 对不上，没有计算任何指标：" + alignment.reason)
     # 定义的内容指纹（data/caliber_identity）：同一位置的口径定义变没变按它认，运行时算出来的值不进哈希。
     # 口径名和版本不参与（这里只按指标算），和账本里的源头口径卡两侧对得上
     definition_hash = card_hash_of({"metrics": definitions})
@@ -375,8 +391,10 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                     sources.append(snap)
         metric["contract_findings"] = list(dict.fromkeys([*(metric.get("contract_findings") or []),
                                                         *contract_findings(definition, metric, sources)]))
-        # 描述文字不会被静默当作已执行的 SQL 约束。
-        if any(definition.get(key) for key in ("grain", "time_field", "numerator", "denominator", "dimensions", "filters", "params")):
+        # 描述文字不会被静默当作已执行的 SQL 约束。业务字段（K04 的时间口径、退款规则）也算：受控绑定对齐只说
+        # 「定义和取数实现同步」，业务描述本身仍需人工审阅（4.5），质量结论不能因为 aligned 自动变成 pass
+        if any(definition.get(key) for key in ("grain", "time_field", "numerator", "denominator", "dimensions",
+                                               "filters", "params", "time_role", "refund_rule")):
             metric["semantic_unverified"] = True
         metric["quality"] = metric_quality(metric)
     semantic_fingerprint = semantic_hash(ctx.run.spec.model_dump(mode="json"), ctx.node.id)
@@ -447,13 +465,106 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     return updates
 
 
+# --------------------------------------------------------------------------
+# 指标选择（K08）：caliber_from.metrics 是可选选择，缺省整卡
+# --------------------------------------------------------------------------
+
+
+class SelectionRefused(ValueError):
+    """口径卡的指标选择读不出来（形状不对、空的、点了卡上不存在的指标）：响亮失败，绝不退回整卡。
+
+    退回整卡等于没选——算的是别的指标、下游按位置取的 `nodes.<卡>.metrics[i]` 也就对不上了。所以这里不静默放宽。"""
+
+
+def duplicate_metric_ids(definitions: Iterable[Any]) -> list[str]:
+    """卡上**重复出现的非空指标 id**（按首次出现顺序，每个只列一次）。
+
+    指标 id 在一张卡上该唯一：下游 `nodes.<卡>.metrics[i]`、出具契约、比例契约、报告引用都按 id 与位置取数，同一张卡上
+    两个指标同名就分不清是哪一条。**不能取第一条静默执行**——那会把另一条的数顶替过来。空 id（没有声明的）不算重复，
+    缺 id 另有报法（画布校验 metrics.id_missing、运行时报「指标定义不完整」）。
+
+    判定只有一处：``ledger.closure.duplicate_metric_ids``（闭包把它记成 DUPLICATE_METRIC_ID 未决，运行时/画布校验按同一份
+    依据响亮失败——两边不会一个拦一个放）。"""
+    from app.ledger.closure import duplicate_metric_ids as canonical
+
+    return list(canonical(list(definitions)))
+
+
+def selection_index(definitions: Iterable[Any], selection: Any = None) -> list[int]:
+    """有效指标在 ``definitions`` 里的**下标**（按卡顺序）。``selection`` 缺省 → 全部下标。
+
+    位置与取舍只由 ``ledger.closure.selection_index`` 这一处算（K08 的一份解释），这里只是取它的 ``positions``：运行时、
+    对账、召回认 ``nodes.<卡>.metrics[i]`` 的 i 时都走它，别处不再各写一遍筛选与排序。"""
+    from app.ledger.closure import selection_index as canonical
+
+    return list(canonical(list(definitions), selection).positions)
+
+
+def effective_metrics(definitions: Iterable[Any], selection: Any = None) -> list[Any]:
+    """这次真正要算的指标定义（按**卡顺序**归一）。``selection`` 缺省（``None``）→ 整卡原样，行为一字不变。
+
+    唯一的一份解释在 ``ledger.closure.effective_metrics``（位置与取舍同一处算）；这里只是转发，别处不再各写一遍。"""
+    from app.ledger.closure import effective_metrics as canonical
+
+    return list(canonical(list(definitions), selection))
+
+
+def require_selection(definitions: Iterable[Any], selection: Any) -> list[Any]:
+    """运行时按口径卡上记的选择（``caliber_from.metrics``）读这一次真正要算的定义，未知、空的选择响亮失败。
+
+    ``ledger.closure.selection_index`` 把选择里认不出的 id 照实交回（不静默当整卡、也不静默丢掉）：这里把它变成一条
+    能看懂的 NodeError 由调用方抛。空选择（显式 ``[]``，或选择里没有一个是这张卡上的）同样不许——不退成整卡。"""
+    from app.ledger.closure import selection_index as canonical
+
+    if isinstance(selection, (str, bytes)) or not isinstance(selection, (list, tuple)):
+        raise SelectionRefused("要写成一串指标 id")
+    if any(not isinstance(s, str) or not s.strip() for s in selection):
+        raise SelectionRefused("每一项都要是非空的指标 id")
+    # 卡上同名指标（重复 id）：闭合解析只取第一次，绝不能顺着它把第一条静默算出来顶替另一条——在这里响亮失败
+    if duplicates := duplicate_metric_ids(definitions):
+        raise SelectionRefused(f"这张卡上有重复的指标 ID：{'、'.join(f'「{d}」' for d in duplicates)}"
+                               "（指标 ID 要唯一，重复了分不清取的是哪一条）")
+    index = canonical(list(definitions), selection)
+    card_ids = [str(m.get("id")) for m in definitions if isinstance(m, Mapping) and m.get("id")]
+    if index.unknown:
+        raise SelectionRefused(f"这张卡上没有指标 {'、'.join(f'「{u}」' for u in index.unknown)}"
+                               f"（卡上的指标：{'、'.join(card_ids) or '（一个也没有）'}）")
+    if not index.definitions:
+        raise SelectionRefused("一个指标也没选：不给就按整卡算，给了空列表不当作整卡")
+    return list(index.definitions)
+
+
+def pinned_effective(pinned: Any) -> list[dict[str, Any]]:
+    """一张已读好的口径卡（ledger.derive.Pinned）**这次真正会算出的**指标数组：``effective_metrics(pinned.metrics, 选择)``。
+
+    对账、召回按 ``nodes.<卡>.metrics[i]`` 建引用、配列时只用这一份：卡带了指标选择（caliber_from.metrics，K08）时，
+    全量定义里的下标和运行时算出来那份对不上，照全量定下标会静默取到别的指标。没有选择时就是全量定义（行为一字不变）。
+
+    选择从哪来（K08 S2）：裁剪过的 ``Pinned.closure``（``derive.select_pinned`` 附的这一次选择）优先；没有闭包时看
+    ``Pinned.selection``、再看卡自己的 ``caliber_from.metrics``。"""
+    selection: Any = None
+    closure = getattr(pinned, "closure", None)
+    if closure is not None and not getattr(closure, "whole_card", True):
+        selection = list(getattr(closure, "metric_ids", ()) or ())
+    else:
+        selection = getattr(pinned, "selection", None)
+        if selection is None:
+            config = getattr(pinned, "card_config", None)
+            ref = config.get("caliber_from") if isinstance(config, dict) else None
+            selection = ref.get("metrics") if isinstance(ref, dict) else None
+    return effective_metrics(list(pinned.metrics), selection)
+
+
 async def _pinned_caliber(ctx: NodeContext) -> tuple[dict[str, Any], dict[str, Any]]:
     """caliber_from 指向的那张口径卡：({caliber, caliber_version, metrics}, 来源)。
 
     从那个工作流的 WorkflowVersion 快照里取——版本快照不可变，同一份引用每次取到的定义都一样，
     审批恢复后节点重放也还是这一份。取不到就让节点失败并说清是哪一环断了：悄悄退回本地
     定义，等于换了口径还照常出具。
-    """
+
+    **普通使用者先过资产授权这一道**（`_require_own_caliber`，K14）：图是使用者的（问数据里生成的图也是），光在发起时按图
+    的白名单拦一遍不够——「读别的工作流那一版的口径定义」这件事真正的门在这一层。没有授权在**读定义之前**就失败（`format`
+    写错那种不涉及定义，照旧直接说格式）。"""
     from sqlalchemy import select
 
     from app.db.base import SessionLocal
@@ -467,6 +578,7 @@ async def _pinned_caliber(ctx: NodeContext) -> tuple[dict[str, Any], dict[str, A
     if not wf_id or not node_id or version is None or version < 1:
         raise NodeError(ctx.node.id, f"「{field_label('caliber_from')}」格式有误：需要指定工作流、版本和其中的口径卡，"
                                      f"当前为「{ref}」")
+    await _require_own_caliber(ctx, workflow_id=wf_id, version=version)
     async with SessionLocal() as session:
         workflow = await session.get(Workflow, wf_id)
         if workflow is None:
@@ -506,8 +618,56 @@ async def _pinned_caliber(ctx: NodeContext) -> tuple[dict[str, Any], dict[str, A
             raise NodeError(ctx.node.id, f"「{field_label('caliber_from')}」的节点改名映射有误：{problem}")
         metrics = [rename_definition(m, rename) for m in metrics]
         source["nodes"] = dict(rename)
+    # K08：可选指标选择（caliber_from.metrics）。缺省整卡；给了就只算选中的那些（按卡顺序归一）——未知、空的响亮失败，
+    # 绝不退回整卡。绑定判定（run_metrics 拿这一份 definitions 去比对）、指标集、下游按位置取的 nodes.<卡>.metrics[i]
+    # 都按这一份有效数组（唯一的一份解释在 ledger.closure，见 effective_metrics）
+    selection = ref.get("metrics") if isinstance(ref, dict) else None
+    if selection is not None:
+        try:
+            metrics = require_selection(metrics, selection)
+        except SelectionRefused as e:
+            raise NodeError(ctx.node.id, f"「{field_label('caliber_from')}」的指标选择（metrics）用不了：{e}") from e
+        source["metrics"] = [str(m.get("id")) for m in metrics]
     return {"caliber": cfg.get("caliber") or title, "caliber_version": str(cfg.get("caliber_version") or "v1"),
             "metrics": metrics}, source
+
+
+async def _require_own_caliber(ctx: NodeContext, *, workflow_id: str, version: int) -> None:
+    """普通使用者拿 `caliber_from` 钉别的工作流那一版的口径卡时，运行时按**同一份资产授权**核一遍（K14）。
+
+    为什么必须在运行时再判一道：图是使用者自己的（问数据里模型生成的图、画布上搭的图都一样），发起时的白名单只认节点类型，
+    认不出「这一版口径是谁的」——`caliber_from` 把**任意一份已发布口径的定义**读进这次运行这件事，只有执行到这一步才知道。
+    所以门设在这里：`apps/access.caliber_role`（AppGrant + 应用当前发布版精确固定着这一版）到 use 及以上才放行；
+    builder / admin / 关登录由 `restricted_actor` 显式放行（这几档不写进资产授权函数）。没授权在**读定义之前**失败——
+    既不把那份口径读出来，也不算任何指标（机器码 `querycore_not_authorized`，和别处同一条口径的拒绝同一个码）。
+
+    判谁：**父 Run 记下来的发起人**（名字），加上请求上下文里那个认得出名字的身份（调用方替谁发起时取更严的那一个）。
+    **两者都没有**说明这次运行不是某个使用者发起的（服务端自己发起的按需比对、口径召回、目录变化后的重算：`ledger/reconcile`、
+    `ledger/recall` 这批不带 actor，调度器、发布之后的后台任务也一样）——那不是「使用者拿别人的口径定义」，不按使用者那一档
+    收窄（builder 路径照旧跑得完）。"""
+    from app.api.deps import Principal, current_principal
+    from app.apps.access import at_least, caliber_role
+    from app.auth.chat_policy import restricted_actor
+    from app.db.base import SessionLocal
+    from app.ledger.querycore import NOT_AUTHORIZED
+    from app.tools.registry import RUN_STARTED_BY_KEY
+
+    extra = ctx.run.extra if isinstance(ctx.run.extra, dict) else {}
+    who: Any = extra.get(RUN_STARTED_BY_KEY)
+    if not who:
+        request = current_principal()
+        if not isinstance(request, Principal) or not request.username:
+            return
+        who = request
+    async with SessionLocal() as session:
+        if not await restricted_actor(session, who):
+            return
+        role = await caliber_role(session, who, str(workflow_id), int(version))
+        if at_least(role, "use"):
+            return
+    raise NodeError(ctx.node.id, "没有权限：这张卡转抄的口径没有授权给你使用，没有读它的定义、也没有算任何指标"
+                                 f"（{NOT_AUTHORIZED}）。要用它先让搭建者把固定着那一版的「应用」授权给你，"
+                                 "或者按数据源自己搭一张图")
 
 
 #: 改名映射里的节点 id：要能写进式子的取值链（nodes.<id>），和画布上的节点 id 同一种写法

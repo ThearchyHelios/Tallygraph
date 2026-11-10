@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import re
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
@@ -12,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.coded import CodedHTTPException
 # 「人」的唯一入口搬到了 api/deps.py（开登录时返回认证过的用户名）。别处照旧从这里导入 actor_of
-from app.api.deps import actor_of  # noqa: F401
+from app.api.deps import actor_of, restricted  # noqa: F401
 from app.core.bus import bus
 from app.db.base import SessionLocal, get_session
 from app.db.models import Approval, Artifact, Run, RunEvent
@@ -22,6 +25,8 @@ from app.engine.launch import (  # noqa: F401
     TOOL_MISSING, LaunchRefused, launch_run, missing_tools, node_setting, tool_bindings,
 )
 from app.engine.runner import run_manager
+# 口径查询的真实工具名：投影里认「这个节点调的是口径查询」用它，别处不许另写一个字符串
+from app.ledger.querycore import CALIBER_QUERY
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
@@ -32,6 +37,197 @@ ORIGIN_REF_NOT_ALLOWED = "origin_ref_not_allowed"
 ORIGIN_REF_INVALID = "origin_ref_invalid"
 #: 删除被拒：这次运行写过外部系统（有演练以外的生效记录，409）
 RUN_HAS_EFFECTS = "run_has_effects"
+
+
+# --------------------------------------------------------------------------
+# 普通使用者的投影（K14）：读得到的运行图上、事件流里，口径查询那一处不留内部身份
+#
+# 规则本身在 auth/chat_policy（谁要按授权收窄）。这里只管**交出去的那一份**：开登录后 user 角色读自己这次运行（问数据的
+# origin_kind=chat + 在工具边界遮过，api/deps.run_events_readable）时，事件、运行图里的口径查询工具**参数**（哪张卡、哪一版）、
+# 工具结果（发布清单、selection、哈希、工件 id、参数材料）换成安全摘要——**存储一个字节都不动**，只在 API 这一层换一份。
+# 给人看的东西一件不少：算成没算成、状态、指标值（本来就遮过）、运行进度、别的节点的事件原样保留（不因为这里有一条口径
+# 查询就把普通聊天的事件清空）。builder 及以上读到的还是原件。
+# --------------------------------------------------------------------------
+
+#: 留在事件里的字段（按整个数据字典白名单）：都是「到哪一步了、算成没算成、花了多久」
+SAFE_EVENT_KEYS = ("tool", "label", "node_type", "duration_ms", "attempt", "outcome", "status", "timed_out",
+                   "error", "ok", "truncated", "level", "code", "message", "to", "kind", "timing")
+#: 留在工具结果摘要里的字段：结果本身（指标值、问题码）与它算成没算成
+SAFE_RESULT_KEYS = ("ok", "status", "metrics", "problems", "truncated")
+#: 运行图里口径查询节点的参数换成这一句（口径身份不给：那是内部的事）
+CALIBER_ARGS_NOTE = {"caliber": "按一份有授权的口径取数（卡与版本不在运行记录里给出）"}
+#: 转抄卡（metrics.caliber_from）的身份映射换成这一句：它指的是哪一份工作流的哪一版、节点怎么对应，都不出去
+CALIBER_FROM_NOTE = {"caliber": "转抄自一份有授权的口径（工作流、版本与节点映射不在运行记录里给出）"}
+#: 失败说法里的安全白话：口径那一档只给「没成功」+ 机器码（口径名、版本、card 都不带出来）
+CALIBER_FAILED_TEXT = "按口径取数没有成功"
+#: 提示词 / 说明里那份「取数写法」的键：口径身份那几个的值换成安全摘要（键、说明、inputs 的值都留着）
+CALIBER_CALL_KEYS = ("workflow", "workflow_id", "workflow_version", "card", "card_id", "version", "node_id")
+_CALL_VALUE = re.compile(r'("(?:' + "|".join(CALIBER_CALL_KEYS) + r')"\s*:\s*)"[^"]*"')
+#: 失败事件（这几个类型才把 error / message 换成安全白话；log 的消息照旧给——它本来就没有口径身份）
+FAILURE_EVENTS = ("node.failed", "tool.error", "run.failed")
+
+
+def run_projection(graph: Any) -> _Projection | None:
+    """这次请求要不要给运行图、事件做投影：普通使用者要（交回投影），builder 及以上不要（交回 None，照原样给）。"""
+    return _Projection(graph) if restricted() else None
+
+
+class _Projection:
+    """一次请求里这份投影：先把运行图上绑口径查询的节点认出来，之后按节点/工具名判每一条事件、每张图。"""
+
+    def __init__(self, graph: Any) -> None:
+        self.nodes = _caliber_nodes(graph)
+
+    def graph(self, graph: Any) -> Any:
+        """运行图：口径查询节点的参数、提示词与转抄卡的身份映射换成安全摘要，别的节点一个字不动。"""
+        if not isinstance(graph, dict):
+            return graph or {}
+        nodes = []
+        for node in graph.get("nodes") or []:
+            config = _config_of(node)
+            if isinstance(node, dict) and isinstance(config, dict) and _touches_caliber(config):
+                node = {**node, "data": {**node["data"], "config": _safe_config(config)}}
+            nodes.append(node)
+        return {**graph, "nodes": nodes}
+
+    def event(self, event: Any) -> Any:
+        """一条事件：口径查询那几处按白名单留字段（含工具结果的安全摘要、失败说法的安全白话），别的事件原样。
+
+        判「是口径那一处」的几种写法：事件的节点是口径节点、工具是口径查询、失败事件里另带的口径节点 id（`run.failed`
+        的节点写在 data 里，事件那一列是空的），或者这条失败说法本来就是口径那一档（认得出机器码/工具名）。"""
+        if not isinstance(event, dict):
+            return event
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return event
+        node_id = str(event.get("node_id") or "")
+        failure = str(event.get("type") or "") in FAILURE_EVENTS
+        if node_id in self.nodes or str(data.get("tool") or "") == CALIBER_QUERY \
+                or str(data.get("node_id") or "") in self.nodes \
+                or (failure and safe_failure(data.get("error")) is not None):
+            safe = {k: v for k, v in data.items() if k in SAFE_EVENT_KEYS}
+            result = result_summary(data.get("artifact")) or safe_result(data.get("preview"))
+            if result is not None:
+                safe["result"] = result
+            if failure:
+                # 失败的那一条：口径名、版本、card 从说法里出去，机器码留着（人认得出是哪一档失败）
+                for key in ("error", "message"):
+                    if key in safe:
+                        safe[key] = safe_failure(safe[key])
+            return {**event, "data": safe}
+        if "caliber" in data:
+            # 补固定的那条日志：源名、版本号留下，口径的固定目标（哪一份口径要的这版数据）不留给使用者
+            return {**event, "data": {k: v for k, v in data.items()
+                                      if k not in ("caliber", "workflow_id", "version")}}
+        return event
+
+    def failure(self, text: Any) -> Any:
+        """运行记录上那条失败说法：是口径那一档就换安全白话 + 机器码（`get_run` 的 error 用它）。"""
+        return safe_failure(text) or text
+
+
+def _caliber_nodes(graph: Any) -> set[str]:
+    """这张图里与口径有关的节点 id：绑着口径查询的（调用工具节点写死的那个，Agent / 协作成员绑的也算），以及转抄卡
+    （metrics.caliber_from）——两类都带着口径的身份，事件里按白名单给。"""
+    out: set[str] = set()
+    for node in (graph or {}).get("nodes") or []:
+        config = _config_of(node)
+        if isinstance(config, dict) and _touches_caliber(config):
+            out.add(str(node.get("id")))
+    return out
+
+
+def _touches_caliber(config: Mapping[str, Any]) -> bool:
+    """这个节点的配置里有没有口径的身份：绑了口径查询，或者是一张转抄卡。"""
+    bound = config.get("tools") if isinstance(config.get("tools"), list) else []
+    if config.get("tool") == CALIBER_QUERY or CALIBER_QUERY in [t for t in bound if isinstance(t, str)]:
+        return True
+    return config.get("caliber_from") not in (None, "", {})
+
+
+def _safe_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """与口径有关的内部写法换成安全摘要：工具参数、提示词里的取数写法、转抄卡的身份映射。
+
+    别的键（节点自己的说明、inputs 的值、工具清单）一个字不动——「使用者的图长什么样」照旧看得见，看不见的只是
+    「调的是哪一份工作流的哪一版」。"""
+    out = dict(config)
+    if out.get("tool") == CALIBER_QUERY and "args" in out:
+        out["args"] = dict(CALIBER_ARGS_NOTE)
+    bound = out.get("tools") if isinstance(out.get("tools"), list) else []
+    if out.get("tool") == CALIBER_QUERY or CALIBER_QUERY in [t for t in bound if isinstance(t, str)]:
+        for key in ("prompt", "instructions"):
+            if key in out:
+                out[key] = safe_call_text(out[key])
+    if out.get("caliber_from") not in (None, "", {}):
+        out["caliber_from"] = dict(CALIBER_FROM_NOTE)
+    return out
+
+
+def safe_call_text(text: Any) -> Any:
+    """提示词 / 说明里那份「取数写法」：口径身份那几个键的**值**换成安全摘要，键名、说明、inputs 的值都留着。
+
+    模型是照 look 交回的那一行（`{"workflow": "<id>", "card": "<id>", ...}`）写进 agent 提示词的：整行照抄最省事，
+    所以这里按同一对键把它改掉——说明（「不要自己写取数 SQL」那几句）和要填的入口取值都还在，只是认不出是哪一份口径。"""
+    if not isinstance(text, str) or '"' not in text:
+        return text
+    return _CALL_VALUE.sub(lambda m: m.group(1) + '"（有授权的口径）"', text)
+
+
+def safe_failure(text: Any) -> str | None:
+    """一条失败说法的安全白话：只留机器码，口径名、版本、card 一个字不带出来；不是口径那一档返回 None（照原样给）。
+
+    认得出是口径那一档的两种写法：说法里有工具名（节点模板写的是「工具 caliber_query 执行失败：…」），或者有 querycore
+    起 Run 之前拒绝的那几个机器码（口径固定执行在起 Run 之前拒时，码就写在消息里）。"""
+    from app.ledger.querycore import REFUSAL_CODES
+
+    if not isinstance(text, str) or not text.strip():
+        return None
+    code = next((code for code in REFUSAL_CODES if code in text), None)
+    if code is None and CALIBER_QUERY not in text:
+        return None
+    return f"{CALIBER_FAILED_TEXT}（{code}）" if code else CALIBER_FAILED_TEXT
+
+
+def _config_of(node: Any) -> Any:
+    if not isinstance(node, dict) or not isinstance(node.get("data"), dict):
+        return None
+    return node["data"].get("config")
+
+
+def result_summary(artifact: Any) -> dict[str, Any] | None:
+    """这次调用的**产出工件**里那份工具结果的安全摘要（本机文件，读不出来当没有）。
+
+    tool.end 的 preview 只留前 2000 个字符（一次口径查询交回的东西远超它），所以指标值、问题码从**工件本身**取：
+    值本来就在工具边界遮过，这里只按白名单挑「算成没算成、值是多少」，口径身份、清单、selection、哈希、工件 id 都不出去。"""
+    if not artifact:
+        return None
+    from app.core.artifact_store import load
+
+    try:
+        payload = load(str(artifact))
+    except (ValueError, OSError):
+        return None
+    if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
+        payload = payload["result"]         # 工具快照包着 result；节点产出就是结果本身
+    return _pick(payload)
+
+
+def safe_result(preview: Any) -> dict[str, Any] | None:
+    """那条 preview（工具交回的整份结果，可能被截断）里的安全摘要：读不成 JSON 就当没有，不猜。"""
+    if not isinstance(preview, str) or not preview.lstrip().startswith("{"):
+        return None
+    try:
+        payload = json.loads(preview)
+    except ValueError:
+        return None
+    return _pick(payload)
+
+
+def _pick(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    out = {k: payload[k] for k in SAFE_RESULT_KEYS if payload.get(k) is not None}
+    return out if out.get("metrics") is not None or out.get("problems") is not None else None
 
 
 
@@ -125,6 +321,8 @@ async def start_run(
     options = None
     actor = actor_of(x_actor)
     memory_scope = payload.memory_scope
+    #: 这次要发起的图：使用者的那一档可能被 chat/launch 补上口径查询工具（见下面）
+    graph = payload.graph
     if restricted():
         # user 角色（管理员开了问数据）只能发起问数据当场搭的探索运行：已发布工作流的正式运行只经应用入口发起，别的来源
         # 都是搭建者的事。图里只许读数据、整理、撰写这一类节点和只读工具（app/auth/chat_policy.py）。
@@ -135,9 +333,10 @@ async def start_run(
         from app.auth.chat_policy import SCOPE_REFUSED
         from app.chat.launch import ChatRunRefused, user_chat_run
 
-        # 白名单、记忆范围、遮罩与只读这几条和服务端跑的一轮问数据（chat/job.py）共用 chat/launch.user_chat_run
+        # 白名单、记忆范围、遮罩与只读这几条和服务端跑的一轮问数据（chat/job.py）共用 chat/launch.user_chat_run；
+        # 它交回的图里可能已经补上了口径查询工具（有授权的口径那一份，见 chat/launch），发起用的是那一份
         try:
-            memory_scope, options = user_chat_run(payload.graph, actor)
+            memory_scope, options, graph = await user_chat_run(session, payload.graph, actor)
         except ChatRunRefused as e:
             raise HTTPException(403, str(e)) from e
         if payload.memory_scope or payload.collection:
@@ -146,7 +345,7 @@ async def start_run(
         return await launch_run(
             session,
             workflow_id=payload.workflow_id,
-            graph=payload.graph,
+            graph=graph,
             input_payload=payload.input,
             memory_scope=memory_scope,
             collection=payload.collection,
@@ -290,6 +489,9 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
     if not run:
         raise HTTPException(404, "运行记录不存在")
     out = RunOut.model_validate(run)
+    if (projection := run_projection(run.graph)) is not None:
+        # 失败说法里那一句（口径名、版本、card）不给使用者看：换成安全白话 + 机器码，别的失败原样
+        out.error = projection.failure(out.error)
     if out.status == "failed" and not out.error_node_id:
         # 加这一列之前失败的老运行：从事件里找最后一个失败的节点
         out.error_node_id = (await session.execute(
@@ -302,11 +504,17 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
 
 @router.get("/{run_id}/graph")
 async def get_run_graph(run_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """运行时的那张图（快照），不是工作流现在的样子。回放历史运行时画布照它画。"""
+    """运行时的那张图（快照），不是工作流现在的样子。回放历史运行时画布照它画。
+
+    开登录后的使用者拿到的是一份**投影**（见 run_projection）：图上口径查询节点的参数换成安全摘要，别的节点原样。"""
     run = await session.get(Run, run_id)
     if not run:
         raise HTTPException(404, "运行记录不存在")
-    return {"graph": run.graph or {}, "workflow_id": run.workflow_id, "version": run.version}
+    graph = run.graph or {}
+    projection = run_projection(graph)
+    if projection is not None:
+        graph = projection.graph(graph)
+    return {"graph": graph, "workflow_id": run.workflow_id, "version": run.version}
 
 
 @router.get("/{run_id}/events")
@@ -315,13 +523,17 @@ async def get_events(
     after: int = 0,
     session: AsyncSession = Depends(get_session),
 ) -> list[dict[str, Any]]:
-    """拉历史事件。刷新页面后重建时间线用这个，再接 WebSocket 续上实时流。"""
+    """拉历史事件。刷新页面后重建时间线用这个，再接 WebSocket 续上实时流。
+
+    开登录后的使用者拿到的是一份**投影**（见 run_projection）：口径查询那几处按白名单给，别的节点的事件原样。"""
+    run = await session.get(Run, run_id)
+    projection = run_projection(run.graph if run is not None else None)
     rows = await session.execute(
         select(RunEvent)
         .where(RunEvent.run_id == run_id, RunEvent.seq > after)
         .order_by(RunEvent.seq)
     )
-    return [
+    events = [
         {
             "id": e.id,
             "run_id": e.run_id,
@@ -333,6 +545,7 @@ async def get_events(
         }
         for e in rows.scalars()
     ]
+    return [projection.event(event) for event in events] if projection is not None else events
 
 
 @router.get("/{run_id}/artifacts")
@@ -617,6 +830,10 @@ async def stream_run(websocket: WebSocket, run_id: str) -> None:
     """
     await websocket.accept()
     after = int(websocket.query_params.get("after", 0) or 0)
+    # 开登录后的使用者：实时流和历史回放是**同一条路**（下面两个都过同一个投影），见 run_projection
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+    projection = run_projection(run.graph if run is not None else None)
 
     # 先占订阅位，再读历史。反过来的话，两步之间图正好跑出来的事件既不在
     # 历史里、也不在实时流里——永远丢了。实测就是这样：一次跑图的开头
@@ -624,12 +841,12 @@ async def stream_run(websocket: WebSocket, run_id: str) -> None:
     # 在转圈、它的子步骤跑到了顶层。
     subscription = bus.attach(run_id)
     try:
-        last_seq, run = await _replay(websocket, run_id, after)
+        last_seq, run = await _replay(websocket, run_id, after, projection)
         if run is not None and run.status in _SETTLED and run_manager.is_active(run_id):
             # 状态已经落了、执行任务还在收尾（终态事件、封存）：等它收完，把这期间
             # 落库的事件补上，按最终状态收尾。否则会在 run.finished 之前就宣布结束
             await run_manager.wait_idle(run_id)
-            last_seq, run = await _replay(websocket, run_id, last_seq)
+            last_seq, run = await _replay(websocket, run_id, last_seq, projection)
 
         if run is None or run.status in _SETTLED:
             await _end(websocket, run.status if run else None)
@@ -640,7 +857,7 @@ async def stream_run(websocket: WebSocket, run_id: str) -> None:
         from app.cluster.relay import relay
 
         with relay.follow_run(run_id, last_seq):
-            pump = asyncio.create_task(_pump(websocket, subscription.stream(after=last_seq), run_id))
+            pump = asyncio.create_task(_pump(websocket, subscription.stream(after=last_seq), run_id, projection))
             try:
                 # 客户端断开时读操作会抛异常，用它来结束这条连接
                 while True:
@@ -660,8 +877,11 @@ async def stream_run(websocket: WebSocket, run_id: str) -> None:
         subscription.close()
 
 
-async def _replay(websocket: WebSocket, run_id: str, after: int) -> tuple[int, Run | None]:
-    """把 seq > after 的历史事件发出去，顺带取回运行当前的状态。"""
+async def _replay(websocket: WebSocket, run_id: str, after: int,
+                  projection: _Projection | None = None) -> tuple[int, Run | None]:
+    """把 seq > after 的历史事件发出去，顺带取回运行当前的状态。
+
+    projection 不为空（开登录后的使用者）时，事件先过一遍投影再发——历史回放和实时流走的是同一条路。"""
     last_seq = after
     async with SessionLocal() as session:
         rows = await session.execute(
@@ -671,16 +891,15 @@ async def _replay(websocket: WebSocket, run_id: str, after: int) -> tuple[int, R
         )
         for event in rows.scalars():
             last_seq = max(last_seq, event.seq or 0)
-            await websocket.send_json(
-                {
-                    "seq": event.seq,
-                    "type": event.type,
-                    "node_id": event.node_id,
-                    "ts": event.ts,
-                    "data": event.data,
-                    "replay": True,
-                }
-            )
+            wire = {
+                "seq": event.seq,
+                "type": event.type,
+                "node_id": event.node_id,
+                "ts": event.ts,
+                "data": event.data,
+                "replay": True,
+            }
+            await websocket.send_json(projection.event(wire) if projection is not None else wire)
         run = await session.get(Run, run_id)
     return last_seq, run
 
@@ -691,10 +910,12 @@ async def _end(websocket: WebSocket, status: str | None) -> None:
     await websocket.close()
 
 
-async def _pump(websocket: WebSocket, stream: Any, run_id: str) -> None:
+async def _pump(websocket: WebSocket, stream: Any, run_id: str,
+                projection: _Projection | None = None) -> None:
     try:
         async for event in stream:
-            await websocket.send_json(event.to_wire())
+            wire = event.to_wire()
+            await websocket.send_json(projection.event(wire) if projection is not None else wire)
         # 实时流走完 = 运行到了终态，或者关停时挂起了：补一条结束标记再关，
         # 客户端不用靠猜，也不会对着一条已经结束的运行无限重连
         async with SessionLocal() as session:

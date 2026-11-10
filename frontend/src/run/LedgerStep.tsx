@@ -398,11 +398,19 @@ export function LedgerPart({ runId, runClass, report, segId, segText, segLedger,
                   <DiffList related={where} />
                 </div>
                 {action ? (
-                  <button type="button" className="btn btn-xs mt-1.5" disabled={readOnly}
-                          title={readOnly ? LEDGER_UI.reconcile.readOnly : undefined}
-                          onClick={() => setDialog({ action, related: where })} data-ledger-reconcile-open={r.caliber ?? ''}>
-                    <Scale size={11} aria-hidden /> {LEDGER_UI.reconcile.button}
-                  </button>
+                  action.available === false ? (
+                    // 服务端没给这一项身份（当前身份没有使用授权）：只是说明，不摆按钮
+                    <p className="mt-1.5 text-2xs text-dim" data-ledger-reconcile-refused={r.caliber ?? ''}
+                       title={LEDGER_UI.reconcile.unavailableHint}>
+                      {LEDGER_UI.reconcile.unavailable(caliberOf(action))}
+                    </p>
+                  ) : (
+                    <button type="button" className="btn btn-xs mt-1.5" disabled={readOnly}
+                            title={readOnly ? LEDGER_UI.reconcile.readOnly : undefined}
+                            onClick={() => setDialog({ action, related: where })} data-ledger-reconcile-open={r.caliber ?? ''}>
+                      <Scale size={11} aria-hidden /> {LEDGER_UI.reconcile.button}
+                    </button>
+                  )
                 ) : r.comparable === false ? <p className="mt-1 text-2xs text-faint">{r.reason || LEDGER_UI.step.notComparable}</p> : null}
                 {!!done.length && <ReconcileResults runId={runId} items={done} data={data} original={segText} readOnly={readOnly} />}
               </div>

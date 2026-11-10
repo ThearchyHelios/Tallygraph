@@ -8,7 +8,9 @@
 - started_at 只在第一次开始时写；
 - duration_ms（= active_ms）是各段执行时长之和；
 - wall_ms 是从第一次开始到结束的墙钟；wait_ms 是等人审批的总时长；
-- 三者随 run.finished / run.failed / run.cancelled 的 timing 一起发出。
+- queue_ms（K13）是各段等并发名额的总时长：那一截在 started_at 之前，既不在 active 里也不算进 wall，
+  单独记，和等人审批的 wait_ms 是两回事；
+- 四者随 run.finished / run.failed / run.cancelled 的 timing 一起发出。
 """
 
 from __future__ import annotations
@@ -120,7 +122,10 @@ async def test_resumed_run_keeps_its_start_and_sums_every_segment(slow_transform
     finished = next(e for e in await _events(run.id) if e.type == "run.finished")
     assert finished.data["timing"] == {
         "wall_ms": usage["wall_ms"], "active_ms": usage["active_ms"], "wait_ms": usage["wait_ms"],
+        "queue_ms": usage["queue_ms"],
     }
+    # 没人抢名额时 queue_ms 只剩「要名额到拿到名额」那一下的开销（几毫秒）；绝不能拿等人那 0.6 秒冒充
+    assert 0 <= usage["queue_ms"] < WAIT * 1000 / 2, usage
 
 
 async def test_bookkeeping_after_the_pause_is_not_counted_twice(slow_transforms, monkeypatch):
@@ -186,7 +191,7 @@ async def test_continued_run_keeps_its_start_and_sums_every_segment(fails_once):
     assert failed.usage["duration_ms"] >= SEGMENT * 1000 * 0.9
 
     failed_ev = next(e for e in await _events(run.id) if e.type == "run.failed")
-    assert set(failed_ev.data["timing"]) == {"wall_ms", "active_ms", "wait_ms"}
+    assert set(failed_ev.data["timing"]) == {"wall_ms", "active_ms", "wait_ms", "queue_ms"}
     assert failed_ev.data["node_id"] == "flaky"
 
     await run_manager.continue_failed(run.id)
@@ -210,7 +215,7 @@ async def test_cancel_reports_timing_too(slow_transforms):
     assert await run_manager.cancel(run.id)
     await _wait(run.id, ("cancelled",))
     cancelled = next(e for e in await _events(run.id) if e.type == "run.cancelled")
-    assert set(cancelled.data["timing"]) == {"wall_ms", "active_ms", "wait_ms"}
+    assert set(cancelled.data["timing"]) == {"wall_ms", "active_ms", "wait_ms", "queue_ms"}
     assert cancelled.data["timing"]["active_ms"] > 0
 
 

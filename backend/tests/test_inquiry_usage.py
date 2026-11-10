@@ -235,13 +235,13 @@ async def test_post_seal_inquiries_stay_out_of_the_run_usage(monkeypatch):
     failed = await _until(run.id, ("failed",))
     written = await append_events(run.id, [ask("这次为什么失败", A)], require="sealed")
     assert written and written[0].data["post_seal"] is True
-    assert set(failed.usage) == {"duration_ms", "wall_ms", "active_ms", "wait_ms"}
+    assert set(failed.usage) == {"duration_ms", "wall_ms", "active_ms", "wait_ms", "queue_ms"}
 
     state["fail"] = False
     await run_manager.continue_failed(run.id)
     row = await _until(run.id, ("succeeded",))
     assert row.manifest_seq > written[0].seq, "继续运行之后重新封存，这条质询落进了新的封存范围"
-    assert set(row.usage) == {"duration_ms", "wall_ms", "active_ms", "wait_ms"}
+    assert set(row.usage) == {"duration_ms", "wall_ms", "active_ms", "wait_ms", "queue_ms"}
 
 
 @pytest.mark.parametrize("asked_before", [False, True], ids=["first-pause", "second-pause"])
@@ -270,10 +270,10 @@ async def test_runs_without_inquiries_keep_their_usage():
     await _until(run.id, ("interrupted",))
     await run_manager.resume(run.id, {"approved": True})
     row = await _until(run.id, ("succeeded",))
-    assert set(row.usage) == {"duration_ms", "wall_ms", "active_ms", "wait_ms"}
+    assert set(row.usage) == {"duration_ms", "wall_ms", "active_ms", "wait_ms", "queue_ms"}
 
     other = await run_manager.start(graph=gated(), input_payload={})
     await _until(other.id, ("interrupted",))
     assert await run_manager.cancel(other.id) == "cancelled"
     row = await _until(other.id, ("cancelled",))
-    assert set(row.usage) == {"duration_ms", "wall_ms", "active_ms", "wait_ms"}
+    assert set(row.usage) == {"duration_ms", "wall_ms", "active_ms", "wait_ms", "queue_ms"}

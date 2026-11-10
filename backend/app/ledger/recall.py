@@ -13,7 +13,8 @@
   metrics_from 指向召回卡；不加报告、不调模型）。两版在同一次运行里查同一份数据，差值只反映口径；数据随时间的变化另外拿
   原答案当时的值对照着说（task_payload 的 original）。
 - 不能重算的照实记「无法重算：原因」，不发起：口径的数据部分不能复用（derive.NotDerivable）、新版里没有这张口径卡、两版
-  没有同名的指标、新版入口要的参数这一组里没有或不合规（compose.check_inputs 同一套校验）、新版的图里会写外部系统
+  没有同名的指标、入口要的参数这一组里没有或不合规——新版和旧版各自的取数模板都判（ledger/params 的参数完整性，值就是
+  这一组的输入；新版一侧 compose.check_inputs 同一套校验，旧版一侧 build_plan 的 parameter_problem 补上）、新版的图里会写外部系统
   （apps/backfill.graph_external_write，和按新口径补算、按口径出具同一个判断）。新版图里别处有人工节点、按流程使用不安全的
   照样重算：召回图只有两版的取数和口径卡，碰不到它们（口径卡上游的人工节点 derive 已经认作数据部分不能复用）；「按新版
   重新出具」走完整的正式运行，仍按 graph_side_effect 全套拒绝（ledger/issue.check_target）。
@@ -100,6 +101,8 @@ CARD_GONE = "新版 v{version} 里没有口径卡「{card}」"
 NO_COMMON = "新旧两版的口径卡没有同名的指标，比不了"
 SIDE_EFFECT = "「{name}」v{version}{reason}，召回不代人做这些事"
 NEW_INPUTS = "新版 v{version} 的入口要的参数这一组里没有或不合规：{problem}"
+#: 旧版一侧的同一句话（旧版独有的字段在这组里没有值、绑定出来的是空串、值承载不了……）
+OLD_INPUTS = "旧版 v{version} 的入口要的参数这一组里没有或不合规：{problem}"
 NEW_GONE = "新版本不存在，可能已被删除"
 LAUNCH_REFUSED = "没能发起召回运行：{reason}"
 RUN_FAILED = "重算失败：{reason}"
@@ -234,8 +237,29 @@ async def recall_runs(session: Any, workflow_id: str, new_version: int | None = 
     return list((await session.execute(stmt.order_by(Run.created_at.desc(), Run.id.desc()))).scalars())
 
 
+def parameter_problem(pairs: Sequence[Pair], inputs: Mapping[str, Any]) -> str | None:
+    """这一组的参数按两版各自的取数模板各过一遍（ledger/params，trial、组合式问数、派生各入口同一套）：模板引用了入口
+    没声明的字段、这次没有值（含绑定出来的是空串——空串不是值，是省略）、值承载不了（引号里带引号、裸写的不是数）都要在
+    计划这一步说清。计划说「可重算」、起飞了才失败，等于让人白等一次召回，也让人分不清「还剩几组没算」还算不算得完。
+
+    两版各自判：新版一侧 compose.check_inputs 已经按同一份判断判过（值就是这一组的输入），这里按同一份输入把旧版一侧
+    补上——旧版独有的字段、旧版模板写在哪，只有旧版自己知道。认不出写法的取数模板在派生那一步（derive.load_pinned）已经
+    拒过，这里的问题都是缺参数 / 未声明 / 承载不了。运行时那道兜底照旧在（engine/nodes/tools 发查询前再判一次）。"""
+    from app.ledger import params
+
+    for pair in pairs:
+        for wrapper, pinned in ((NEW_INPUTS, pair.new), (OLD_INPUTS, pair.old)):
+            problems = params.check_nodes(pinned.fetches, fields=pinned.entry_fields, values=inputs)
+            if problems:
+                return wrapper.format(version=pinned.version, problem=params.describe(problems))
+    return None
+
+
 async def build_plan(session: Any, workflow_id: str, new_version: int) -> Plan:
-    """W 升到 N 的召回计划（见模块说明）。只读，不发起。"""
+    """W 升到 N 的召回计划（见模块说明）。只读，不发起。
+
+    一组能不能重算，先把这一组的输入按两版各自的取数模板判过（parameter_problem），判不过的写进 group.problem
+    ——「新版入口要的参数这一组里没有或不合规」也可以是旧版一侧的同一个问题。"""
     from app.apps import versions as app_versions
     from app.apps.backfill import graph_external_write
     from app.ledger import compose, derive
@@ -271,7 +295,7 @@ async def build_plan(session: Any, workflow_id: str, new_version: int) -> Plan:
                 problems.append(CARD_GONE.format(version=new_version, card=old.card_title)
                                 if e.code == derive.GONE else NOT_REUSABLE.format(reason=e.message))
                 continue
-            if not {m["id"] for m in old.metrics} & {m["id"] for m in new.metrics}:
+            if not {m["id"] for m in _effective(old)} & {m["id"] for m in _effective(new)}:
                 problems.append(NO_COMMON)
                 continue
             pairs.append(Pair(old, new))
@@ -309,6 +333,8 @@ async def build_plan(session: Any, workflow_id: str, new_version: int) -> Plan:
             group.problem = NEW_INPUTS.format(version=new_version, problem=e.message)
             continue
         group.inputs = {**checked, **{k: v for k, v in group.binding.items() if k not in new_names}}
+        if problem := parameter_problem(pairs, group.inputs):
+            group.problem = problem
     existing = await recall_runs(session, workflow_id, int(new_version))
     by_key: dict[tuple[int, str], Run] = {}
     for run in existing:
@@ -335,6 +361,16 @@ _refusals: dict[tuple[str, int, int, str], str] = {}
 # ==========================================================================
 
 
+def _effective(pinned: Any) -> list[dict[str, Any]]:
+    """这一版口径卡**这次真正会算出的**指标数组（唯一一份解释，见 engine/nodes/metrics.pinned_effective）。
+
+    召回卡按 ``nodes.<卡>.metrics[i].value`` 取两版的数：i 必须落在运行时算出来的那份上。卡带了指标选择
+    （caliber_from.metrics，K08）时，全量定义里的下标会对不上、静默取到别的指标；没有选择时就是全量定义，行为一字不变。"""
+    from app.engine.nodes.metrics import pinned_effective
+
+    return pinned_effective(pinned)
+
+
 def _metric(mid: str, name: str, expression: str, src: Mapping[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {"id": mid, "name": name, "unit": str(src.get("unit") or ""), "expression": expression}
     if src.get("decimals") is not None:
@@ -354,8 +390,9 @@ def recall_card(pairs: Sequence[Pair]) -> tuple[dict[str, Any], list[dict[str, A
     k = 0
     for i, pair in enumerate(pairs):
         old_prefix, new_prefix = derive.recall_prefixes(i)
-        new_by = {m["id"]: (j, m) for j, m in enumerate(pair.new.metrics)}
-        for idx, m in enumerate(pair.old.metrics):
+        old_metrics, new_metrics = _effective(pair.old), _effective(pair.new)
+        new_by = {m["id"]: (j, m) for j, m in enumerate(new_metrics)}
+        for idx, m in enumerate(old_metrics):
             if m["id"] not in new_by:
                 continue
             j, nm = new_by[m["id"]]

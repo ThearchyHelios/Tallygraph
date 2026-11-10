@@ -257,7 +257,10 @@ export const api = {
       name: string; description?: string; graph?: GraphSpec; tags?: string[]
       origin?: { run_id: string; conversation_id?: string; turn_id?: string }
     }) => post<Workflow>('/workflows', body),
-    update: (id: string, body: Partial<Workflow> & { note?: string }) =>
+    /** 改工作流：带 graph 就是保存一版。expected_revision 是读到的 Workflow.version（K02 的乐观锁）：对不上回
+     *  409 stale_revision（另带 current_version），这时页面保留自己的编辑、也不自动重放，人确认后再按最新一版
+     *  显式重试（或载入最新版本） */
+    update: (id: string, body: Partial<Workflow> & { note?: string; expected_revision?: number }) =>
       patch<Workflow>(`/workflows/${id}`, body),
     remove: (id: string) => del(`/workflows/${id}`),
     duplicate: (id: string) => post<Workflow>(`/workflows/${id}/duplicate`),

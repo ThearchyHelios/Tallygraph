@@ -11,9 +11,10 @@
 
 **各入口看什么**（总方案 §5.3）：画布、问数据看表和能力（问数据只列只读能力）；发布前修复、升级证据看表，由系统按要修
 的 SQL 代为查看（look 文档 D5）；应用润色看工作流版本和能力（在 copilot.py 里组装）。问数据另看已发布口径（next-round 02
-做法 4：搭建者及以上；使用者发起的图里看得到拷进来的取数 SQL，这一波不给）：助手可以 use_caliber 选用一份口径做骨架，
-「什么时候该看」换成 LOOK_WHEN_ANSWER_PROMPT，输出协议多 USE_CALIBER_PROMPT 一段。运行时写 SQL 的 Agent 不看口径（拍板
-L2：保持独立解读，「等价已证明」才有意义）。
+做法 4），两档按身份分（K14）：搭建者及以上用 use_caliber 选用一份口径做骨架（它的取数 SQL 由服务端拷进图里），「什么时候
+该看」换成 LOOK_WHEN_ANSWER_PROMPT，输出协议多 USE_CALIBER_PROMPT 一段；**普通使用者**只列它有授权的那些版本（look/calibers
+按 actor 收窄），不给 use_caliber，给的是「在 agent 里调口径查询工具 caliber_query」的写法，「什么时候该看」换成
+LOOK_WHEN_QUERY_PROMPT。运行时写 SQL 的 Agent 不看口径（拍板 L2：保持独立解读，「等价已证明」才有意义）。
 
 这里提供：look_service（按入口组装查看服务，开流之前调：读目录、读能力登记要用会话）、section（system 里数据源那一节）、
 system_look（系统代为查看）、写 SQL 的硬性要求和「什么时候该看」的判断标准。
@@ -62,7 +63,14 @@ LOOK_WHEN_PROMPT = """\
   · 用户说了一条数据事实：先看那张表的现有目录，再提目录修改
   · 要看就先看，看完再规划，不要先搭节点再回头看；这次对话里已经看过的表直接点名看，不要只给需求"""
 
-#: 问数据里（能看已发布口径时）的「什么时候该看」：问数据那一条按口径账本改写（next-round 02 做法 4 ④），别的照旧
+#: 问数据里口径这一档怎么用（api/copilot 按身份给）：
+#: look = 只看（列有授权的口径与参数，不选用、不调工具）；compose = 搭建者及以上，look 后用 use_caliber 把口径带进图；
+#: query = 普通使用者，look 后让 agent 调口径查询工具（caliber_query）取数——那条路不把口径的 SQL 拷进使用者的图里
+CALIBER_LOOK = "look"
+CALIBER_COMPOSE = "compose"
+CALIBER_QUERY = "query"
+
+#: 问数据里（能选用已发布口径时）的「什么时候该看」：问数据那一条按口径账本改写（next-round 02 做法 4 ④），别的照旧
 LOOK_WHEN_ANSWER_PROMPT = LOOK_WHEN_PROMPT.replace(
     """  · 问数据：查库交给 agent 节点，它运行时会自己查表结构。只有从概览看不出该用哪个库、用户点了表名、用户说了口径时
     才看一次，把看到的表名写进 agent 的提示词，运行时少走弯路""",
@@ -70,6 +78,17 @@ LOOK_WHEN_ANSWER_PROMPT = LOOK_WHEN_PROMPT.replace(
     一部分时 use_caliber 选用那一部分，其余交给 agent 补；问法多了口径没有的条件（比如「含退款」「只看新客」）时不要套
     口径，交给 agent 去查，系统会自动拿它的 SQL 和口径对账。查库交给 agent 时它运行时会自己查表结构：只有从概览看不出
     该用哪个库、用户点了表名时才看表，把看到的表名写进 agent 的提示词""")
+
+#: 问数据里**普通使用者**那一档的「什么时候该看」（K14）：先看有授权的口径，对得上就让 agent 调口径查询工具取数——
+#: 这条路上没有 use_caliber（把口径的取数 SQL 拷进使用者的图是搭建者才做的事），数得来自一次固定口径执行
+LOOK_WHEN_QUERY_PROMPT = LOOK_WHEN_PROMPT.replace(
+    """  · 问数据：查库交给 agent 节点，它运行时会自己查表结构。只有从概览看不出该用哪个库、用户点了表名、用户说了口径时
+    才看一次，把看到的表名写进 agent 的提示词，运行时少走弯路""",
+    """  · 问数据：先看已发布口径（kind 写 caliber）——列出来的都是**你有授权的**那些版本。问法和某张口径对得上时
+    **不要自己写取数 SQL**：搭一个 agent 节点，在它的 prompt 里让它照查看结果的「取数写法」调用口径查询工具算出那几个
+    指标（口径身份、指标 id、inputs 照抄；相对时间先取当前日期再折算成开始/结束），交回的指标值写进报告。口径只覆盖问题
+    的一部分时，其余交给 agent 查底表补；问题里有多出口径没有的条件（含退款、只看新客这类）时不要套口径，交给 agent 去查。
+    查库交给 agent 时它运行时会自己查表结构：只有从概览看不出该用哪个库、用户点了表名时才看表，把看到的表名写进提示词""")
 
 #: 问数据里输出协议多的一段：选用口径（ledger/compose.py）。只在这一轮能看已发布口径时接在协议后面。
 #: 两个 id 写清楚（真实验收里模型第一次常把 card 写成自己起的 c1，被拒之后才改对）：card 是那一版工作流图里口径卡的节点 id，
@@ -91,13 +110,15 @@ SYSTEM_LOOK_UPGRADE_NEED = "要升级的工作流里，查库节点的 SQL 用�
 async def look_service(sources: list[Any], *, spec: ModelSpec | None, graph: Mapping[str, Any] | None = None,
                        kinds: tuple[str, ...] = ("table", "capability"), answer: bool = False,
                        catalog_view: Any = None, trail: Mapping[str, Any] | None = None,
-                       session: Any = None) -> LookService:
+                       session: Any = None, actor: Any = None, caliber: str = CALIBER_LOOK) -> LookService:
     """按入口组装这一轮的查看服务。读目录、读能力登记都用各自的短会话，开流前后都能调。
 
     spec 是助手的模型规格：挑选模型第一次要用时才按它拿（关思考、额度按 look/pick.PICK_MAX_TOKENS）。graph 是现有工作流，概览里列出它查过的表。
     answer：问数据（意图为回答），能力只列只读的。catalog_view：表详情里给哪一份数据目录（data/catalog_view.py），不给是当前目录。
     trail：按需加入探查范围时的留痕（哪一轮对话：{conversation_id}；谁取这次请求的身份）。
-    kinds 里有 caliber 时用 session（调用方开流之前的会话）读已发布口径，问数据里另判能不能组合（look/calibers 的 compose）。
+    kinds 里有 caliber 时用 session（调用方开流之前的会话）读已发布口径：compose 那一档另判能不能组合（look/calibers
+    的 compose），query 那一档只给按口径查询工具取数的写法（普通使用者，K14）。`actor` 是这次是谁：交给 CaliberKind.load
+    按资产授权收窄（普通使用者只列有授权的那些版本；不给就取当前请求的身份）。
     """
     from app.look.calibers import CaliberKind
 
@@ -108,18 +129,23 @@ async def look_service(sources: list[Any], *, spec: ModelSpec | None, graph: Map
     if "capability" in kinds:
         made.append(await CapabilityKind.load(picker=picker, read_only=answer))
     if "caliber" in kinds and session is not None:
-        made.append(await CaliberKind.load(session, picker=picker, compose=answer))
+        made.append(await CaliberKind.load(session, picker=picker, compose=caliber == CALIBER_COMPOSE, actor=actor,
+                                           query=caliber == CALIBER_QUERY))
     return LookService(made)
 
 
 def composing(looks: LookService) -> bool:
-    """这一轮能不能选用已发布口径（问数据里读好了能组合的口径卡）。"""
+    """这一轮能不能选用已发布口径（问数据里读好了能组合的口径卡，搭建者及以上那一档）。"""
     kind = looks.kinds.get("caliber")
-    return kind is not None and getattr(kind, "options", None) is not None
+    return (kind is not None and getattr(kind, "options", None) is not None
+            and not getattr(kind, "query", False))
 
 
 def look_when(looks: LookService) -> str:
-    """「什么时候该看」：能选用已发布口径的问数据用改写过的那一份。"""
+    """「什么时候该看」：问数据里能选用已发布口径的用一份，普通使用者（不能 use_caliber、要让它调口径查询工具）用另一份。"""
+    kind = looks.kinds.get("caliber")
+    if kind is not None and getattr(kind, "query", False):
+        return LOOK_WHEN_QUERY_PROMPT
     return LOOK_WHEN_ANSWER_PROMPT if composing(looks) else LOOK_WHEN_PROMPT
 
 
@@ -155,6 +181,7 @@ async def system_look(looks: LookService, graph: Mapping[str, Any] | None, sourc
 
 
 __all__ = [
-    "LOOK_WHEN_ANSWER_PROMPT", "LOOK_WHEN_PROMPT", "SQL_RULES_PROMPT", "SYSTEM_LOOK_FIX_NEED", "SYSTEM_LOOK_UPGRADE_NEED",
+    "CALIBER_COMPOSE", "CALIBER_LOOK", "CALIBER_QUERY", "LOOK_WHEN_ANSWER_PROMPT", "LOOK_WHEN_PROMPT",
+    "LOOK_WHEN_QUERY_PROMPT", "SQL_RULES_PROMPT", "SYSTEM_LOOK_FIX_NEED", "SYSTEM_LOOK_UPGRADE_NEED",
     "USE_CALIBER_PROMPT", "composer", "composing", "graph_tables", "look_service", "look_when", "section", "system_look",
 ]

@@ -16,6 +16,13 @@ cell(nodes.X, 0, '列')、X 是查库的调用工具节点（look/calibers.card_
 模板只引用入口字段（{{ input.字段 }}）——引用 vars.、nodes.、模板函数（file_text……）的，拷出来就拿不到同样的值，照实
 拒收、给原因（NotDerivable）。工作流、版本、节点不在了也照实说。
 
+**只算一部分指标（K08 S2）**：load_pinned / select_pinned 收可选的 metric_ids（或显式 whole_card=True）。给了选择就先算一份
+依赖闭包（ledger/closure），只拷这次真正要执行的取数节点、入口字段收窄到这次要用的，并把选中的指标记进口径卡的
+caliber_from.metrics（运行时按 closure.effective_metrics 只算这几个）。没给选择就照旧整卡——图、参数、身份一个字不变。
+未决依赖（点名的指标不在这张卡上、式子读不出来、绑定对不上、点名的取数没有可读 SQL）一律照实拒
+（NotDerivable，code=derive.selection_unresolved），**不静默退回整卡**；共享给未选中指标的那条 SQL 照样保留（它还在算谁
+记在闭包的 computes_unselected 上，不做投影）。
+
 **已实现的**：caliber_probe —— 一份口径的取数 + 口径卡（评测口径题的期望）；reconcile —— 口径对账（第 3 波，
 reconcile_graph）；组合式问数用的 caliber_block(card_id, inputs)（第 3 波）；recall —— 口径召回（第 4 波，recall_graph）。
 
@@ -39,10 +46,15 @@ from __future__ import annotations
 import copy
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.ledger import params
+
+if TYPE_CHECKING:                                   # 运行时按需 import：closure 反过来要用这一层（entry_fields）
+    from app.ledger.closure import Closure
 
 #: 派生图的种类（见模块说明）
 KINDS = ("caliber_probe", "reconcile", "recall")
@@ -52,6 +64,13 @@ GONE = "derive.version_gone"
 NOT_CARD = "derive.not_caliber_card"
 NOT_REUSABLE = "derive.not_reusable"
 TEMPLATE = "derive.fetch_template"
+#: 取数模板引用了入口没声明的参数（ledger/params.UNDECLARED）：拷出来渲染不出那一版口径的 SQL
+UNDECLARED_PARAMETER = "derive.undeclared_parameter"
+#: 业务定义（统计时间口径、退款规则）和取数节点上的受控绑定对不上（K04）：派生出来跑的还是旧 SQL，
+#: 这一版的数不能冒充新定义（见 ledger/bindings）
+BINDING_UNALIGNED = "derive.binding_unaligned"
+#: 点名要算的指标解析不出依赖闭包（K08 S2）：闭包的每一条未决原样写进 message，照实拒绝、不静默退回整卡
+SELECTION = "derive.selection_unresolved"
 
 #: 派生图自己的入口、出口节点 id（和拷出来的节点撞了就加后缀）
 ENTRY_ID = "derived_in"
@@ -68,17 +87,24 @@ TEMPLATE_REASON = ("取数节点「{node}」的模板引用了「{ref}」：只�
 
 
 class NotDerivable(Exception):
-    """不能从这一版派生只读图。message 给人看（照实说哪一环不行），code 给程序认。"""
+    """不能从这一版派生只读图。message 给人看（照实说哪一环不行），code 给程序认。
 
-    def __init__(self, message: str, code: str) -> None:
+    problems：参数完整性问题（ledger/params.Problem）的原样一份，入口据此回结构化错误（problems 数组）；不是参数问题为空。"""
+
+    def __init__(self, message: str, code: str, *, problems: Sequence[Any] = ()) -> None:
         super().__init__(message)
         self.message = message
         self.code = code
+        self.problems = tuple(problems)
 
 
 @dataclass(frozen=True)
 class Pinned:
-    """读好的一版口径：那一版的图、口径卡、它读的取数节点、入口字段。只从不可变的版本快照读。"""
+    """读好的一版口径：那一版的图、口径卡、它读的取数节点、入口字段。只从不可变的版本快照读。
+
+    给了选择（select_pinned / load_pinned(metric_ids=…)）的这份只带**这次要执行**的那几个取数节点与前缀入口字段，另带
+    这份选择的依赖闭包（``closure``）；没给选择就是整卡，闭包是整卡的（附上供调用方读身份，不在这里判未决）。
+    """
 
     workflow_id: str
     workflow_name: str
@@ -91,14 +117,21 @@ class Pinned:
     published: bool
     retired: bool
     card: dict[str, Any]
-    #: 口径卡读的取数节点（图里的原始 JSON），按图里的先后
+    #: 口径卡读的取数节点（图里的原始 JSON），按图里的先后；给了选择时只有这次要执行的那几个
     fetches: tuple[dict[str, Any], ...]
-    #: card_inputs 认出的 [(取数节点, 工具, 列)]
+    #: card_inputs 认出的 [(取数节点, 工具, 列)]；给了选择时只有留下的那几个节点
     reads: tuple[tuple[str, str, tuple[str, ...]], ...]
-    #: 入口节点声明的字段（原始 JSON：name、type、required、default……）
+    #: 入口节点声明的字段（原始 JSON：name、type、required、default……）；给了选择时收窄到这次真正会用到的
     entry_fields: tuple[dict[str, Any], ...]
     #: 图级 defaults（节点上没写的配置按它取，照抄才和原图取值一致）
     defaults: dict[str, Any]
+    #: 业务绑定（K04）的判定：这一版的业务定义（时间口径、退款规则）和取数节点上的受控绑定是不是同步
+    #: （ledger/bindings 的 Report.as_dict()）。load_pinned 已经保证只有 aligned / unbound 的卡才派得出来。
+    binding: dict[str, Any] = field(default_factory=dict)
+    #: 读这一版时留下的那张图（只读）：按选择再算一次依赖闭包时用它，不重读库、也不再回内存里那份快照
+    graph: dict[str, Any] = field(default_factory=dict)
+    #: 这一版的依赖闭包（K08）：没给选择时是整卡闭包；给了选择时就是这次选择的那一份，也是这次裁剪的依据
+    closure: "Closure | None" = None
 
     @property
     def card_title(self) -> str:
@@ -200,8 +233,13 @@ def entry_fields(graph: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
     return tuple(out.values())
 
 
-async def load_pinned(session: AsyncSession, workflow_id: str, version: int, node_id: str) -> Pinned:
-    """读 workflow_id@version 里的口径卡 node_id。不能派生的抛 NotDerivable（照实说哪一环不行）。"""
+async def read_pinned(session: AsyncSession, workflow_id: str, version: int, node_id: str) -> Pinned:
+    """读 workflow_id@version 里的口径卡 node_id，**不判依赖**：工作流、版本、节点在不在、是不是口径卡（不在就抛
+    NotDerivable）；读一版图只有这一处。交回的 Pinned 有那一版的图、卡、入口字段与图级缺省值；取数节点空着，reads 是
+    「整卡认得出的那一份」（card_inputs 读不出来就是空，不在这里判能不能用）。
+
+    调用方按选择裁（select_pinned）或按整卡门禁判（load_pinned）。look 的按指标可组合性（calibers.metric_options）也从
+    这一份出发：B 独有那条查询坏了不该牵连 A，所以它不能走整卡门禁那一条路。"""
     from app.apps import versions as app_versions
     from app.db.models import Workflow
     from app.look.calibers import card_inputs
@@ -218,22 +256,147 @@ async def load_pinned(session: AsyncSession, workflow_id: str, version: int, nod
         raise NotDerivable(f"「{workflow.name}」v{version} 里没有节点 {node_id}", GONE)
     if card.get("type") != "metrics":
         raise NotDerivable(f"「{workflow.name}」v{version} 里的 {node_id} 不是口径卡", NOT_CARD)
-    inputs, reason = card_inputs(graph, node_id)
+    readable, _ = card_inputs(graph, node_id)
+    return Pinned(workflow_id=workflow.id, workflow_name=workflow.name, version=int(version), node_id=node_id,
+                  level=row.level, published=app_versions.is_published(row, current=workflow.published_version),
+                  retired=row.retired_at is not None, card=copy.deepcopy(card), fetches=(),
+                  reads=tuple((i["node"], i["tool"], tuple(i["columns"])) for i in readable),
+                  entry_fields=entry_fields(graph), defaults=copy.deepcopy(graph.get("defaults") or {}), graph=graph)
+
+
+async def load_pinned(session: AsyncSession, workflow_id: str, version: int, node_id: str, *,
+                      metric_ids: Sequence[str] | None = None, whole_card: bool = False) -> Pinned:
+    """读 workflow_id@version 里的口径卡 node_id。不能派生的抛 NotDerivable（照实说哪一环不行）。
+
+    metric_ids / whole_card 给了就只按这次要算的指标读（K08 S2）：取数节点、入口字段、参数与绑定判定都收窄到这次的范围
+    （未选中指标独有那条查询的坏 SQL、坏绑定不牵连选中的），未决依赖照实拒（code=SELECTION）——**不静默退回整卡**。
+    不给就是整张卡：门禁、图、身份和以前一字不差（整卡闭包照样算一份附在 Pinned 上，只是不在这里判它有没有未决）。
+
+    唯一两条路径都不放行的是**指标 id 重复**（同一张卡上两个指标用同一个 id，code=duplicate_metric_id）：那是卡的指标
+    身份本身坏了——闭包按定义解析、运行时按指标集筛、下游按位置取 nodes.<卡>.metrics[i] 会各算一份，谁是谁说不清。
+    """
+    from app.look.calibers import card_inputs
+
+    pinned = await read_pinned(session, workflow_id, version, node_id)
+    title = pinned.card_title
+    # 指标 id 重复（同一张卡上两个指标用了同一个 id）：卡的指标身份本身坏了——闭包按定义解析、运行时按指标集筛、下游按
+    # 位置取 nodes.<卡>.metrics[i] 会各算一份，谁是谁说不清。这不是「某个指标的问题」，哪条路径都不放行、也不静默取一份
+    from app.ledger.closure import DUPLICATE_METRIC_ID, duplicate_metric_ids
+
+    if duplicates := duplicate_metric_ids(pinned.metrics):
+        raise NotDerivable(f"「{pinned.workflow_name}」v{pinned.version} 的口径卡「{title}」上有指标 id 重复："
+                           f"{'、'.join(duplicates)}——同一张卡上每个指标 id 只能有一个，先改成不重的 id",
+                           DUPLICATE_METRIC_ID)
+    if metric_ids is not None:
+        # 点名要算哪几个：整卡的「每个输入都要是查库结果里的格」那道门禁不在这里判——B 独有那条查询再糟也不该牵连 A；
+        # 收窄到这次的范围、逐条判依赖，判不出来照实拒（收窄与判定都在 select_pinned 的闭包里）
+        return select_pinned(pinned, metric_ids=metric_ids, whole_card=whole_card)
+    graph, node = pinned.graph, pinned.node_id
+    inputs, reason = card_inputs(graph, node)
     if reason is not None:
-        title = (card.get("data") or {}).get("label") or node_id
-        raise NotDerivable(f"「{workflow.name}」v{version} 的口径卡「{title}」不能复用：{reason}", NOT_REUSABLE)
+        raise NotDerivable(f"「{pinned.workflow_name}」v{pinned.version} 的口径卡「{title}」不能复用：{reason}", NOT_REUSABLE)
     wanted = {i["node"] for i in inputs}
     fetches = tuple(copy.deepcopy(n) for n in graph.get("nodes") or []
                     if isinstance(n, dict) and n.get("id") in wanted)
-    for node in fetches:
-        if problem := template_problem(str(node["id"]), _config(node)):
-            raise NotDerivable(f"「{workflow.name}」v{version} 的{problem}", TEMPLATE)
-    return Pinned(
-        workflow_id=workflow.id, workflow_name=workflow.name, version=int(version), node_id=node_id,
-        level=row.level, published=app_versions.is_published(row, current=workflow.published_version),
-        retired=row.retired_at is not None, card=copy.deepcopy(card), fetches=fetches,
-        reads=tuple((i["node"], i["tool"], tuple(i["columns"])) for i in inputs),
-        entry_fields=entry_fields(graph), defaults=copy.deepcopy(graph.get("defaults") or {}))
+    for node_ in fetches:
+        if problem := template_problem(str(node_["id"]), _config(node_)):
+            raise NotDerivable(f"「{pinned.workflow_name}」v{pinned.version} 的{problem}", TEMPLATE)
+    # 模板里的参数要和入口字段对得上（ledger/params，各入口同一套判断）：引用入口没声明的字段，派生出来渲染的就是空串
+    # ——在派生这一步就说清楚，别等发出的 SQL 少了个值
+    if problems := params.check_nodes(fetches, fields=pinned.entry_fields,
+                                      where=f"「{pinned.workflow_name}」v{pinned.version} 的入口声明的字段"):
+        first = problems[0]
+        raise NotDerivable(f"「{pinned.workflow_name}」v{pinned.version} 的取数节点「{first.node_id or node}」："
+                           f"{first.message}", UNDECLARED_PARAMETER if first.code == params.UNDECLARED else TEMPLATE,
+                           problems=problems)
+    # K04：指标里的业务定义（统计时间口径、退款规则）和取数节点上的受控绑定对不上的，不许派生——派生出来跑的还是
+    # 那张旧 SQL，这一版的数不能冒充新定义。旧资产（没声明这两个字段）是 unbound，照旧放行
+    from app.ledger import bindings as caliber_bindings
+
+    alignment = caliber_bindings.analyze(graph, node)
+    if alignment.blocked:
+        raise NotDerivable(f"「{pinned.workflow_name}」v{pinned.version} 的口径卡「{title}」：{alignment.reason}",
+                           BINDING_UNALIGNED)
+    pinned = replace(pinned, fetches=fetches,
+                     reads=tuple((i["node"], i["tool"], tuple(i["columns"])) for i in inputs),
+                     binding=alignment.as_dict())
+    # 显式整卡：和缺省那条路径同一道门禁，再要一份整卡闭包（闭包有未决就照实拒，不静默放宽）
+    return select_pinned(pinned, whole_card=True) if whole_card else select_pinned(pinned)
+
+
+def select_pinned(pinned: Pinned, *, metric_ids: Sequence[str] | None = None,
+                  whole_card: bool = False) -> Pinned:
+    """按选择从**读好的一版**里裁出一份 Pinned（纯函数、无 IO）：只留这次要执行的取数节点、入口字段收窄到这次会用到的，
+    并把这次选择的依赖闭包附在闭包字段上。别的（卡、口径名、版本、级别、图级缺省值）原样。
+
+    - 没给选择（metric_ids 是 None、whole_card 不是 True）：原样交回，只把整卡闭包附上去（供调用方读身份与依赖），
+      不在这里判有没有未决——那几道门禁在 load_pinned 里照旧；
+    - 给了选择：先看这份闭包能不能用，不能用一律 NotDerivable（code=SELECTION，每一条未决原样写进 message），
+      **绝不静默退回整卡**；能用就只留闭包里的那些查询（共享给未选中指标的那条 SQL 照样保留，它还在算谁记在
+      Query.computes_unselected 上），入口字段收窄到这次真正引用的那些，绑定判定也只看这次要执行的那些节点。
+
+    pinned.graph 是读这一版时留下的那张图（只读）。同一版、同一份选择，每次得到同一份结果。
+    """
+    from app.ledger import closure as caliber_closure
+
+    graph = pinned.graph if isinstance(pinned.graph, dict) else {}
+    explicit = metric_ids is not None or whole_card
+    try:
+        selection = caliber_closure.build(graph, pinned.workflow_id, pinned.version, pinned.node_id,
+                                         metric_ids=metric_ids, whole_card=whole_card)
+    except caliber_closure.ClosureRefused as e:
+        if not explicit:
+            return pinned                     # 手里没有这一版的图（手工拼的 Pinned）：算不了闭包，旧路径照旧
+        raise NotDerivable(f"口径卡「{pinned.card_title}」算不出依赖：{e}", SELECTION) from None
+    if not explicit:
+        return replace(pinned, closure=selection)
+    # 每个点名的指标读的输入都要能复用（cell(nodes.X, 0, '列')、X 是查库的调用工具节点）：判定与整卡那道门禁、
+    # look 的按指标可组合性（calibers.metric_options）同一份 metric_inputs。B 读的是别的节点，不牵连 A
+    from app.look.calibers import metric_inputs as caliber_metric_inputs
+
+    named = [m for m in pinned.metrics if str(m.get("id")) in set(metric_ids or [])]
+    for metric in named:
+        _, reason = caliber_metric_inputs(graph, pinned.node_id, metric)
+        if reason is not None:
+            raise NotDerivable(f"「{pinned.workflow_name}」v{pinned.version} 的口径卡「{pinned.card_title}」"
+                               f"不能复用：{reason}", NOT_REUSABLE)
+    try:
+        selection.require()
+    except caliber_closure.UnresolvedClosure as e:
+        raise NotDerivable(
+            f"「{pinned.workflow_name}」v{pinned.version} 的口径卡「{pinned.card_title}」这次点名的指标算不出来："
+            f"{problems_text(e.problems)}。请把依赖补齐，或按整卡再来一次", SELECTION) from None
+    if selection.whole_card:
+        return replace(pinned, closure=selection)
+    kept = {q.node_id for q in selection.queries}
+    names = {str(f.get("name")) for f in selection.required_entry_fields}
+    from app.ledger import bindings as caliber_bindings
+
+    selected = [m for m in pinned.metrics if str(m.get("id")) in set(selection.metric_ids)]
+    # 这次要执行的取数节点从**图**里取（不靠整卡那一步认出来的那份）：B 独有那条查询再糟，也不影响 A 被认出来
+    fetches = tuple(copy.deepcopy(n) for n in graph.get("nodes") or []
+                    if isinstance(n, Mapping) and str(n.get("id")) in kept)
+    return replace(pinned, fetches=fetches,
+                   reads=tuple(r for r in pinned.reads if str(r[0]) in kept),
+                   entry_fields=tuple(f for f in pinned.entry_fields if str(f.get("name") or "").strip() in names),
+                   binding=caliber_bindings.analyze(graph, pinned.node_id, selected).as_dict(),
+                   closure=selection)
+
+
+def problems_text(problems: Sequence[Mapping[str, Any]]) -> str:
+    """闭包的每一条未决收成一句话：前四条原样带各自的机器码，多的只报个数（不逐条铺开）。
+
+    ``select_pinned`` 的拒收消息与 look 的按指标可组合性（calibers.metric_options）都读这一份，不各写一遍措辞。"""
+    said = "；".join(f"{p.get('message') or p.get('code')}（{p.get('code')}）" for p in problems[:4])
+    more = f"；另有 {len(problems) - 4} 项" if len(problems) > 4 else ""
+    return said + more
+
+
+def _problems_text(problems: Sequence[Mapping[str, Any]]) -> str:
+    """闭包的每一条未决收成一句话：前四条原样带各自的机器码，多的只报个数（不逐条铺开）。"""
+    said = "；".join(f"{p.get('message') or p.get('code')}（{p.get('code')}）" for p in problems[:4])
+    more = f"；另有 {len(problems) - 4} 项" if len(problems) > 4 else ""
+    return said + more
 
 
 # ==========================================================================
@@ -247,7 +410,10 @@ def _node(nid: str, ntype: str, label: str, **config: Any) -> dict[str, Any]:
 
 def render_inputs(value: Any, inputs: Mapping[str, Any]) -> Any:
     """配置里每一段字的 {{ input.字段 }} 按 inputs 渲染成字面值（和运行时同一个渲染器 engine/expressions.render_template）。
-    load_pinned 已经保证取数节点的模板只引用入口字段。别的值原样。"""
+    load_pinned 已经保证取数节点的模板只引用入口字段。别的值原样。
+
+    渲染只能发生一次：这里渲染出来的东西交给运行时之后，运行时的模板渲染不能再碰它（caliber_block 会在节点上写一份参数
+    契约，engine/nodes/tools.run_tool 按它跳过渲染）。渲染过的结果被再解释一遍，值里的 {{ }} 就不是数据了（K01）。"""
     from app.engine.expressions import render_template
 
     if isinstance(value, str):
@@ -260,16 +426,27 @@ def render_inputs(value: Any, inputs: Mapping[str, Any]) -> Any:
 
 
 def caliber_block(pinned: Pinned, *, prefix: str = "", upgrade_policy: str | None = None,
-                  card_id: str | None = None, inputs: Mapping[str, Any] | None = None) -> Block:
+                  card_id: str | None = None, inputs: Mapping[str, Any] | None = None,
+                  metrics: Sequence[str] | None = None, whole_card: bool = False) -> Block:
     """一份口径：拷出取数节点（id、配置原样；prefix 不为空时改名为 prefix + 原 id）+ 一张 caliber_from 固定到那一版的
     口径卡（id 同原卡，带前缀时同样改名；「缺输入时」照抄原卡）。
+
+    metrics / whole_card 给了就先按这次要算的指标裁一份（select_pinned 的闭包）：只拷这次要执行的取数节点，改名映射
+    （caliber_from.nodes）只列它们，拷出来的卡照旧固定到那一版。裁剪过的口径卡多一项 caliber_from.metrics（这次算哪几个
+    指标，按源卡顺序）——运行时按它只算这几个（closure.effective_metrics）；整卡时不写这一项，行为和以前一样。
 
     upgrade_policy：钉住的版本有了新的已发布版本时这一段怎么处置（recompute / dual / incomparable，没有缺省）。写在
     本地口径卡上，判断走和正式运行同一个 engine/governance.unresolved_caliber_upgrades；不给就不写（有新版本时那个
     判断报「待处置」）。带前缀时口径卡的 caliber_from 带改名映射 nodes（metrics 运行时按它改写式子，见模块说明）。
 
     组合式问数（ledger/compose.py）另给两项：card_id 是口径卡在新图里的 id（缺省 prefix + 原卡 id）；inputs 给了的话，
-    取数节点配置里的 {{ input.字段 }} 按它渲染成字面值——拷进问数据的图里，那张图的入口没有口径的入口字段。"""
+    取数节点配置里的 {{ input.字段 }} **在这里渲染成字面值**（值只被模板替换这一次），并在节点上写一份按这份渲染结果的
+    哈希与节点绑定的参数契约（ledger/params 的 marker）：args 里已经是字面语句，运行时的模板渲染一概不碰它；复制走、
+    改过 args 之后契约作废，那个节点回退成普通模板。不写契约的话，值里带 `{{ }}` 的文本会在运行时被当模板再解释一遍
+    （K01 的二次渲染反例）；而模板留在节点上也不行——engine/variables 会把「引用了没人产出的 {{ input.x }}」判成错误，
+    那张图跑不起来（拷进的是问数据的图，入口没有口径的入口字段）。"""
+    if metrics is not None or whole_card:
+        pinned = select_pinned(pinned, metric_ids=metrics, whole_card=whole_card)
     rename = {str(n["id"]): f"{prefix}{n['id']}" for n in pinned.fetches} if prefix else {}
     nodes: list[dict[str, Any]] = []
     for original in pinned.fetches:
@@ -277,11 +454,22 @@ def caliber_block(pinned: Pinned, *, prefix: str = "", upgrade_policy: str | Non
         node["id"] = rename.get(str(node["id"]), str(node["id"]))
         node["position"] = {"x": 0, "y": 0}
         if inputs is not None and isinstance(node.get("data"), dict):
-            node["data"]["config"] = render_inputs(node["data"].get("config") or {}, inputs)
+            config = node["data"].get("config") or {}
+            template = str(((config.get("args") or {}) if isinstance(config, dict) else {}).get("sql") or "")
+            node["data"]["config"] = render_inputs(config, inputs)
+            if params.input_refs(template):
+                # 契约与渲染好的 args 绑定（rendered）：节点被复制、args 改过之后契约自动作废，运行时回退正常渲染
+                node["data"]["config"][params.KEY] = params.marker(
+                    rendered=node["data"]["config"].get("args"), template=template, values=inputs,
+                    declared_fields=declared_entry_fields(pinned),
+                    source={**pinned.ref(), "node_id": str(original.get("id") or pinned.node_id)})
         nodes.append(node)
     source = pinned.ref()
     if rename:
         source = {**source, "nodes": dict(rename)}
+    selection = _selection_ids(pinned)
+    if selection:
+        source = {**source, "metrics": selection}
     config: dict[str, Any] = {"caliber_from": source}
     on_missing = pinned.card_config.get("on_missing")
     if on_missing not in (None, ""):
@@ -291,6 +479,21 @@ def caliber_block(pinned: Pinned, *, prefix: str = "", upgrade_policy: str | Non
     card_id = card_id or f"{prefix}{pinned.node_id}"
     nodes.append(_node(card_id, "metrics", pinned.card_title, **config))
     return Block(nodes=nodes, card_id=card_id, rename=rename, source=pinned.describe())
+
+
+def _selection_ids(pinned: Pinned) -> list[str]:
+    """这一版这次选了哪些指标（按源卡顺序）：整卡、或手里没有闭包（手工拼的 Pinned）时是空——那时不写这一项，
+    运行时按整卡算，和以前一样。"""
+    closure = pinned.closure
+    return [] if closure is None or closure.whole_card else [str(m) for m in closure.metric_ids]
+
+
+def declared_entry_fields(pinned: Pinned) -> tuple[dict[str, Any], ...]:
+    """写参数契约时记的入口字段：**那一版入口声明了什么**，不随这次选了哪些指标而变。裁剪过（选了指标）的 Pinned 手上
+    只有这次要用的那几个，就从读这一版时留下的图里取回全部；图不在（手工拼的 Pinned）就用手上这份。"""
+    if pinned.closure is not None and not pinned.closure.whole_card:
+        return entry_fields(pinned.graph) or pinned.entry_fields
+    return pinned.entry_fields
 
 
 def _free_id(wanted: str, taken: set[str]) -> str:
@@ -355,9 +558,14 @@ def reconcile_prefix(pinned: Pinned) -> str:
 
 
 def ours_block(sql: str, tool: str, *, label: str = "这次的取数") -> Block:
-    """对账里「这次的取数」：这次执行过的 SQL 原文，放进一个调用工具节点（id ours_q1）。没有口径卡。"""
-    return Block(nodes=[_node(OURS_ID, "tool", label, tool=tool, args={"sql": sql})], card_id=None,
-                 source={"kind": "executed", "node_id": OURS_ID})
+    """对账里「这次的取数」：这次执行过的 SQL 原文，放进一个调用工具节点（id ours_q1）。没有口径卡。
+
+    放进节点的**是实际执行过的那条语句，不是模板**：写一份参数契约（ledger/params 的 marker，与这条语句绑定），运行时的
+    模板渲染一概不碰它。不然语句里带 {{ }} 的值（值里就是有这种字）会在运行时被再解释一遍，对账比的就不是这次查过的那条了。"""
+    return Block(nodes=[_node(OURS_ID, "tool", label, tool=tool, args={"sql": sql},
+                              **{params.KEY: params.marker(rendered={"sql": sql},
+                                                           source={"kind": "executed", "node_id": OURS_ID})})],
+                 card_id=None, source={"kind": "executed", "node_id": OURS_ID})
 
 
 def reconcile_graph(pinned: Pinned, ours: Block, tail: Sequence[dict[str, Any]], *,
@@ -435,6 +643,7 @@ def caliber_probe(pinned: Pinned, *, upgrade_policy: str | None = None) -> Deriv
 
 
 __all__ = ["ALIGN_ID", "Block", "DerivedGraph", "ENTRY_ID", "EXIT_ID", "GONE", "KINDS", "NOT_CARD", "NOT_REUSABLE",
-           "NotDerivable", "OURS_ID", "Pinned", "RECALL_CARD", "RECONCILE_CARD", "TEMPLATE", "assemble", "caliber_block",
-           "caliber_probe", "entry_fields", "load_pinned", "ours_block", "recall_fields", "recall_graph",
-           "recall_prefixes", "reconcile_graph", "reconcile_prefix", "render_inputs", "template_problem"]
+           "NotDerivable", "OURS_ID", "Pinned", "RECALL_CARD", "RECONCILE_CARD", "SELECTION", "TEMPLATE", "assemble",
+           "caliber_block", "caliber_probe", "declared_entry_fields", "entry_fields", "load_pinned", "ours_block",
+           "problems_text", "read_pinned", "recall_fields", "recall_graph", "recall_prefixes", "reconcile_graph",
+           "reconcile_prefix", "render_inputs", "select_pinned", "template_problem"]

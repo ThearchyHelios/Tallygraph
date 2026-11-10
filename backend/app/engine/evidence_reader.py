@@ -30,8 +30,12 @@ class Sealed:
     ledger: set[tuple[str, str]] = field(default_factory=set)
     #: 节点 id → 它最后一次 node.finished 的产出工件 id
     outputs: dict[str, str] = field(default_factory=dict)
-    #: 封存范围内交回过的查询快照：工件 id → {node_id, tool, source, via, call_id, exec}
+    #: 封存范围内交回过的查询快照：工件 id → {node_id, tool, source, via, call_id, exec, query_id, …}
+    #: 同一份快照被两次执行时这里只留一条（工件 id 相同、内容一样），要逐次区分用 query_records
     queries: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: 封存范围内交回过的查询快照，**按事件顺序逐条**记：同一份快照被两次执行（循环里、两个节点写同一条 SQL）
+    #: 就是两条，各自带执行身份（K10）。每条是 {artifact, node_id, exec, query_id, execution_id, attempt, …}
+    query_records: list[dict[str, Any]] = field(default_factory=list)
     #: 口径卡节点 id → 封存范围内它的 caliber.upgrade 事件（升版处置）
     upgrades: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: 封存范围内 node.finished.evidence 的台账条目，按事件顺序（给可疑实体找「最接近的名字」重建目录用）
@@ -79,6 +83,39 @@ class Sealed:
         if nested:
             out += [nid for nid, kind in self.types.items() if "/" in nid and kind == node_type]
         return out
+
+    def query_records_of(self, node_id: Any) -> list[dict[str, Any]]:
+        """这个节点交回过的查询快照，按执行先后（同一次执行只有一条）。同一份快照被执行两次就两条，
+        老条目、新条目都在（老条目也记 exec，只是没有 execution_id）。"""
+        wanted = str(node_id)
+        return [r for r in self.query_records if str(r.get("node_id") or "") == wanted]
+
+    def query_at(self, artifact: Any, *, node_id: Any = None, exec_no: Any = None,
+                 execution_id: Any = None) -> dict[str, Any] | None:
+        """按执行身份取那一次查询：新条目按 (artifact, node_id, exec/attempt, execution_id) 认。
+
+        exec=2 取第二次而不是第一次：先按 exec/attempt 对，对不上再按这个节点的第 N 条。老条目（一个执行
+        身份字段都没有）也照这条走——它们同样记了 node_id / exec，逐次记的 query_records 里分得开；只有
+        连台账条目都没有（工具只回了 tool.end）时才退回 queries 里按 artifact 的那一份，和以前一样。
+        """
+        key = str(artifact or "")
+        records = [r for r in self.query_records if str(r.get("artifact") or "") == key]
+        if execution_id not in (None, ""):
+            hit = next((r for r in records if r.get("execution_id") == execution_id
+                        and (node_id in (None, "") or str(r.get("node_id") or "") == str(node_id))), None)
+            if hit is not None:
+                return hit
+        if node_id not in (None, ""):
+            mine = [r for r in records if str(r.get("node_id") or "") == str(node_id)]
+            if exec_no is not None:
+                hit = next((r for r in mine if r.get("exec") == exec_no or r.get("attempt") == exec_no), None)
+                if hit is not None:
+                    return hit
+                if isinstance(exec_no, int) and not isinstance(exec_no, bool) and 1 <= exec_no <= len(mine):
+                    return mine[exec_no - 1]
+            if mine:
+                return mine[-1]
+        return self.queries.get(key)
 
     def payload_of(self, node_ids: list[str]) -> dict[str, Any] | None:
         """这几个节点里最后跑完的那个的产出，从封存的事件指向的工件里取。"""
@@ -148,8 +185,15 @@ async def read_sealed(run_id: str) -> Sealed:
                 artifact = str(entry["artifact"])
                 if entry.get("kind") == "query":
                     out.queries[artifact] = {
-                        "node_id": node_id, **{k: entry[k] for k in ("tool", "source", "via", "call_id", "exec")
+                        "node_id": node_id, **{k: entry[k] for k in ("tool", "source", "via", "call_id", "exec",
+                                                                    "query_id", "execution_id", "attempt")
                                                if entry.get(k) is not None}}
+                    # 逐次记一条（同一份快照两次执行就是两条）：eid、出处链、app 按 exec 取快照都靠它认得出是哪一次
+                    out.query_records.append({
+                        "artifact": artifact, "node_id": node_id,
+                        **{k: entry[k] for k in ("tool", "source", "via", "call_id", "exec",
+                                                 "query_id", "execution_id", "attempt")
+                           if entry.get(k) is not None}})
                 elif entry.get("kind") == "schema":
                     out.schemas[artifact] = {"node_id": node_id, "source": entry.get("source")}
                 elif entry.get("kind") == "retrieval":

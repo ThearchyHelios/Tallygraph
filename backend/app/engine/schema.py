@@ -540,7 +540,11 @@ def _check_dual_check(node: GraphNode, spec: GraphSpec, result: ValidationResult
             "请把口径卡连到双盲复算之前", "card", "dual_check.card_invalid")
         return
     if target.config.get("caliber_from") not in (None, "", {}):
-        known = None
+        # 转抄卡：钉住那一版的指标清单不在本图里。带了指标选择（caliber_from.metrics，K08）时，这张卡这次只会算出选中的
+        # 那些——可选的指标清单就是它，按它校验；没带选择才认不出（照旧不查指标 ID）
+        ref = target.config.get("caliber_from")
+        selection = ref.get("metrics") if isinstance(ref, dict) else None
+        known = [str(m) for m in selection] if isinstance(selection, list) and selection else None
     else:
         known = [str(d.get("id")) for d in target.config.get("metrics") or [] if isinstance(d, dict) and d.get("id")]
     hint = ("，可选的指标 ID：" + "、".join(known[:12])) if known else ""
@@ -1370,6 +1374,14 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
                 for issue in metric_definition_issues(node, d, i):
                     result.add(issue.message, level=issue.level, node_id=issue.node_id, field=issue.field,
                                code=issue.code)
+            # K08：同一张卡上的指标 ID 要唯一。下游按 ID 与位置取数（nodes.<卡>.metrics[i]、出具契约、比例契约），
+            # 重复了分不清是哪一条——画布 / 发布前检查就拦住，别等到运行时把第一条静默算出来
+            from app.engine.nodes.metrics import duplicate_metric_ids
+
+            for duplicated in duplicate_metric_ids(defs):
+                result.add(f"指标 ID「{duplicated}」在这张口径卡上重复了：同一张卡上的指标 ID 要唯一（下游按 ID 与位置"
+                           f"取数，重复了分不清是哪一条）", node_id=node.id, field="metrics",
+                           code="metrics.id_duplicate")
         elif node.type == NodeType.DUAL_CHECK:
             _check_dual_check(node, spec, result)
         elif node.type == NodeType.REPORT:
@@ -2028,6 +2040,16 @@ def _caliber_from_issues(node: GraphNode, policies: set[str], labels: dict[str, 
                 elif new not in upstream:
                     add(f"「{field_label('caliber_from')}」改名后的取数节点「{nodes[new].title}」不在口径卡的上游：口径卡计算时"
                         "它还没有执行。请把它连到口径卡之前", "caliber_from.nodes")
+    # K08：可选指标选择（caliber_from.metrics）。这里只看形状——钉住那一版的指标清单不在本图里，具体有没有这个指标
+    # 由运行时按那一版判（未知、空的选择运行时响亮失败，绝不退回整卡）
+    selection = ref.get("metrics")
+    if selection is not None:
+        if isinstance(selection, (str, bytes)) or not isinstance(selection, list) \
+                or any(not isinstance(m, str) or not m.strip() for m in selection):
+            add(f"「{field_label('caliber_from')}」的指标选择（metrics）要写成一串指标 id", "caliber_from.metrics")
+        elif not selection:
+            add(f"「{field_label('caliber_from')}」的指标选择（metrics）是空的：一个指标也不选。不写表示按整卡算，"
+                "要选就点名要算的指标", "caliber_from.metrics")
     if cfg.get("metrics"):
         add(f"已设置「{field_label('caliber_from')}」，将按所引用的口径卡计算，此处填写的「{field_label('metrics')}」"
             "不会生效", "metrics", level="warning")

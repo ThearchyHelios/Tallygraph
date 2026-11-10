@@ -17,8 +17,9 @@ SELECT，服务端把 SQL、入口字段、口径卡、报告串成图，后台�
 就没有值，图能建但出不了数。
 
 **为什么 build_graph 收多组 blocks。** 一张草稿图原来只能挂一条 SQL，业务文档几十条指标得分几十次起草、几十张图。取数
-节点多几个、口径卡读全部，试跑一次就跑完；入口字段按 name 合并，同名但类型/必填对不上就抛 ValueError——那是两份草案自己
-打架，调用方当成问题记下来，比悄悄取一个更能让人发现。
+节点多几个、口径卡读全部，试跑一次就跑完；入口字段按 name 合并，必填取并集、类型按一条固定的合并规则定（见 _merged_type，
+结果与各组先后无关），默认值冲突就清掉默认值要求人填。不抛错、也不悄悄取某一组：不一致的地方记进 entry_notes 摆给起草的
+人看（早先这里抛 ValueError，一份 34 条指标的草稿因为一个字段的 required 不同就整份作废）。
 
 **为什么引用核对还是照 docdraft 的老规矩。** 定义的事实来源还是文档原文。模型转述得再像，也要能在原文里逐字定位；一条
 引用都核不上的指标整条丢弃，写进 problems 交给人看。这里只做校验，不改 docdraft 的规则。
@@ -40,6 +41,8 @@ MAX_INPUT_CHARS = docdraft.MAX_INPUT_CHARS
 MAX_TABLES_CHARS = 24000
 #: 取数 SQL 的长度上限（字符）。再长的查询不是草稿该承载的
 MAX_SQL_CHARS = 20000
+#: 这一版提示词的版本（改了 _SYSTEM 就 +1）。写进草稿的提示记录，历史结果才知道是按哪一版起草的。
+PROMPT_VERSION = 1
 
 #: 入口字段能写的类型（apps/spec.FORM_TYPES 的子集；日期用 string + description 说清）
 ENTRY_TYPES = ("string", "number", "integer", "boolean")
@@ -189,15 +192,19 @@ def _chars(messages: list[Any]) -> int:
     return sum(len(str(getattr(message, "content", "") or "")) for message in messages)
 
 
-def _fit(docs: list[dict], chunks: dict[str, dict], guidance: str,
-         datasource: dict | None, tables_text: str,
-         covered: Sequence[str] = (), fixed: str = "") -> tuple[dict[str, dict], str, bool, bool]:
+def fit_material(docs: list[dict], chunks: dict[str, dict], guidance: str,
+                 datasource: dict | None, tables_text: str,
+                 covered: Sequence[str] = (), fixed: str = "") -> tuple[dict[str, dict], str, bool, bool]:
     """把材料压到 MAX_INPUT_CHARS 以内：先截表目录尾部，再从后往前按 chunk 边界丢，最后截仅剩的那一段。
+    返回 (真正进提示的 chunk, 真正进提示的目录, doc_truncated, catalog_truncated)。
 
     表目录先截：SQL 必须写在目录里的表上，目录比文档的细枝末节更硬；被截掉的是表详情，表名索引还在最前面。
 
     截断来源分开报：doc_truncated 是文档段落被丢/被截，catalog_truncated 是表目录被截。调用方要能说清「指标没覆盖
     完，是因为原文没给全，还是因为目录没给全」——改文档、改目录是两件不同的事。
+
+    **返回值就是「模型实际看到的材料」。** 调用方拿它去核对引用（不能引用被丢掉的段落）、记进提示记录；也可以自己
+    先算一次、把结果传回 plan / plan_groups / repair_group，免得同一份材料在两处各算一遍、算得不一样。
     """
     kept = dict(chunks)
     tables = tables_text
@@ -264,12 +271,15 @@ def _salvage_reply(text: str) -> dict:
 
 async def plan(session: Any, *, docs: list[dict], chunks: dict[str, dict], guidance: str = "",
                datasource: dict | None = None, tables_text: str = "", model: Any = None,
-               covered: Sequence[str] = (), fixed: str = "") -> dict:
+               covered: Sequence[str] = (), fixed: str = "",
+               fitted: tuple[dict[str, dict], str, bool, bool] | None = None) -> dict:
     """一次模型调用，返回 {entry_fields, sql, metrics, open_questions, model_id, doc_truncated,
-    catalog_truncated, truncated}（未校验）。
+    catalog_truncated, truncated, visible_chunk_ids, prompt_version, parse_version}（未校验）。
 
     covered 是前几轮已经起草过的指标名，写进提示词让模型不要重复；fixed 是「每次都不变的条件」（工厂、产线、
     属性组），提示词要求它写死在 sql 里、不做成入口字段。调用方按 uncovered 续跑，直到 covered 不再增长。
+    截断情况与 visible_chunk_ids 说的是同一份材料：**实际进了这次提示的**那几段，被 fit_material 丢掉的段落不在里面，
+    引用它也核不上。fitted 是调用方先算好的材料（fit_material 的返回值），给了就用它，不给这里自己算。
     truncated 仍是两者的「或」，老前端只认这一个键。不落库。model 可注入（测试用假对象：有 async ainvoke(messages)，
     回复有 .content）；不给就按设置解析，模型不可用时抛 docdraft.DraftUnavailable。SQL 的对错、引用能不能核对，交给
     normalize_plan。
@@ -286,8 +296,9 @@ async def plan(session: Any, *, docs: list[dict], chunks: dict[str, dict], guida
         named = getattr(model, "model_name", None) or getattr(model, "model", None)
         model_id = named if isinstance(named, str) else ""
 
-    kept, tables, doc_truncated, catalog_truncated = _fit(docs, chunks, guidance, datasource, tables_text,
-                                                          covered, fixed)
+    if fitted is None:
+        fitted = fit_material(docs, chunks, guidance, datasource, tables_text, covered, fixed)
+    kept, tables, doc_truncated, catalog_truncated = fitted
     reply = await model.ainvoke(prompt(docs, kept, guidance, datasource, tables, covered, fixed))
     text = message_text(reply)
     salvaged = False
@@ -320,6 +331,9 @@ async def plan(session: Any, *, docs: list[dict], chunks: dict[str, dict], guida
         "salvaged": salvaged,
         "diagnostics": diagnostics,
         "model_id": model_id,
+        "visible_chunk_ids": _order(kept),
+        "prompt_version": PROMPT_VERSION,
+        "parse_version": docdraft.PARSE_VERSION,
         "doc_truncated": doc_truncated,
         "catalog_truncated": catalog_truncated,
         "truncated": doc_truncated or catalog_truncated,
@@ -341,12 +355,17 @@ def _reply_groups(data: Mapping) -> list[dict]:
 
 async def plan_groups(session: Any, *, docs: list[dict], chunks: dict[str, dict], guidance: str = "",
                       datasource: dict | None = None, tables_text: str = "", model: Any = None,
-                      covered: Sequence[str] = (), fixed: str = "") -> dict:
-    """一次模型调用，交回**多组**草案（未校验）：{groups, open_questions, uncovered, model_id, ...}。
+                      covered: Sequence[str] = (), fixed: str = "",
+                      fitted: tuple[dict[str, dict], str, bool, bool] | None = None) -> dict:
+    """一次模型调用，交回**多组**草案（未校验）：{groups, open_questions, uncovered, model_id,
+    visible_chunk_ids, prompt_version, parse_version, ...}。
 
     和 plan() 的区别只在输出形状：模型一次尽量交几组「能共用一条 SQL 的指标」，剩下的写 uncovered；调用方不必为一组
     指标各调一次模型。每组的结构仍是 {sql, entry_fields, metrics}，交给 normalize_plan 逐组校验；一组不合格只丢那一组，
     不影响别的组。旧形状（顶层 sql + metrics）也收，当成只有一组——模型不按新格式回时不用整份作废。
+
+    fitted 是调用方先算好的材料（fit_material 的返回值）。给了就用它，调用方由此知道自己看到的 visible_chunk_ids
+    与实际提示一致，不必再算一遍；不给这里自己算（其它入口照旧）。
     """
     from app.engine.state import message_text
 
@@ -360,8 +379,9 @@ async def plan_groups(session: Any, *, docs: list[dict], chunks: dict[str, dict]
         named = getattr(model, "model_name", None) or getattr(model, "model", None)
         model_id = named if isinstance(named, str) else ""
 
-    kept, tables, doc_truncated, catalog_truncated = _fit(docs, chunks, guidance, datasource, tables_text,
-                                                          covered, fixed)
+    if fitted is None:
+        fitted = fit_material(docs, chunks, guidance, datasource, tables_text, covered, fixed)
+    kept, tables, doc_truncated, catalog_truncated = fitted
     reply = await model.ainvoke(prompt(docs, kept, guidance, datasource, tables, covered, fixed))
     text = message_text(reply)
     salvaged = False
@@ -392,6 +412,9 @@ async def plan_groups(session: Any, *, docs: list[dict], chunks: dict[str, dict]
         "salvaged": salvaged,
         "diagnostics": diagnostics,
         "model_id": model_id,
+        "visible_chunk_ids": _order(kept),
+        "prompt_version": PROMPT_VERSION,
+        "parse_version": docdraft.PARSE_VERSION,
         "doc_truncated": doc_truncated,
         "catalog_truncated": catalog_truncated,
         "truncated": doc_truncated or catalog_truncated,
@@ -400,10 +423,13 @@ async def plan_groups(session: Any, *, docs: list[dict], chunks: dict[str, dict]
 
 async def repair_group(session: Any, *, group: Mapping, problems: list[dict], docs: list[dict],
                        chunks: dict[str, dict], guidance: str = "", datasource: dict | None = None,
-                       tables_text: str = "", model: Any = None, fixed: str = "") -> dict:
+                       tables_text: str = "", model: Any = None, fixed: str = "",
+                       fitted: tuple[dict[str, dict], str, bool, bool] | None = None) -> dict:
     """只重写一组：把这一组原来的指标和没通过校验的原因交回模型，返回修好的原始组（未校验）。
 
     修不出来返回 {}，由调用方照实记失败，不让整份草稿跟着作废。修的时候只给这一组的指标名和问题，不让模型重排别的组。
+    fitted 是调用方先算好的材料（fit_material 的返回值，与本次提示一致）。给了就用它，引用核对与本轮其它调用用同一份
+    可见材料；不给这里自己算。
     """
     from app.engine.state import message_text
 
@@ -413,8 +439,9 @@ async def repair_group(session: Any, *, group: Mapping, problems: list[dict], do
         model, _model_id, availability = await resolve_draft_model(session)
         if model is None or not getattr(availability, "available", False):
             raise docdraft.DraftUnavailable(getattr(availability, "reason", "") or "AI 起草不可用")
-    kept, tables, _doc_truncated, _catalog_truncated = _fit(docs, chunks, guidance, datasource, tables_text,
-                                                            (), fixed)
+    if fitted is None:
+        fitted = fit_material(docs, chunks, guidance, datasource, tables_text, (), fixed)
+    kept, tables = fitted[0], fitted[1]
     names = [str(metric.get("name") or metric.get("id")) for metric in group.get("metrics") or []
              if isinstance(metric, Mapping) and (metric.get("name") or metric.get("id"))]
     reasons = "；".join(f"{problem.get('name') or '问题'}：{problem.get('reason') or ''}"
@@ -431,6 +458,13 @@ async def repair_group(session: Any, *, group: Mapping, problems: list[dict], do
         data = _salvage_reply(text)
     groups = _reply_groups(data)
     return groups[0] if groups else {}
+
+
+def _entry_type(value: Any) -> str:
+    """入口字段声明的类型规范成 ENTRY_TYPES 里的一个词：认不出的按文字（apps.forms.input_schema 也按同一套认）。
+
+    起草时（_entry_fields）和合并各组声明时（_merged_type）用同一份判断：这套写法从哪个入口进来，认出来的都是同一个词。"""
+    return value if value in ENTRY_TYPES else "string"
 
 
 def _entry_fields(value: Any, problems: list[dict]) -> list[dict]:
@@ -450,9 +484,7 @@ def _entry_fields(value: Any, problems: list[dict]) -> list[dict]:
             problems.append({"name": name, "reason": "入口字段重名"})
             continue
         seen.add(name)
-        kind = item.get("type")
-        if kind not in ENTRY_TYPES:
-            kind = "string"
+        kind = _entry_type(item.get("type"))
         default = item.get("default")
         if not isinstance(default, (str, int, float, bool)):
             default = None
@@ -648,12 +680,25 @@ def _blocks(value: Any) -> list[dict]:
     return [dict(block) for block in value or [] if isinstance(block, Mapping)]
 
 
+def _merged_type(left: str, right: str) -> str:
+    """两组把同一个入口字段声明成不同（已规范的）类型时，合并成什么：两边对调结果一样，与哪一组先出现无关（R02）。
+
+    - 整数和数都是数（records.store.union_compatible 也把这两类算一列）：并成数——数能填小数，能把整数那一组的值收下，
+      反过来 3.5 会被「整数」拒收；
+    - 别的组合一律并成文字：文字跟谁都能并；是或否和数/整数不能互相表示（true 不是 1），退回文字让人填，不拿某一组的
+      说法去判另一组的值。合并结果永远落在 ENTRY_TYPES 里。"""
+    if left == right:
+        return left
+    return "number" if {left, right} <= {"number", "integer"} else "string"
+
+
 def _merge_fields(target: dict[str, dict], value: Any, notes: list[str], conflicts: set[str]) -> None:
     """入口字段按 name 合并，冲突取更保守的一边，**不抛错**。
 
     同一份文档分几轮起草，各组对同一个字段的声明常常对不上：一组说必填、另一组给了缺省；一组按数、另一组按文本。
-    这不是错误——它们本来就是从不同批指标里各看了一次。合并时必填取并集（有一组要就必须给），类型取更宽的一个
-    （能填进文本）。默认值冲突时清掉默认值、要求人填，不能自动把某一组的范围用于其他组；0 和 False 都是有效值。
+    这不是错误——它们本来就是从不同批指标里各看了一次。合并时必填取并集（有一组要就必须给），类型按 _merged_type 的
+    规则定（数+整数并成数，别的并成文字，结果与各组先后无关）。默认值冲突时清掉默认值、要求人填，不能自动把某一组
+    的范围用于其他组；0 和 False 都是有效值。
 
     早先这里抛 ValueError，结果一份 34 条指标的草稿因为一个字段的 required 不同就整份作废——代价完全不成比例。
     """
@@ -665,15 +710,15 @@ def _merge_fields(target: dict[str, dict], value: Any, notes: list[str], conflic
             continue
         item = dict(field)
         item["name"] = name
+        item["type"] = _entry_type(item.get("type"))
         old = target.get(name)
         if old is None:
             target[name] = item
             continue
         merged = dict(old)
-        old_type = str(old.get("type") or "string")
-        new_type = str(item.get("type") or "string")
+        old_type, new_type = _entry_type(old.get("type")), item["type"]
+        merged["type"] = _merged_type(old_type, new_type)
         if old_type != new_type:
-            merged["type"] = "string" if "string" in (old_type, new_type) else old_type
             notes.append(f"入口字段「{name}」在各组里的类型不一致（{old_type} / {new_type}），按「{merged['type']}」合并")
         if bool(old.get("required")) != bool(item.get("required")):
             merged["required"] = bool(old.get("required")) or bool(item.get("required"))
@@ -799,4 +844,5 @@ def build_graph(blocks: Any, *, name: str, question: str = "", datasource: str =
 
 
 __all__ = ["ENTRY_TYPES", "MAX_INPUT_CHARS", "MAX_SQL_CHARS", "MAX_TABLES_CHARS", "METRIC_FIELDS",
-           "build_graph", "normalize_plan", "plan", "plan_groups", "prompt", "repair_group", "unique_metric_ids"]
+           "PROMPT_VERSION", "build_graph", "fit_material", "normalize_plan", "plan", "plan_groups",
+           "prompt", "repair_group", "unique_metric_ids"]
