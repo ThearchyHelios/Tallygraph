@@ -234,7 +234,7 @@ export const LEDGER_UI = {
   drafts: {
     entry: '新增口径',
     title: '从业务文档起草口径',
-    subtitle: '文档整理成定义和取数，自动试运行一次；去画布审改后由人签字发布',
+    subtitle: '先导入指标定义，再选择指标绑定数据、验证并发布；已有口径继续沿用',
     back: '返回口径目录',
     refresh: '刷新',
     /** 列表按阶段筛：全部、起草中、待审、已丢弃、失败。ready / questions_open / path_pending / attached 都归「待审」 */
@@ -263,6 +263,11 @@ export const LEDGER_UI = {
     /** 细状态里值得在阶段旁边多说一句的：没有图、接了运行 */
     stageNote: (status: string) => status === 'path_pending' ? '还没有取数图'
       : status === 'attached' ? '已接上一次运行' : '',
+    stageNoteNeedsGraph: '尚未生成取数图 · 待补充信息',
+    inventoryAwaitingHint: '定义已保留；请在上方「继续处理未完成指标」补充来源表、字段映射或固定条件后继续生成。',
+    questionsContinuationHint: '若需补齐表名、字段映射或计算口径，请在上方「继续处理未完成指标」填写说明以重新生成；下方勾选仅用于标记业务疑问已人工确认。',
+    droppedMore: (n: number) => `展开其余 ${formatNumber(n)} 条`,
+    droppedLess: '收起',
     filterLabel: '按阶段筛',
     summary: (metrics: number, questions: number) => `${formatNumber(metrics)} 个指标 · ${
       questions ? `${formatNumber(questions)} 个未决问题` : '没有未决问题'}`,
@@ -274,7 +279,7 @@ export const LEDGER_UI = {
     // ---- 发起：选文档、可选数据源和起草要求 ----
     start: '起草一份新口径',
     documents: '文档',
-    documentsHint: '从知识库里选；模型只读这些文档的段落',
+    documentsHint: '从知识库选择指标定义表；先保留公式、边界规则和原文，再生成取数',
     noDocuments: '知识库里还没有已完成的文档',
     noDocumentsBody: '先在知识页上传业务文档，切块完成后再来起草',
     documentMeta: (collection: string, chunks: number) => `${collection} · ${formatNumber(chunks)} 段`,

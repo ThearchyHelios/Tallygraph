@@ -102,10 +102,16 @@ class _Projection:
             return event
         node_id = str(event.get("node_id") or "")
         failure = str(event.get("type") or "") in FAILURE_EVENTS
-        if node_id in self.nodes or str(data.get("tool") or "") == CALIBER_QUERY \
+        tool_name = str(data.get("tool") or "")
+        if node_id in self.nodes or tool_name in (CALIBER_QUERY, "ontology_neighbors", "source_health") \
                 or str(data.get("node_id") or "") in self.nodes \
                 or (failure and safe_failure(data.get("error")) is not None):
             safe = {k: v for k, v in data.items() if k in SAFE_EVENT_KEYS}
+            if isinstance(data.get("health_artifact"), Mapping):
+                safe["health_artifact"] = {
+                    k: v for k, v in data["health_artifact"].items()
+                    if k in ("ref", "verdict", "phrase")
+                }
             result = result_summary(data.get("artifact")) or safe_result(data.get("preview"))
             if result is not None:
                 safe["result"] = result
@@ -138,9 +144,12 @@ def _caliber_nodes(graph: Any) -> set[str]:
 
 
 def _touches_caliber(config: Mapping[str, Any]) -> bool:
-    """这个节点的配置里有没有口径的身份：绑了口径查询，或者是一张转抄卡。"""
-    bound = config.get("tools") if isinstance(config.get("tools"), list) else []
-    if config.get("tool") == CALIBER_QUERY or CALIBER_QUERY in [t for t in bound if isinstance(t, str)]:
+    """这个节点的配置里有没有口径的身份：绑了口径查询/本体邻居，或者是一张转抄卡。"""
+    bound = [t for t in (config.get("tools") if isinstance(config.get("tools"), list) else []) if isinstance(t, str)]
+    caliber_tools = {CALIBER_QUERY, "ontology_neighbors"}
+    if str(config.get("tool") or "") in caliber_tools or any(t in caliber_tools for t in bound):
+        return True
+    if config.get("tool") == "source_health" and isinstance(config.get("args"), Mapping) and config["args"].get("workflow"):
         return True
     return config.get("caliber_from") not in (None, "", {})
 
@@ -151,10 +160,13 @@ def _safe_config(config: Mapping[str, Any]) -> dict[str, Any]:
     别的键（节点自己的说明、inputs 的值、工具清单）一个字不动——「使用者的图长什么样」照旧看得见，看不见的只是
     「调的是哪一份工作流的哪一版」。"""
     out = dict(config)
-    if out.get("tool") == CALIBER_QUERY and "args" in out:
+    caliber_tools = {CALIBER_QUERY, "ontology_neighbors"}
+    if (str(out.get("tool") or "") in caliber_tools or (
+        out.get("tool") == "source_health" and isinstance(out.get("args"), Mapping) and out["args"].get("workflow")
+    )) and "args" in out:
         out["args"] = dict(CALIBER_ARGS_NOTE)
-    bound = out.get("tools") if isinstance(out.get("tools"), list) else []
-    if out.get("tool") == CALIBER_QUERY or CALIBER_QUERY in [t for t in bound if isinstance(t, str)]:
+    bound = [t for t in (out.get("tools") if isinstance(out.get("tools"), list) else []) if isinstance(t, str)]
+    if str(out.get("tool") or "") in caliber_tools or any(t in caliber_tools for t in bound):
         for key in ("prompt", "instructions"):
             if key in out:
                 out[key] = safe_call_text(out[key])

@@ -49,18 +49,25 @@ from app.providers.factory import (
 )
 from app.engine.sql_problems import event_checks
 from app.data import catalog_view
+from app.data.source_health import ledger_entry as health_ledger_entry
+from app.ledger.querycore import CALIBER_QUERY
 from app.tools.analysis import (
     REFUSED_CODE as ANALYSIS_REFUSED,
     SCOPE_KEY as ANALYSIS_SCOPE_KEY,
     AnalysisScope,
     call_error_text,
     event_view,
+    health_event_view,
+    health_payload_of,
+    health_reply_text,
     input_snapshot,
     is_analysis_tool,
     payload_of,
+    record_ontology_call,
     reply_text,
     run_snapshot,
 )
+from app.tools.ontology import ONTOLOGY_TOOLS, SOURCE_HEALTH
 from app.tools.datasource import QUERY_PREFIX, run_masks_results, run_reads_only, run_scope_fixed, run_versions
 from app.tools.registry import (
     ToolArgsError,
@@ -132,6 +139,10 @@ async def _build_messages(state: GraphState, ctx: NodeContext, tools: list[BaseT
     messages: list[BaseMessage] = []
 
     system_parts: list[str] = []
+    if ctx.cfg("ask_data_optimization") == 1:
+        from app.chat.optimization import CONCISE_RULE
+
+        system_parts.append(CONCISE_RULE)
     system = ctx.render_str(ctx.cfg("system", ""), state)
     if system:
         system_parts.append(system)
@@ -421,7 +432,8 @@ def _guard(ctx: NodeContext, model_id: str) -> Guard | None:
         {k: ctx.cfg(k) for k in ("max_steps", "budget_tokens", "budget_usd")},
         ctx.run.agent_limits, settings.max_agent_steps,
     )
-    return Guard(limits=limits, window=catalog.find_context(model_id) or FALLBACK_CONTEXT)
+    return Guard(limits=limits, window=catalog.find_context(model_id) or FALLBACK_CONTEXT,
+                 canonical_calls=ctx.cfg("ask_data_optimization") in (1, 2))
 
 
 def _policy(ctx: NodeContext, tool: BaseTool, args: dict[str, Any], granted: set[str]) -> str:
@@ -456,9 +468,12 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         except ProviderNotConfigured as e:
             raise NodeError(ctx.node.id, not_configured(e)) from e
 
-    # 绑了分析工具才建分析容器：本节点查过的结果、做过的分析都放在这里（app/tools/analysis.py），编号和交回模型的一致
+    # 绑了分析工具、本体工具、口径查询或显式开启调查策略时建分析容器：本节点查过的结果、做过的分析与健康核查都放在这里
+    bound_names = ctx.cfg("tools", []) or []
     scope = (AnalysisScope(node_id=ctx.node.id, snapshot=run_snapshot(ctx.run))
-             if any(is_analysis_tool(n) for n in ctx.cfg("tools", []) or []) else None)
+             if (any(is_analysis_tool(n) or n in ONTOLOGY_TOOLS or n == CALIBER_QUERY for n in bound_names)
+                 or bool(ctx.cfg("investigation")))
+             else None)
     tools = await _resolve_tools(ctx, state, scope)
     tool_map = {t.name: t for t in tools}
     # 默认串行：一轮只调一个工具，拿到结果再想下一步。并行更快，但一批工具
@@ -493,12 +508,54 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             total_usage[key] += usage[key]
         total_usage["cost_usd"] = round(total_usage["cost_usd"] + usage["cost_usd"], 6)
 
+    inline_evidence = ctx.cfg("ask_data_optimization") == 2 and evidence_on
+
+    def _live_catalog() -> dict[str, Any]:
+        from app.engine.evidence import build_catalog
+
+        return build_catalog(
+            nodes=state.get("nodes") or {},
+            ledger=[*(state.get("evidence") or []), *entries],
+            inputs=state.get("input") or {},
+        )
+
+    class _InlineStreamProxy:
+        def __init__(self, inner_ctx: NodeContext, live_cat: dict[str, Any]) -> None:
+            from app.engine.evidence import StreamRenderer
+
+            self._ctx = inner_ctx
+            self._cat = live_cat
+            self._renderer = StreamRenderer(live_cat, cells_allowed=True)
+
+        def __getattr__(self, attr: str) -> Any:
+            return getattr(self._ctx, attr)
+
+        def emit(self, event_type: EventType | str, **data: Any) -> None:
+            if event_type == EventType.LLM_TOKEN:
+                if txt := self._renderer.feed(str(data.get("delta") or "")):
+                    self._ctx.emit(EventType.LLM_TOKEN, delta=txt)
+                return
+            if event_type == EventType.LOG and data.get("code") == "stream_fallback":
+                from app.engine.evidence import StreamRenderer
+
+                self._renderer = StreamRenderer(self._cat, cells_allowed=True)
+            self._ctx.emit(event_type, **data)
+
+        def flush(self) -> None:
+            if tail := self._renderer.flush():
+                self._ctx.emit(EventType.LLM_TOKEN, delta=tail)
+
     # @task 的返回值会进 checkpoint：人工审批导致节点重放时，
     # 之前已经完成的模型调用和工具执行不会重跑，也就不会重复计费。
     @task
     async def llm_step(step: int, payload: list[BaseMessage]) -> BaseMessage:
         started = time.perf_counter()
-        response = await _invoke_streaming(model, payload, ctx, model_id)
+        if inline_evidence and any(e.get("kind") == "query" for e in entries):
+            proxy = _InlineStreamProxy(ctx, _live_catalog())
+            response = await _invoke_streaming(model, payload, proxy, model_id)  # type: ignore[arg-type]
+            proxy.flush()
+        else:
+            response = await _invoke_streaming(model, payload, ctx, model_id)
         _report(response, started)
         return response
 
@@ -507,7 +564,12 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 用 base_model 而不是上面那个绑过工具的 model：收尾轮必须在**结构上**
         # 发不出工具调用，靠提示词说"别调工具"是约束不住的
         started = time.perf_counter()
-        response = await _invoke_streaming(base_model, payload, ctx, model_id)
+        if inline_evidence and any(e.get("kind") == "query" for e in entries):
+            proxy = _InlineStreamProxy(ctx, _live_catalog())
+            response = await _invoke_streaming(base_model, payload, proxy, model_id)  # type: ignore[arg-type]
+            proxy.flush()
+        else:
+            response = await _invoke_streaming(base_model, payload, ctx, model_id)
         _report(response, started)
         return response
 
@@ -570,6 +632,8 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 交回模型的「【分析 An】」是同一个（_record_call 紧接着按同一个容器编），不记台账的执行没有编号
         analysis = payload_of(content) if ok and is_analysis_tool(name) else None
         alias = scope.next_alias() if analysis and scope is not None and evidence_on else None
+        health = health_payload_of(content) if ok and name == SOURCE_HEALTH else None
+        health_alias = scope.next_health_alias() if health and scope is not None and evidence_on else None
         ctx.emit(
             EventType.TOOL_END if ok else EventType.TOOL_ERROR,
             tool=name,
@@ -582,6 +646,8 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             **({"query_artifacts": [q["artifact"] for q in queries]} if len(queries) > 1 else {}),
             **({"analysis_artifact": analysis["artifact"], "analysis": event_view(analysis["result"], alias)}
                if analysis else {}),
+            **({"health_artifact": health["artifact"], "source_health": health_event_view(health["result"], health_alias)}
+               if health else {}),
             # 查询当时数据源的表结构快照：和查询快照一样落在封存范围内，证据接口从这里认它
             **({"schema_artifact": first["schema_artifact"]} if first and first.get("schema_artifact") else {}),
             # 这次查询的 SQL 检查结果单独带上：preview 截到前 2000 个字符，checks 通常在截掉的那段里
@@ -804,12 +870,17 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
             outcome = await tool_step(step, name, args, call_id)
             content = outcome["content"]
+            if outcome["ok"]:
+                record_ontology_call(scope, name, content)
             record = {"tool": name, "args": args, "ok": outcome["ok"],
                       "duration_ms": outcome["duration_ms"], "result": content[:4000]}
             if evidence_on:
                 # 编号只取决于 tool_step 的返回值（重放时取自 checkpoint），重放出来的还是这一套
                 content = _record_call(ctx.node.id, exec_no, call_id, name, args, outcome, record,
                                        queries, entries, scope, run_id=ctx.run.run_id)
+            elif scope is not None and outcome["ok"] and name == SOURCE_HEALTH:
+                if found_health := health_payload_of(content):
+                    scope.add_health(found_health["result"], found_health["artifact"])
             transcript.append(record)
             messages.append(ToolMessage(content=content, tool_call_id=call_id))
             if guard:
@@ -925,9 +996,22 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             extra = {"max_tokens": extracted.get("max_tokens")} if code == "agent_field_truncated" else {}
             await once(ctx, EventType.LOG, level="warn", code=code, message=message, fields=names, **extra)
 
+    raw_final_text: str | None = None
+    shown_text = final_text
+    if inline_evidence and final_text:
+        raw_final_text = final_text
+        if any(e.get("kind") == "query" for e in entries):
+            from app.chat.direct_evidence import normalize_and_bind_fast_citations
+            from app.engine.evidence import render_markers
+
+            live_cat = _live_catalog()
+            cleaned_raw = normalize_and_bind_fast_citations(final_text, live_cat)
+            shown_text = render_markers(cleaned_raw, live_cat, cells_allowed=True)
+
     total_usage["total_tokens"] = total_usage["input_tokens"] + total_usage["output_tokens"]
     result = {
-        "text": final_text,
+        "text": shown_text,
+        **({"raw_text": raw_final_text} if raw_final_text is not None else {}),
         "steps": len(transcript),
         **({"investigation": investigation} if investigation["active"] else {}),
         "tool_calls": transcript,
@@ -944,11 +1028,11 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if entries:
         updates["evidence"] = entries
     if ctx.cfg("emit_message", True):
-        updates["messages"] = [AIMessage(content=final_text or "（空）")]
+        updates["messages"] = [AIMessage(content=shown_text or "（空）")]
     var_name = ctx.cfg("assign_to", "")
     if var_name:
         # 开了 cite_fields 的，变量里是核对过的 data（值以快照为准），下游口径卡按字段取
-        updates["vars"] = {var_name: cited[0] if cited is not None else final_text}
+        updates["vars"] = {var_name: cited[0] if cited is not None else shown_text}
     return updates
 
 
@@ -987,6 +1071,15 @@ def _record_call(node_id: str, exec_no: int, call_id: str, name: str, args: dict
         entries.append(ledger_entry(found["result"], node_id=node_id, exec_no=exec_no, artifact=found["artifact"],
                                     call_id=call_id))
         return reply_text(alias, found["result"])
+    if scope is not None and outcome.get("ok") and name == SOURCE_HEALTH:
+        found_health = health_payload_of(content)
+        if found_health is None:
+            return content
+        h_alias = scope.add_health(found_health["result"], found_health["artifact"])
+        record.update(alias=h_alias, health_artifact=found_health["artifact"])
+        entries.append(health_ledger_entry(found_health["result"], node_id=node_id, exec_no=exec_no,
+                                           artifact=found_health["artifact"], call_id=call_id))
+        return health_reply_text(h_alias, found_health["result"])
     items = _called_queries(outcome, content, name)
     if not items:
         return content

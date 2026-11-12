@@ -38,8 +38,8 @@ def graph() -> dict:
 
 def test_the_template_is_listed_once_after_the_others():
     names = [t["name"] for t in TEMPLATES]
-    assert names.count(NAME) == 1 and names[-1] == NAME
-    assert any(n.startswith("⑨ 可追溯周报") for n in names)
+    nine = next(n for n in names if n.startswith("⑨ 可追溯周报"))
+    assert names.count(NAME) == 1 and names.index(NAME) > names.index(nine)
 
 
 def test_the_template_passes_validation():

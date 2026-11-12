@@ -401,7 +401,8 @@ function AnalysisItemList({ nodeId, value, issues, onChange }: {
             </div>
           )
         }
-        const specs = op ? paramSpecs(op, item.mode).filter((p) => !(two && TWO_QUERY_SKIP.has(p.key))) : []
+        const skipTwoPeriods = two && op !== 'cochange'
+        const specs = op ? paramSpecs(op, item.mode).filter((p) => !(skipTwoPeriods && TWO_QUERY_SKIP.has(p.key))) : []
         const headline = params.headline && typeof params.headline === 'object' ? params.headline as Record<string, string> : null
         const setHeadline = (side: 'base' | 'target', t: string) => {
           const next = { base: headline?.base ?? '', target: headline?.target ?? '', [side]: t.trim() }
@@ -412,7 +413,9 @@ function AnalysisItemList({ nodeId, value, issues, onChange }: {
           if (on) {
             next.base_query = item.from ?? ''
             next.target_query = ''
-            for (const k of TWO_QUERY_SKIP) delete next[k]
+            if (op !== 'cochange') {
+              for (const k of TWO_QUERY_SKIP) delete next[k]
+            }
             update(i, { ...item, from: undefined, params: next })
           } else {
             const from = typeof next.base_query === 'string' ? next.base_query : ''

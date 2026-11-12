@@ -1429,3 +1429,6 @@ from app.db import models_triggers  # noqa: E402,F401
 # 编排完善第 2 波 W2-b（docs/design/orchestration-round/00-总方案.md §5）：多进程协调——工作进程的登记和租约、调度当班、
 # 跨进程的请求、运行的并发名额、同源队、按时间窗的计数
 from app.db import models_cluster  # noqa: E402,F401
+# 指标本体穿透（W1-a）：标准业务实体与跨源映射
+from app.db import models_ontology  # noqa: E402,F401
+from app.db.models_ontology import CanonicalEntity  # noqa: E402,F401

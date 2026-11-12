@@ -33,14 +33,14 @@ logger = logging.getLogger(__name__)
 
 #: 候选维度「取值不多」的上限：码值表里的取值不超过这么多（取值观察最多也只取这么多，data/catalog_profile_observe）
 CANDIDATE_MAX = 50
-#: 现象：可比性、基线、趋势
-_PHENOMENA = ("comparable", "baseline", "trend")
+#: 现象：可比性、基线、趋势、跨源对账、跨源联动
+_PHENOMENA = ("comparable", "baseline", "trend", "reconcile", "cochange")
 #: 事实表的表类型（数据目录的 kind）：流水、日志也是一行一件事
 _FACT_KINDS = ("fact", "log")
 #: 候选维度的度量类型
 _DIMENSION_MEASURES = ("attribute", "status")
-#: 拆解的输入快照（下钻的上一层不是快照）
-_DATA_ROLES = ("data", "base", "target")
+#: 分析算子的输入快照（下钻的上一层不是快照）
+_DATA_ROLES = ("data", "base", "target", "primary", "counterpart", "driver")
 
 NOTE_NO_CATALOG = "这次运行读不到数据目录，候选维度核对不了"
 NOTE_NO_NOTES = "拆解所用的数据源还没有数据目录，候选维度核对不了"
@@ -288,7 +288,8 @@ def build(catalog: Mapping[str, Any], *, sources: Mapping[str, Mapping[str, Any]
     decomposes = [r for _, r in ok if r.get("op") == "decompose"]
     excluded = [items[a] for a, r in ok
                 if (r.get("op") == "decompose" and _code(r) == "dispersed")
-                or (r.get("op") == "differ" and _code(r) == "no_evidence")]
+                or (r.get("op") == "differ" and _code(r) == "no_evidence")
+                or (r.get("op") == "cochange" and _code(r) in ("target_normal", "primary_normal", "independent"))]
     tests = sum(1 for _, r in ok if r.get("op") == "differ")
     try:
         missing, note = _undecomposed([r for r in decomposes if _dims(r)], catalog, sources, load)

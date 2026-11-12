@@ -272,6 +272,10 @@ export function sourceOf(seg: EvidenceSegment, doc?: Pick<EvidenceDocData, 'cata
       : loc.key ? E.citedValue(loc.key) : E.citedPhrase
     return [`${E.title} ${cite.alias ?? ''}`.trim(), what].join(' · ')
   }
+  if (cite.kind === 'source_health' || entry?.kind === 'source_health') {
+    const phrase = typeof entry?.phrase === 'string' ? entry.phrase : ''
+    return [`数据源健康核查 ${cite.alias ?? ''}`.trim(), phrase].filter(Boolean).join(' · ')
+  }
   if (cite.kind === 'cell' || (cite.kind !== 'metric' && cite.kind !== 'input' && entry?.kind === 'query')) {
     const where = locatorText(cite.locator)
     return [EVIDENCE_TEXT.query(cite.alias ?? ''), where].filter(Boolean).join(' · ')

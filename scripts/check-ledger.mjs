@@ -520,6 +520,15 @@ await section('使用者看到的入口照服务端的动作：不能出具的�
   check('自动出具过的正式运行：写「按口径自动出具」、哪份口径和档位', issuedText.includes('按口径自动出具')
     && issuedText.includes('「订单口径」v1（已发布）') && issuedText.includes('降档出具'), issuedText)
   check('……使用者不给打开运行的链接，写由搭建者查看', await issued.locator('a').count() === 0 && issuedText.includes('由搭建者在记录页查看'), issuedText)
+  LED.actions = [RECONCILE, { ...RECONCILE }, { ...RECONCILE, query: 'q-another' }]
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  const group = page.locator('[data-ledger-reconcile-group]')
+  await group.waitFor({ state: 'visible' })
+  check('同一口径归组显示，完全重复的入口去重', await group.count() === 1 && (await group.innerText()).includes('2 份取数'))
+  check('多份取数默认收起，不刷屏', !(await group.locator('[data-ledger-turn-reconcile]').first().isVisible()))
+  await group.locator('summary').click()
+  check('展开后仍可分别核对两份取数', await group.locator('[data-ledger-turn-reconcile]').count() === 2
+    && await group.locator('[data-ledger-turn-reconcile]').last().isVisible())
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
 })
 

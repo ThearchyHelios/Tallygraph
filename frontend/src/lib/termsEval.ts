@@ -6,6 +6,7 @@
  */
 import type {
   EvalAnalysisMode, EvalAnalysisOp, EvalAnalysisTools, EvalCatalogMode, EvalCause, EvalE1Band, EvalE3Band, EvalExpectationKind,
+  EvalOntologyTools,
   EvalGoldKind, EvalJudgement, EvalOutcome, EvalPath, EvalRate, EvalStatus, EvalTextOutcome, EvalTransition, EvalTrialStatus,
   EvalTrigger, EvalUpgradePolicy, EvalVerdict,
 } from '../typesEval'
@@ -322,6 +323,7 @@ export const EVAL_TEXT = {
       source: '主要来源', dispersed: '分散，没有主要来源', flat: '基本持平', mix: '主要来自结构变化', rate: '主要来自各段自身的变化',
       mixed: '几方面都有影响', normal: '常规波动', anomaly: '超出常规波动', rising: '上升趋势', falling: '下降趋势',
       no_trend: '没有明显趋势', differs: '差异站得住', no_evidence: '不足以下结论', comparable: '可比', incomparable: '不可比',
+      aligned: '对账一致', diverged: '对账存在偏差', co_anomalous: '伴随异动', target_normal: '驱动未见异动',
     } as Record<EvalJudgement, string>,
     direction: { up: '上升', down: '下降' } as Record<'up' | 'down', string>,
     /** 「主要来源：华东（下降）」「西南高于华东」 */
@@ -375,14 +377,16 @@ export const EVAL_TEXT = {
     title: '发起评测',
     mode: '评测方式',
     modes: {
-      single: '评一次', ab: 'A/B 对照', catalog: '目录贡献对照', analysis_tools: '分析工具贡献对照',
-    } as Record<'single' | 'ab' | 'catalog' | 'analysis_tools', string>,
+      single: '评一次', ab: 'A/B 对照', catalog: '目录贡献对照',
+      analysis_tools: '分析工具贡献对照', ontology_tools: '本体穿透贡献对照',
+    } as Record<'single' | 'ab' | 'catalog' | 'analysis_tools' | 'ontology_tools', string>,
     modeHint: {
       single: '按一组变体评一遍题集',
       ab: '两到三臂各自一组变体，共用同一份期望答案，同一题几臂同时作答',
       catalog: '预设的 A/B：当前目录 vs 关目录，可以再加一臂「只用已核实和已确认的项」，量出数据目录帮了多少',
       analysis_tools: '预设的 A/B：分析工具开 vs 关，量出分析工具（变化拆解、波动基线……）帮了多少',
-    } as Record<'single' | 'ab' | 'catalog' | 'analysis_tools', string>,
+      ontology_tools: '预设的 A/B：本体穿透开 vs 关，量出跨源本体邻居与数据源健康核查帮了多少',
+    } as Record<'single' | 'ab' | 'catalog' | 'analysis_tools' | 'ontology_tools', string>,
     arm: (name: string) => `${name} 臂`,
     addArm: '再加一臂',
     removeArm: '去掉这一臂',
@@ -407,6 +411,9 @@ export const EVAL_TEXT = {
     analysisTools: '分析工具',
     analysisToolsMode: { on: '开', off: '关' } as Record<EvalAnalysisTools, string>,
     analysisToolsHint: '关掉时助手建图看不到分析工具和分析卡；工作流题按固定的版本运行，不受影响',
+    ontologyTools: '本体穿透',
+    ontologyToolsMode: { on: '开', off: '关' } as Record<EvalOntologyTools, string>,
+    ontologyToolsHint: '关掉时助手建图看不到本体穿透与源健康核查工具及邻居提示；工作流题按固定的版本运行，不受影响',
     repeats: '每题重复几次',
     repeatsHint: '模型有随机性：对照建议每题 3 次',
     reviewedArm: '再加一臂「只用已核实和已确认的项」',

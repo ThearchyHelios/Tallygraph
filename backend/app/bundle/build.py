@@ -93,7 +93,8 @@ _SHOWN_EVENTS = frozenset({EventType.RUN_STARTED, EventType.REPORT_CHECKED, Even
 #: node.finished 带规范字符串的节点：报告（预览就是嵌进来的那份文档的正文，文档只给哈希的不带）、口径卡（指标集的 id
 #: 记在台账里；卡上有值不给的指标、有输入取自遮罩列的不带，见 _card_shown）。成果节点在运行里没有带遮罩的快照时带
 #: 目录条目的种类 → 嵌进来的工件种类。运行输入、检索、表和字段的条目不嵌：前者没有工件，后几样不在核对范围里
-_CITED_KINDS = {"metric": "metric_set", "query": "query", LEDGER_KIND: ARTIFACT_KIND}
+_CITED_KINDS = {"metric": "metric_set", "query": "query", LEDGER_KIND: ARTIFACT_KIND,
+                "source_health": "source_health"}
 #: 下钻的上一层结论最多跟几层（同分析设置里下钻层数的上限）
 _PARENT_DEPTH = 6
 
@@ -1229,7 +1230,10 @@ def _shows_content(etype: str, node_id: str | None, data: Any, node_types: Mappi
             return not store.masked(artifact)
         # 分析工具：预览里是结论的前一截（判定语、具名的数、结果表），和结论本身同一个认法
         found = data.get("analysis_artifact") if isinstance(data, dict) else None
-        return isinstance(found, str) and bool(found) and _result_shown(found, store)
+        if isinstance(found, str) and found:
+            return _result_shown(found, store)
+        health = data.get("health_artifact") if isinstance(data, dict) else None
+        return isinstance(health, str) and bool(health) and store.raw(health) is not None
     if etype == EventType.ANALYSIS_END:
         # 分析卡里一项做完的事件：带着判定、判定语和结论工件（analysis_artifact），结论随文件附带得了（输入没碰遮罩列）才带
         found = data.get("analysis_artifact") if isinstance(data, dict) else None

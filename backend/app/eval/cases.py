@@ -64,6 +64,8 @@ GOLD_KINDS = ("sql", "caliber", "from_run")
 HUMAN_VALUE_KEYS = ("value", "values", "expected", "answer", "rows", "number", "segment", "segments", "subjects",
                     "direction", "verdict", "judgement", "driver")
 
+DIAGNOSIS_STAGES = ("health_and_contract", "slice_localization", "ontology_penetration")
+
 #: 每种期望认的键（另有 id、kind、required、label）
 _EXPECTATION_KEYS: dict[str, tuple[str, ...]] = {
     "scalar": ("column", "metric", "row", "where", "tolerance"),
@@ -74,7 +76,8 @@ _EXPECTATION_KEYS: dict[str, tuple[str, ...]] = {
     "text": ("points",),
     "contribution": ("op", "mode", "params", "top_n"),
     "verdict": ("op", "mode", "params"),
-    "investigation": ("minimum_depth", "max_queries", "status", "stop_reason"),
+    "investigation": ("minimum_depth", "max_queries", "status", "stop_reason",
+                      "min_ontology_hops", "require_source_health", "diagnosis_stage"),
 }
 _COMMON_KEYS = ("id", "kind", "required", "label")
 #: 期望答案来源的键（客户端能写的）；from_run 只能由服务端建
@@ -292,12 +295,20 @@ def _expectation(raw: Any, i: int, *, gold_kind: str | None, taken: set[str]) ->
         if status not in ("complete", "partial"):
             raise CaseInvalid("调查期望 status 只能是 complete 或 partial", f"{path}.status")
         out["status"] = status
-        for key, low, high in (("minimum_depth", 0, 5), ("max_queries", 1, 1000)):
-            if key in raw:
+        for key, low, high in (("minimum_depth", 0, 5), ("max_queries", 1, 1000), ("min_ontology_hops", 0, 10)):
+            if key in raw and raw[key] is not None:
                 value = raw[key]
                 if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
                     raise CaseInvalid(f"{key} 需要是 {low} 到 {high} 的整数", f"{path}.{key}")
                 out[key] = value
+        if raw.get("require_source_health") is not None:
+            out["require_source_health"] = _bool(raw["require_source_health"], f"{where}的关联源健康检查要求",
+                                                 f"{path}.require_source_health")
+        if raw.get("diagnosis_stage") is not None:
+            stage = raw["diagnosis_stage"]
+            if stage not in DIAGNOSIS_STAGES:
+                raise CaseInvalid(f"诊断阶段只能是 {'、'.join(DIAGNOSIS_STAGES)}", f"{path}.diagnosis_stage")
+            out["diagnosis_stage"] = stage
         if raw.get("stop_reason") is not None:
             reason = raw["stop_reason"]
             if not isinstance(reason, str) or not reason.strip() or len(reason) > 80:

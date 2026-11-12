@@ -304,12 +304,14 @@ async def capability_versions_for(session: AsyncSession, tool_names: list[str]) 
 
 def is_platform_query(name: str) -> bool:
     """这个工具的结果能不能当查询快照作证（替换 nodes/tools.py、nodes/llm.py 里按名字前缀的判断，F11）。
-    认的是「平台执行」这个身份：数据源查询工具、K10 的口径查询工具（`caliber_query`，由 QueryCore 自己执行取数），
+    认的是「平台执行」这个身份：数据源查询工具、K10 的口径查询工具（`caliber_query`，由 QueryCore 自己执行取数）、
+    独立语义指标查询工具（`metric_query`，委托数据源查询工具落快照），
     和登记里声明了 tabular、绑定端点、由平台执行的读取。不看结果长什么样。"""
     from app.ledger.querycore import CALIBER_QUERY
     from app.tools.datasource import QUERY_PREFIX
+    from app.tools.metrics import METRIC_QUERY
 
-    return name.startswith(QUERY_PREFIX) or name == CALIBER_QUERY or name in _platform_queries
+    return name.startswith(QUERY_PREFIX) or name in (CALIBER_QUERY, METRIC_QUERY) or name in _platform_queries
 
 
 def query_items(payload: Any, name: str) -> list[dict[str, Any]]:
@@ -338,9 +340,18 @@ async def snapshot_owned(artifact_id: str, run_id: str, name: str) -> bool:
       的工件一律拒（这就是父 Run 证据接入的那道门，不另建权限系统）；
     - 别的（登记里平台的端点读取）：工件得是这次运行落下的端点快照。"""
     from app.tools.datasource import QUERY_PREFIX
+    from app.tools.metrics import METRIC_QUERY
 
     if name.startswith(QUERY_PREFIX):
         return True
+    if name == METRIC_QUERY:
+        from app.data.catalog import QUERY_SNAPSHOT_KIND
+        from app.db.base import SessionLocal
+        from app.db.models import Artifact
+
+        async with SessionLocal() as session:
+            row = await session.get(Artifact, (artifact_id, run_id or ""))
+        return row is not None and row.kind == QUERY_SNAPSHOT_KIND
     from app.ledger.querycore import CALIBER_QUERY, PARENT_RUN_KEY
 
     if name == CALIBER_QUERY:

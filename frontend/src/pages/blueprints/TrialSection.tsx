@@ -56,7 +56,7 @@ export function TrialSection({ blueprintId }: { blueprintId: string }) {
     (signal) => (runId ? api.tasks.list({ run_id: runId, status: 'pending' }, { signal }) : Promise.resolve({ items: [] })),
     [runId])
   const running = !!model && Object.values(model.sources).some((s) => s.state === 'running')
-  usePoll(() => { reload(); reloadTasks() }, POLL_MS, running)
+  usePoll(() => Promise.all([reload(), reloadTasks()]), POLL_MS, running)
 
   if (!bp) return null
   if (!runId) {

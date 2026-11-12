@@ -19,6 +19,11 @@ _PHRASES = {
     "no_evidence": "西南和华东的退款率差异可能只是样本波动（样本量 40、230）",
     "comparable": "两期可比",
     "incomparable": "两期不可比：本期只有 3 天数据",
+    "aligned": "两侧报废数对账一致（主侧 120，对账侧 120，相差 0）",
+    "diverged": "两侧报废数存在显著偏差（主侧 120，对账侧 95，相差 +25，+26.3%），偏差集中在 L2",
+    "missing_counterpart": "两侧报废数对账发现对侧缺失记录（共 1 项缺失：L4）",
+    "co_anomalous": "产线效率本期变化 -14.2% 超出常规波动，关联的非计划停机在同期同样超出其常规波动（+185.0%，同期同步异动，统计伴随关系，非因果断言）",
+    "target_normal": "产线效率本期变化 -14.2% 超出常规波动，但关联的非计划停机在同期处于其常规波动范围内（+2.1%）",
 }
 
 _WEEKS = ["2026-07-20", "2026-07-27", "2026-08-03", "2026-08-10", "2026-08-17", "2026-08-24", "2026-08-31",
@@ -102,13 +107,57 @@ def _comparable() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[
     return table, values, params, ["gmv"]
 
 
+def _reconcile() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[str]]:
+    columns = ["line_code", "base", "target", "scaled_target", "diff", "rel_diff", "status"]
+    table = {
+        "columns": columns,
+        "labels": {"line_code": "产线", "base": "主侧", "target": "对账侧原值", "scaled_target": "换算后对账侧",
+                   "diff": "差值", "rel_diff": "相对偏差", "status": "结果"},
+        "rows": [["L2", "60", "35", "35", "25", "0.714285714286", "超差"],
+                 ["L1", "60", "60", "60", "0", "0", "一致"]],
+        "column_types": {"line_code": "text", "base": "number", "target": "number", "scaled_target": "number",
+                         "diff": "number", "rel_diff": "number", "status": "text"},
+    }
+    values = {"base_total": "120", "target_total": "95", "diff_total": "25", "rel_diff_total": "0.263157894737",
+              "unit_factor": "1", "matched_count": "2", "diverged_count": "1", "missing_base_count": "0",
+              "missing_target_count": "0", "max_abs_diff": "25"}
+    params = {"base_query": "Q1", "target_query": "Q2", "by": ["line_code"], "measure": "scrap_qty",
+              "target_measure": "scrap_units", "unit_factor": "1", "label": "报废数"}
+    return table, values, params, ["line_code", "scrap_qty"]
+
+
+def _cochange() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[str]]:
+    columns = ["day", "primary_value", "primary_change", "driver_value", "driver_change", "role"]
+    rows = [[w, "92", "0.01", "12", "0.02", "历史"] for w in _WEEKS[:-1]] + [
+        [_WEEKS[-1], "79", "-0.141304347826", "34", "1.833333333333", "本期"]
+    ]
+    table = {
+        "columns": columns,
+        "labels": {"day": "日期", "primary_value": "产线效率", "primary_change": "主指标变化率",
+                   "driver_value": "非计划停机", "driver_change": "关联指标变化率", "role": "说明"},
+        "rows": rows,
+        "column_types": {"day": "text", "primary_value": "number", "primary_change": "number",
+                         "driver_value": "number", "driver_change": "number", "role": "text"},
+    }
+    values = {"primary_x": "-0.141304347826", "primary_z": "-4.2", "primary_band_lo": "-0.04",
+              "primary_band_hi": "0.04", "driver_x": "1.833333333333", "driver_z": "5.8",
+              "driver_band_lo": "-0.15", "driver_band_hi": "0.15", "lag": "0", "n_history": "12",
+              "co_direction": "opposite"}
+    params = {"base_query": "Q1", "target_query": "Q2", "period": "day", "measure": "efficiency",
+              "driver_measure": "unplanned_min", "lag": 0, "basis": "change", "target": _WEEKS[-1],
+              "label": "产线效率"}
+    return table, values, params, ["day", "efficiency"]
+
+
 _SHAPES = {"decompose": _decompose, "baseline": _baseline, "trend": _trend, "differ": _differ,
-           "comparable": _comparable}
+           "comparable": _comparable, "reconcile": _reconcile, "cochange": _cochange}
 _CRITERIA = {"decompose": "一段占总变化一半以上算主要来源",
              "baseline": "本期和过去 12 周的中位数比，差不到 2 倍稳健标准差算常规波动",
              "trend": "Mann–Kendall 检验的双侧 p 值小于 0.05 时按 Theil–Sen 斜率的正负判上升或下降",
              "differ": "双侧 p 值小于 0.05 算差异站得住",
-             "comparable": "只差日期、窗口一样长、是整期、星期构成相同才算可比"}
+             "comparable": "只差日期、窗口一样长、是整期、星期构成相同才算可比",
+             "reconcile": "两侧总量及各对齐切片相对偏差均不超过 1.0% 且无缺失项算对账一致",
+             "cochange": "主指标与关联指标在对齐期次上同按各自历史中位数 ± 2.0 倍稳健标准差检验是否同步超出常规波动"}
 
 
 def fake_result(op: str = "decompose", mode: str | None = "additive", verdict: str | None = "driver", *,
@@ -121,7 +170,7 @@ def fake_result(op: str = "decompose", mode: str | None = "additive", verdict: s
     elif op == "differ" and mode not in ("rate", "mean", "rows"):
         mode = "rate"
     table, values, params, columns = _SHAPES.get(op, _decompose)()
-    if op == "comparable":
+    if op in ("comparable", "reconcile", "cochange"):
         default_inputs = [{"ref": ref, "artifact": "0" * 64, "role": role, "columns": columns, "rows": "all"}
                           for ref, role in (("Q4", "base"), ("Q5", "target"))]
     else:

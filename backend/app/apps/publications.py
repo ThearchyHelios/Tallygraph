@@ -690,9 +690,10 @@ def problem_key(problem: Mapping[str, Any]) -> tuple[str, str, tuple[tuple[str, 
 def build_content(*, workflow_id: str, version: int, level: str, graph: Any, cards: Sequence[CardBasis]) -> dict[str, Any]:
     """这一版的清单内容：**只由原始输入决定**（这一版不可变的图 + 每张卡引用的那两行记录的值）。"""
     from app.core.artifact_store import execution_hash, graph_hash
+    from app.ledger.ontology import ontology_manifest_section
 
     sources, tables = fetch_dependencies(graph)
-    return {
+    out: dict[str, Any] = {
         "format": FORMAT,
         "workflow_id": str(workflow_id),
         "version": int(version),
@@ -704,6 +705,10 @@ def build_content(*, workflow_id: str, version: int, level: str, graph: Any, car
         "parameters": parameters_of(graph),
         "dependencies": {"sources": sources, "tables": tables, "upstream": upstream_pins(graph)},
     }
+    ontology = ontology_manifest_section(workflow_id=str(workflow_id), version=int(version), graph=graph or {})
+    if ontology is not None:
+        out["ontology"] = ontology
+    return out
 
 
 def content_hash(content: Mapping[str, Any]) -> str:

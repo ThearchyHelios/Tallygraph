@@ -757,7 +757,7 @@ def analysis_issues(spec: GraphSpec, node: GraphNode) -> list[ValidationIssue]:
             add(f"{who}的「在验证什么」需要是一段文字", f"{at}.hypothesis", "analysis.item_invalid")
         both = all(isinstance(params.get(k), str) and params[k].strip() for k in ANALYSIS_NODE_PARAMS)
         if not (isinstance(item.get("from"), str) and item["from"].strip()) and not both:
-            two = "；基期、本期是两份查询时，在参数里选上这两个查询节点" if op in ("decompose", "comparable") else ""
+            two = "；基期、本期是两份查询时，在参数里选上这两个查询节点" if op in ("decompose", "comparable", "reconcile", "cochange") else ""
             add(f"{who}还没有选择输入：选一个上游的查询节点（调用数据库查询工具的「调用工具」节点，或「合并查询」）{two}",
                 f"{at}.from", "analysis.input_invalid")
         headline = params.get("headline")

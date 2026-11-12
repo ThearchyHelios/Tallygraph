@@ -52,7 +52,14 @@ function summaryOf(data: RunLedger) {
  * 服务端只给「确实能发起」的那一项口径身份（available）：不能发起的那几项只是说明，界面上单独写一行、不摆按钮。
  */
 function reconcileEntries(data: RunLedger): { action: LedgerReconcileAction; related?: LedgerRelated }[] {
-  return (data.actions ?? []).filter((a): a is LedgerReconcileAction => a.kind === 'reconcile').map((action) => ({
+  const seen = new Set<string>()
+  return (data.actions ?? []).filter((a): a is LedgerReconcileAction => {
+    if (a.kind !== 'reconcile') return false
+    const key = JSON.stringify([a.query, a.caliber, a.workflow_id, a.version, a.node_id, a.available])
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  }).map((action) => ({
     action,
     related: (data.queries ?? []).find((q) => q.artifact === action.query)?.candidates
       .find((c) => c.caliber === action.caliber && c.status === 'related'),
@@ -92,6 +99,11 @@ export function LedgerTurn({ runId, runClass, done, readOnly = false }: {
   }
   const issue = (data.actions ?? []).find((a): a is LedgerIssueAction => a.kind === 'issue')
   const reconciles = reconcileEntries(data)
+  const groups = new Map<string, typeof reconciles>()
+  for (const entry of reconciles) {
+    const key = JSON.stringify([entry.action.workflow_id, entry.action.version, caliberOf(entry.action)])
+    groups.set(key, [...(groups.get(key) ?? []), entry])
+  }
   const issued = data.issued ?? []
   const reconciled = data.reconciled ?? []
   if (!summary.total && !issued.length && !reconciled.length && !marked) return null
@@ -114,7 +126,8 @@ export function LedgerTurn({ runId, runClass, done, readOnly = false }: {
       {(issue || reconciles.length > 0) && (
         <div className="flex flex-wrap items-start gap-1.5" data-ledger-actions="">
           {issue && <IssueControl runId={runId} action={issue} slot={slot} readOnly={readOnly} />}
-          {reconciles.map(({ action, related }) => (
+          {[...groups].map(([key, entries]) => {
+            const controls = entries.map(({ action, related }, index) => (
             // 服务端只给「确实能发起」的那一项身份：没有身份的那些是说明，不摆按钮（也就不发 undefined 的请求）
             action.available === false ? (
               <p key={`${action.query}|${action.caliber}`} className="text-2xs text-dim"
@@ -125,10 +138,18 @@ export function LedgerTurn({ runId, runClass, done, readOnly = false }: {
               <button key={`${action.query}|${action.caliber}`} type="button" className="btn btn-xs" disabled={readOnly}
                       title={readOnly ? LEDGER_UI.reconcile.readOnly : undefined}
                       onClick={() => setDialog({ action, related })} data-ledger-turn-reconcile={action.caliber}>
-                <Scale size={11} aria-hidden /> {LEDGER_UI.reconcile.turnButton(caliberOf(action))}
+                <Scale size={11} aria-hidden /> {entries.length > 1
+                  ? `取数 ${index + 1} · ${(data.queries ?? []).find(q => q.artifact === action.query)?.tables?.join('、') || '查看并核对参数'}`
+                  : LEDGER_UI.reconcile.turnButton(caliberOf(action))}
               </button>
             )
-          ))}
+            ))
+            return entries.length === 1 ? <span key={key}>{controls}</span>
+              : <details key={key} data-ledger-reconcile-group="" className="rounded border p-1.5">
+                  <summary className="cursor-pointer text-2xs">{LEDGER_UI.reconcile.turnButton(caliberOf(entries[0].action))} · {entries.length} 份取数</summary>
+                  <div className="mt-2 flex flex-wrap gap-1.5">{controls}</div>
+                </details>
+          })}
         </div>
       )}
       <IssuedList data={data} />

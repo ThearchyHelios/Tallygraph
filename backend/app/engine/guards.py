@@ -89,7 +89,32 @@ def node_limits(config: dict[str, Any], snapshot: dict[str, Any], hard_cap: int)
     )
 
 
-def call_key(name: str, args: dict[str, Any]) -> str:
+def call_key(name: str, args: dict[str, Any], *, canonical: bool = False) -> str:
+    if canonical:
+        args = dict(args)
+        if name.startswith("db_schema__") and "table" in args:
+            from app.tools.datasource import _schema_tables
+
+            args["table"] = sorted(set(_schema_tables(args["table"])))
+        if name.startswith("db_query__") and isinstance(args.get("sql"), str):
+            import sqlglot
+
+            sql = args["sql"]
+            try:
+                tokens = sqlglot.tokenize(sql)
+                # Preserve every token verbatim, including literals, quoted identifiers and comments.
+                # Only collapse whitespace gaps: comments/non-whitespace gaps disqualify normalization.
+                end, pieces = 0, []
+                for token in tokens:
+                    if sql[end:token.start].strip():
+                        break
+                    pieces.append(sql[token.start:token.end + 1])
+                    end = token.end + 1
+                else:
+                    if not sql[end:].strip():
+                        args["sql"] = " ".join(pieces)
+            except sqlglot.errors.TokenError:
+                pass
     return json.dumps({"tool": name, "args": args}, ensure_ascii=False, sort_keys=True, default=str)
 
 
@@ -124,12 +149,13 @@ class Guard:
     last_input: int = 0
     compressed: bool = False
     facts: dict[str, Any] = field(default_factory=dict)
+    canonical_calls: bool = False
 
     # ------------------------------------------------------------ 重复调用
 
     def repeat(self, name: str, args: dict[str, Any]) -> str | None:
         """同一个工具、同样的参数已经成功跑过：返回要喂回去的那句话，不再执行。"""
-        hit = self.seen.get(call_key(name, args))
+        hit = self.seen.get(call_key(name, args, canonical=self.canonical_calls))
         if hit is None:
             return None
         step, content = hit
@@ -138,7 +164,7 @@ class Guard:
 
     def record(self, step: int, name: str, args: dict[str, Any], ok: bool, content: str) -> None:
         if ok:
-            self.seen.setdefault(call_key(name, args), (step, content))
+            self.seen.setdefault(call_key(name, args, canonical=self.canonical_calls), (step, content))
 
     def step_done(self, progressed: bool) -> None:
         self.stalled = 0 if progressed else self.stalled + 1

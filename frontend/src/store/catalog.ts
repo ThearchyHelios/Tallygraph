@@ -400,11 +400,11 @@ const reloading: Partial<Record<CatalogKey, Promise<void>>> = {}
  * 数据源目录（订阅版）。list 含停用的，按需自己 filter(enabled)；state 同
  * catalogListState，不是 ok 时空列表不代表「没有数据源」，别劝人去新建。
  *
- * 挂载时如果目录超过 maxAgeMs 没取过就后台重拉一次，先照旧给手上的那份。
+ * 挂载或 refreshKey（例如路由进入标识）变化时检查 maxAgeMs，过期就后台重拉一次，先展示缓存。
  * 同一时刻多处挂载只会发一个请求（reload 自己不去重，这里记着在路上的那一次）。
  * 启动的 refresh 还没落定时先不拉（那次本来就会取）；落定时这张表没取回来，就补拉一次
  */
-export function useDatasources(opts?: { maxAgeMs?: number }): { list: DataSource[]; state: CatalogListState } {
+export function useDatasources(opts?: { maxAgeMs?: number; refreshKey?: string }): { list: DataSource[]; state: CatalogListState } {
   const list = useCatalog((s) => s.datasources)
   const state = useCatalogListState('datasources')
   const loaded = useCatalog((s) => s.loaded)
@@ -416,7 +416,7 @@ export function useDatasources(opts?: { maxAgeMs?: number }): { list: DataSource
     if ((at == null || Date.now() - at > maxAge) && !reloading.datasources) {
       reloading.datasources = s.reload('datasources').finally(() => { reloading.datasources = undefined })
     }
-  }, [maxAge, loaded])
+  }, [maxAge, loaded, opts?.refreshKey])
   return { list, state }
 }
 

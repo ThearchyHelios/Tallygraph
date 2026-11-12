@@ -156,6 +156,7 @@ def register(
 def all_specs() -> dict[str, ToolSpec]:
     import app.tools.builtin  # noqa: F401  触发内置工具注册
     import app.ledger.querycore  # noqa: F401  触发 caliber_query（K10 的父 Run 工具入口）注册
+    import app.tools.ontology  # noqa: F401  触发 ontology_neighbors / source_health 注册
 
     return dict(_REGISTRY)
 

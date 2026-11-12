@@ -63,6 +63,10 @@ from decimal import ROUND_HALF_UP, Context, Decimal
 from typing import Any, Literal, TypedDict
 
 from app.analysis.contract import CATALOG_PREFIX, LEDGER_KIND, MARKER_KIND, catalog_result, is_result, method_label
+from app.data.source_health import LEDGER_KIND as HEALTH_KIND, is_health_result
+
+HEALTH_MARKER = "h"
+HEALTH_PREFIX = "H"
 from app.core.artifact_store import canonical_json, content_hash
 from app.core.artifact_store import load as load_artifact
 from app.data.names import FILLERS, name_key
@@ -111,7 +115,7 @@ _ISO_DATETIME = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}(?::\d{2}(?:\.\d+)
 class EvidenceEntry(TypedDict, total=False):
     """台账条目：state["evidence"] 里的一行，同时写进 node.finished.evidence。"""
 
-    kind: Literal["query", "metric_set", "retrieval", "tool", "node_output", "schema", "analysis"]
+    kind: Literal["query", "metric_set", "retrieval", "tool", "node_output", "schema", "analysis", "source_health"]
     node_id: str
     exec: int                 # 这个节点第几次执行（循环里会有多次），从 1 数
     artifact: str             # 被引用的那件工件
@@ -167,7 +171,7 @@ class Citation(TypedDict, total=False):
 class Segment(TypedDict, total=False):
     id: str
     #: analysis：[[a:A3]] 渲染出的判定语（一整句，系统按模板写的）；[[a:A3.键]] 的具名标量照数字、取值算
-    kind: Literal["text", "number", "value", "entity", "quote", "structural", "analysis"]
+    kind: Literal["text", "number", "value", "entity", "quote", "structural", "analysis", "source_health"]
     text: str
     span: list[int]           # [start, end)，在 doc.markdown 里的码点偏移
     ref: str                  # 带前缀的原始引用：m:gmv、i:week、t:orders
@@ -818,7 +822,7 @@ _MARKER_GUARD = rf"(?=[^\[\]\n]{{0,{MARKER_MAX - 4}}}\]\])"
 #: [[kind:body]]。body 里不许有方括号和换行——这样一个没闭合的 [[ 最多吞到行尾
 MARKER_RE = re.compile(
     r"\[\[" + _MARKER_GUARD + r"[ \t]*(?P<kind>[A-Za-z]+)[ \t]*:(?P<body>[^\[\]\n]*?)\]\]")
-SUPPORTED_KINDS = frozenset({"m", "i", "see", "v", "table", "t", "c", "q", MARKER_KIND})
+SUPPORTED_KINDS = frozenset({"m", "i", "see", "v", "table", "t", "c", "q", MARKER_KIND, HEALTH_MARKER})
 #: 三期起没有「以后才支持」的标记了；留着这个名字给老代码 import
 LATER_KINDS: frozenset[str] = frozenset()
 #: 这次运行没冻结表结构（没查过库、升级前的运行）时，t / c 仍按一期判为解析不了，原因是这一句
@@ -866,7 +870,7 @@ TABLE_DEFAULT_ROWS = 5
 TABLE_MAX_ROWS = 20
 TABLE_MAX_COLS = 12
 _ROLE = {"t": "entity", "c": "entity", "q": "quote"}
-_SEG_KIND = {"t": "entity", "c": "entity", "q": "quote"}
+_SEG_KIND = {"t": "entity", "c": "entity", "q": "quote", HEALTH_MARKER: HEALTH_KIND}
 
 
 def _parse_body(kind: str, body: str) -> dict[str, Any]:
@@ -1016,8 +1020,8 @@ def build_catalog(
                 **({"comparability": metric["comparability"]} if isinstance(metric.get("comparability"), dict) else {}),
             }
 
-    queries = retrievals = analyses = 0
-    snaps: _Snapshots | None = None                    # 取分析结论的工件用，有 A 条目才建
+    queries = retrievals = analyses = healths = 0
+    snaps: _Snapshots | None = None                    # 取分析结论或数据源健康工件用，有 A / H 条目才建
     schemas: list[dict[str, Any]] = []
     shaped: list[tuple[dict[str, Any], str]] = []      # 带表结构快照的查询条目和它的全局编号
     for entry in entries:
@@ -1042,6 +1046,12 @@ def build_catalog(
             alias = f"{CATALOG_PREFIX}{analyses}"
             snaps = snaps or _Snapshots(loader)
             catalog[alias] = _analysis_entry(entry, alias, snaps)
+            continue
+        if entry.get("kind") == HEALTH_KIND:
+            healths += 1
+            alias = f"{HEALTH_PREFIX}{healths}"
+            snaps = snaps or _Snapshots(loader)
+            catalog[alias] = _health_entry(entry, alias, snaps)
             continue
         if entry.get("kind") == "query":
             queries += 1
@@ -1115,10 +1125,32 @@ def analysis_card(entry: dict[str, Any] | None) -> bool:
     return isinstance(entry, dict) and bool(entry.get("item")) and not entry.get("call_id")
 
 
+_HEALTH_KEYS = ("node_id", "exec", "artifact", "call_id", "verdict", "sources", "issue_count")
+
+
+def _health_entry(entry: dict[str, Any], alias: str, snaps: _Snapshots) -> dict[str, Any]:
+    """台账里的一条数据源健康核查 → 写作目录的 H 条目。"""
+    out: dict[str, Any] = {
+        "alias": alias,
+        "kind": HEALTH_KIND,
+        "eid": make_eid(HEALTH_KIND, entry.get("artifact"), {}),
+        "locator": {},
+        **{k: entry[k] for k in _HEALTH_KEYS if k in entry},
+    }
+    result, why = snaps.health(alias, {"artifact": entry.get("artifact")})
+    if result is None:
+        out["unreadable"] = why
+    else:
+        out["result"] = result
+    phrase = _clean(str((result or {}).get("phrase") or ""))
+    out["label"] = f"数据源健康 · {phrase}" if phrase else "数据源健康"
+    return out
+
+
 def stored_entry(entry: dict[str, Any]) -> dict[str, Any]:
-    """存进报告文档的目录条目：分析结论只留摘要（编号、种类、判定码、工件、输入、行数……），不带整份结论（result）——它在
+    """存进报告文档的目录条目：分析结论与数据源健康只留摘要（编号、种类、判定码、工件……），不带整份结论（result）——它在
     工件里，取回时复验哈希；别的条目原样。"""
-    if entry.get("kind") == LEDGER_KIND and "result" in entry:
+    if entry.get("kind") in (LEDGER_KIND, HEALTH_KIND) and "result" in entry:
         return {k: v for k, v in entry.items() if k != "result"}
     return entry
 
@@ -1524,6 +1556,18 @@ class _Snapshots:
             why = "的工件不是分析结论"
         return (None, f"{alias} {why}") if why else (content, None)
 
+    def health(self, alias: str, entry: dict[str, Any]) -> tuple[Any, str | None]:
+        """取回一份数据源健康度结论：(结论, 原因)。"""
+        cached = entry.get("result")
+        if is_health_result(cached):
+            return cached, None
+        if entry.get("unreadable"):
+            return None, str(entry["unreadable"])
+        content, why = self._fetch(entry.get("artifact"), "数据源健康结论")
+        if why is None and not is_health_result(content):
+            why = "的工件不是数据源健康结论"
+        return (None, f"{alias} {why}") if why else (content, None)
+
     def table(self, alias: str, entry: dict[str, Any]) -> tuple[Any, str | None]:
         """按单元格、整表取的那张表：(表, 取不到的原因)。查询结果是查询快照本身；分析结论是它的结果表（形状同查询快照：
         columns 是稳定的列 id，另带 labels 给人看的列名，整表的表头写它）。结果表另记了列类型（column_types）、各列的换算
@@ -1865,11 +1909,13 @@ def resolve_marker(marker: dict[str, Any], catalog: dict[str, Any], *, cells_all
         return _resolve_quote(marker, catalog, _snapshots(loader))
     if kind == MARKER_KIND:
         return _resolve_analysis(marker, catalog, _snapshots(loader), cells_allowed)
+    if kind == HEALTH_MARKER:
+        return _resolve_health(marker, catalog, _snapshots(loader), cells_allowed)
     if kind not in ("m", "i"):
         return _unresolved(marker, f"{kind}:{ref}", kind, _Reason(
             f"引用类型「{kind}」无法识别",
             f"不认识的引用类型 {kind}：只支持 m（口径卡指标）、v（查询单元格）、table（整表）、"
-            "i（运行输入）、t / c（表 / 字段）、q（引文）、a（分析结论）、see（依据）"))
+            "i（运行输入）、t / c（表 / 字段）、q（引文）、a（分析结论）、h（数据源健康）、see（依据）"))
 
     conv = marker.get("conv")
     if kind == "m":
@@ -1978,6 +2024,52 @@ def _resolve_analysis(marker: dict[str, Any], catalog: dict[str, Any], snaps: _S
     if conv:
         cite["conv"] = conv
     return cite
+
+
+_HEALTH_REF = re.compile(rf"^(?P<alias>{HEALTH_PREFIX}\d+)$")
+_HEALTH_FIX = f"数据源健康结论的判定语写 [[{HEALTH_MARKER}:H1]]，句末挂依据写 [[see:H1]]"
+
+
+def _is_health_alias(alias: Any) -> bool:
+    return isinstance(alias, str) and alias.startswith(HEALTH_PREFIX) and alias[len(HEALTH_PREFIX):].isdigit()
+
+
+def _resolve_health(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapshots,
+                    cells_allowed: bool) -> dict[str, Any]:
+    """[[h:H1]] → 数据源健康核查里系统渲染的判定语（整句涂白，核对封存哈希与显示字面）。"""
+    ref = (marker.get("ref") or "").strip()
+    conv = marker.get("conv")
+    parsed = _HEALTH_REF.match(ref)
+    if parsed is None:
+        return _unresolved(marker, ref or "H?", HEALTH_KIND, _Reason("数据源健康结论的引用格式无法识别", _HEALTH_FIX))
+    alias = parsed.group("alias")
+    entry = catalog.get(alias)
+    if entry is None:
+        return _unresolved(marker, alias, HEALTH_KIND, _Reason(
+            f"引用的数据源健康结论 {alias} 不存在", f"目录里没有 {alias}（可用的健康核查见证据目录）"))
+    if entry.get("kind") != HEALTH_KIND:
+        return _unresolved(marker, alias, HEALTH_KIND, f"{alias} 不是数据源健康结论")
+    if not cells_allowed and entry.get("call_id"):
+        return _unresolved(marker, alias, HEALTH_KIND, ANALYSIS_CELLS_REASON)
+    if conv:
+        return _unresolved(marker, alias, HEALTH_KIND, _Reason(
+            "数据源健康判定语是一整句话，不能换算", f"判定语 [[{HEALTH_MARKER}:{alias}]] 不能加换算"))
+    result, why = snaps.health(alias, entry)
+    if result is None:
+        return _unresolved(marker, alias, HEALTH_KIND, why or f"{alias} 无法读取")
+    phrase = result.get("phrase")
+    if not isinstance(phrase, str) or not phrase.strip():
+        return _unresolved(marker, alias, HEALTH_KIND, f"{alias} 没有判定语")
+    return {
+        "ref": ref,
+        "alias": alias,
+        "locator": {},
+        "eid": make_eid(HEALTH_KIND, entry.get("artifact"), {}),
+        "kind": HEALTH_KIND,
+        "role": "value",
+        "status": "resolved",
+        "rendered": render_cell(phrase, kind="text"),
+    }
 
 
 def _resolve_entity(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snapshots) -> dict[str, Any]:
@@ -2149,14 +2241,16 @@ def _resolve_quote(marker: dict[str, Any], catalog: dict[str, Any], snaps: _Snap
             "source": {k: v for k, v in source.items() if v is not None}}
 
 
-_ROW_REF = re.compile(rf"^(?P<alias>[QK{CATALOG_PREFIX}]\d+)(?:\.r(?P<row>\d+))?$")
+_ROW_REF = re.compile(rf"^(?P<alias>[QK{CATALOG_PREFIX}{HEALTH_PREFIX}]\d+)(?:\.r(?P<row>\d+))?$")
 
 
 def resolve_support(ref: str, catalog: dict[str, Any], *, loader: Loader | _Snapshots | None = None) -> dict[str, Any]:
-    """[[see:]] 里的一个依据：m:gmv、i:week、Q4、Q4.r0、K2、A3、A3.r0、t:orders、c:orders.amount。只核对「这件证据存在」。
-    分析结论当依据和查询编号一样写（[[see:A3]]），受管级别的出具里也照样可以写；顺手写成 a:A3 的照 A3 认。"""
+    """[[see:]] 里的一个依据：m:gmv、i:week、Q4、Q4.r0、K2、A3、A3.r0、H1、t:orders、c:orders.amount。只核对「这件证据存在」。
+    分析结论与数据源健康当依据和查询编号一样写（[[see:A3]] / [[see:H1]]），受管级别的出具里也照样可以写；顺手写成 a:A3 / h:H1 的照认。"""
     ref = ref.strip()
     if ref.startswith(f"{MARKER_KIND}:") and _is_analysis_alias(ref.partition(":")[2].strip()):
+        ref = ref.partition(":")[2].strip()
+    elif ref.startswith(f"{HEALTH_MARKER}:") and _is_health_alias(ref.partition(":")[2].strip()):
         ref = ref.partition(":")[2].strip()
     kind, sep, body = ref.partition(":")
     base = {"ref": ref, "role": "support"}
@@ -2178,15 +2272,18 @@ def resolve_support(ref: str, catalog: dict[str, Any], *, loader: Loader | _Snap
         why = f"运行输入中没有「{body}」"
     elif sep:
         why = _Reason(f"依据「{ref}」的写法无法识别",
-                      f"不认识的依据写法 {ref}：写 m:指标、i:输入，或者 Q1 / K1 / A1 这样的编号")
+                      f"不认识的依据写法 {ref}：写 m:指标、i:输入，或者 Q1 / K1 / A1 / H1 这样的编号")
     elif m := _ROW_REF.match(ref):
         alias = m.group("alias") if m.group("alias") in catalog else None
         if alias and m.group("row") is not None:
-            row, total = int(m.group("row")), catalog[alias].get("rows")
-            if isinstance(total, int) and row >= total:
-                alias, why = None, f"{m.group('alias')} 只有 {total} 行，没有第 {row} 行（行号从 0 开始）"
+            if catalog[alias].get("kind") == HEALTH_KIND:
+                alias, why = None, f"{m.group('alias')} 是数据源健康结论，没有行号，请直接写 [[see:{m.group('alias')}]]"
             else:
-                locator = {"row": row}
+                row, total = int(m.group("row")), catalog[alias].get("rows")
+                if isinstance(total, int) and row >= total:
+                    alias, why = None, f"{m.group('alias')} 只有 {total} 行，没有第 {row} 行（行号从 0 开始）"
+                else:
+                    locator = {"row": row}
     elif f"m:{ref}" in catalog:
         alias = f"m:{ref}"          # 漏写了 m: 前缀的指标 id，意思没有歧义
     if alias is None:
@@ -3694,7 +3791,16 @@ def verify_doc(
     # 统计也不多这个键。目录条目只带摘要的（存进文档的那份）按工件取回整份结论
     from app.engine import analysis_claims as said
 
-    said_found = said.verify(doc, catalog, cited=cited_by, load=lambda alias, entry: snaps.analysis(alias, entry)[0])
+    said_found = said.verify(
+        doc,
+        catalog,
+        cited=cited_by,
+        load=lambda alias, entry: (
+            snaps.health(alias, entry)[0]
+            if isinstance(entry, dict) and entry.get("kind") == HEALTH_KIND
+            else snaps.analysis(alias, entry)[0]
+        ),
+    )
     if said_found is not None:
         violations.extend(said_found)
         stats["analysis_claims"] = sum(1 for v in said_found if v["code"] in said.CODES)
@@ -4523,6 +4629,25 @@ def _cut_lines(lines: list[str], limit: int, note: str) -> list[str]:
     return out
 
 
+def _health_prompt(catalog: dict[str, Any], snaps: _Snapshots, cells_allowed: bool) -> list[str]:
+    """数据源健康核查在写作目录里的文字（没有 H 条目时返回空列表，不影响既有目录）。"""
+    entries = [e for e in catalog.values() if isinstance(e, dict) and e.get("kind") == HEALTH_KIND]
+    if not entries:
+        return []
+    lines = ["\n数据源健康核查（正文直接引用判定语写 [[h:H1]]，句末挂依据写 [[see:H1]]）："]
+    for e in entries:
+        alias = e["alias"]
+        result, why = snaps.health(alias, e)
+        if result is None:
+            lines.append(f"- {alias}：{why or '无法读取'}")
+            continue
+        phrase = _clean(str(result.get("phrase") or ""))
+        verdict = str(result.get("verdict") or "")
+        cite_tip = f"[[h:{alias}]]" if cells_allowed or not e.get("call_id") else f"[[see:{alias}]]（仅作句末依据）"
+        lines.append(f"- {alias}（判定={verdict}）：{phrase} —— 引用写 {cite_tip}")
+    return lines
+
+
 def writer_catalog(catalog: dict[str, Any], *, budget: int = DEFAULT_CATALOG_BUDGET, cells_allowed: bool = True,
                    loader: Loader | None = None, fields: list[dict[str, Any]] | None = None,
                    titles: dict[str, str] | None = None) -> WriterCatalog:
@@ -4540,7 +4665,7 @@ def writer_catalog(catalog: dict[str, Any], *, budget: int = DEFAULT_CATALOG_BUD
     snaps = _Snapshots(loader)
     head = ["可引用的证据（写数字只能用下面的引用标记，系统会换成真实数值）："]
     field_lines, empty, cited = _fields_prompt(fields or [], catalog, snaps, cells_allowed)
-    first = [*_metric_prompt(catalog), *field_lines]
+    first = [*_metric_prompt(catalog), *field_lines, *_health_prompt(catalog, snaps, cells_allowed)]
     analyses = _AnalysisLines.of(catalog, snaps, cells_allowed)
     queries = [e for e in catalog.values() if e.get("kind") == "query"]
     rules = ([f"\n{CELL_RULES}" if cells_allowed else

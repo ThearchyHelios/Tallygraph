@@ -298,11 +298,18 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     schema = first.get("schema_artifact") if first else None
     # 这次查询的 SQL 检查结果单独带上：preview 只有前 2000 个字符，checks 排在 rows 后面，通常被截掉
     checks = event_checks(result) if is_platform_query(name) else []
+    health: dict[str, Any] | None = None
+    if name == "source_health":
+        from app.tools.analysis import health_event_view, health_payload_of
+
+        health = health_payload_of(result)
     ctx.emit(EventType.TOOL_END, tool=name, duration_ms=elapsed,
              preview=json.dumps(result, ensure_ascii=False, default=str)[:2000],
              artifact=snapshot_id, **({"query_artifact": first["artifact"]} if first else {}),
              # 一次调用交回多条查询（caliber_query）时把工件 id 全列出来：只给第一条，界面上剩下的就点不开
              **({"query_artifacts": [q["artifact"] for q in queries]} if len(queries) > 1 else {}),
+             **({"health_artifact": health["artifact"], "source_health": health_event_view(health["result"])}
+                if health else {}),
              **({"schema_artifact": schema} if schema else {}), **({"checks": checks} if checks else {}))
 
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
@@ -313,6 +320,11 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         if snapshot_id:
             entries.append({"kind": "tool", "node_id": ctx.node.id, "exec": exec_no, "artifact": snapshot_id,
                             "tool": name})
+        if health:
+            from app.data.source_health import ledger_entry as health_ledger_entry
+
+            entries.append(health_ledger_entry(health["result"], node_id=ctx.node.id, exec_no=exec_no,
+                                               artifact=health["artifact"]))
         for item in queries:
             # 实际执行的执行身份（K10）：query_id 是逻辑查询、execution_id 是这一次、attempt 是第几次。
             # 口径查询那条自己带着（K09 算好的），别的按这次节点执行的序号算

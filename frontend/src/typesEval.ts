@@ -90,17 +90,19 @@ export interface EvalSuiteDetail extends EvalSuite {
 export type EvalCaseKind = 'ask' | 'workflow'
 export type EvalExpectationKind = 'scalar' | 'table' | 'set' | 'none' | 'ask' | 'text' | 'contribution' | 'verdict' | 'investigation'
 
-/** 分析期望用的分析方法（服务端 app/analysis/contract.OPS）：贡献恒为 decompose，判定是另外四种 */
-export type EvalAnalysisOp = 'decompose' | 'baseline' | 'trend' | 'differ' | 'comparable'
+/** 分析期望用的分析方法（服务端 app/analysis/contract.OPS） */
+export type EvalAnalysisOp = 'decompose' | 'baseline' | 'trend' | 'differ' | 'comparable' | 'reconcile' | 'cochange'
 /** 分析方法的模式（contract.MODES）：变化拆解 additive / ratio / factor，差异检验 rate / mean / rows */
 export type EvalAnalysisMode = 'additive' | 'ratio' | 'factor' | 'rate' | 'mean' | 'rows'
 /**
  * 判定类（服务端 app/eval/judgements.JUDGEMENTS）：期望和答案里的分析结论都按它比。贡献：source 主要来源、dispersed 分散、
  * flat 基本持平、mix 结构变化为主、rate 各段自身的变化为主、mixed 两方面都有影响；判定：normal 常规波动、anomaly 超出常规波动、
- * rising / falling / no_trend、differs 差异站得住、no_evidence 不足以下结论、comparable / incomparable
+ * rising / falling / no_trend、differs 差异站得住、no_evidence 不足以下结论、comparable / incomparable、aligned / diverged、
+ * co_anomalous / target_normal
  */
 export type EvalJudgement = 'source' | 'dispersed' | 'flat' | 'mix' | 'rate' | 'mixed' | 'normal' | 'anomaly' | 'rising'
   | 'falling' | 'no_trend' | 'differs' | 'no_evidence' | 'comparable' | 'incomparable'
+  | 'aligned' | 'diverged' | 'co_anomalous' | 'target_normal'
 
 /**
  * 一个期望。数值期望不许人填（评测-D4）：只写从期望答案的结果里取哪一格、哪一列、整张表，值由 SQL / 口径算出来；分析期望
@@ -109,6 +111,9 @@ export type EvalJudgement = 'source' | 'dispersed' | 'flat' | 'mix' | 'rate' | '
 export interface EvalExpectation {
   minimum_depth?: number
   max_queries?: number
+  min_ontology_hops?: number
+  require_source_health?: boolean
+  diagnosis_stage?: 'health_and_contract' | 'slice_localization' | 'ontology_penetration'
   status?: 'complete' | 'partial'
   stop_reason?: string
   id?: string
@@ -377,21 +382,25 @@ export type EvalCatalogMode = 'live' | 'reviewed' | 'off' | 'snapshot'
 /** 分析工具开、关（关的那一臂助手建图时看不到分析工具和分析卡） */
 export type EvalAnalysisTools = 'on' | 'off'
 
-/** 预设对照：目录贡献（当前目录 vs 关，可加「只用已核实和已确认的项」）、分析工具贡献（开 vs 关） */
-export type EvalPreset = 'catalog' | 'catalog_reviewed' | 'analysis_tools'
+/** 本体穿透开、关（关的那一臂助手建图时看不到本体穿透工具与邻居提示） */
+export type EvalOntologyTools = 'on' | 'off'
+
+/** 预设对照：目录贡献（当前目录 vs 关，可加「只用已核实和已确认的项」）、分析工具贡献（开 vs 关）、本体穿透贡献（开 vs 关） */
+export type EvalPreset = 'catalog' | 'catalog_reviewed' | 'analysis_tools' | 'ontology_tools'
 
 export interface EvalModelPair {
   provider: string | null
   model: string | null
 }
 
-/** 一臂变体：助手、写作模型，结论裁判，目录，分析工具，重复次数，名字。加分析工具之前存下的评测记录里没有 analysis（当开） */
+/** 一臂变体：助手、写作模型，结论裁判，目录，分析工具，本体穿透，重复次数，名字。老评测记录里没有 analysis / ontology 时当开 */
 export interface EvalVariant {
   assistant: EvalModelPair
   writer: EvalModelPair
   judge: boolean
   catalog: { mode: EvalCatalogMode; snapshot: string | null }
   analysis: { tools: EvalAnalysisTools }
+  ontology: { tools: EvalOntologyTools }
   repeats: number
   label: string | null
 }

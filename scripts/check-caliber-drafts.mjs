@@ -536,6 +536,8 @@ await section('撤销：按保存前的值构造逆操作，带当前版本和�
   check('撤销用一个**新的**请求键', typeof undo.request_id === 'string' && undo.request_id
     && undo.request_id !== seen[0].request_id, `${seen[0].request_id} / ${undo.request_id}`)
   check('撤销不走整份覆盖（没有 metrics）', undo.metrics === undefined)
+  // 收到 PATCH 不等于响应已渲染：等新版本的回执，避免页面较忙时读到上一版。
+  await until(async () => (await textOf(page.locator('[data-draft-rule-result]'))).includes('已保存成 v9'))
   const after = await textOf(page.locator('[data-draft-rule-result]'))
   check('撤销后回执写清新版本', after.includes('已保存成 v9'), after)
   check('撤销记在这次会话里（提示已撤销）', await page.locator('[data-draft-rule-undo]').count() === 0)
@@ -686,6 +688,7 @@ await section('验证：独立期望试运行、样例对得上、审阅确认�
   const { page, errors } = await pageOn(state)
   await expand(page, state.draft)
   const panel = validationPanel(page)
+  await panel.waitFor({ state: 'visible' })
   check('验证一块画出来了', await panel.count() === 1)
   check('没有独立期望的记录如实标成「只记了试运行结果」',
     await panel.getAttribute('data-draft-validation') === 'observed',
@@ -852,6 +855,7 @@ await section('契约防御：试跑响应里的 validation 只有记录那一�
   const trialText = await textOf(trialBlock)
   check('读不到质量状态时不写「质量检查通过」', !trialText.includes('质量检查通过'), trialText)
   check('照实说质量结论还没有', !trialText.includes('质量检查未通过') && trialText.includes('尚未完成质量验证'), trialText)
+  await trialBlock.locator('[data-draft-trial-record]').waitFor({ state: 'visible' })
   check('试运行块里只画这一次的那条记录',
     await trialBlock.locator('[data-draft-trial-record="matched"]').count() === 1,
     await trialBlock.locator('[data-draft-trial-record]').count() + ' 条')
@@ -1618,6 +1622,7 @@ await section('重复工作项：同一条指标上有两条候选时，接受 /
   }
   const { page, errors } = await pageOn(state)
   await expand(page, state.draft)
+  await until(async () => await page.locator('[data-draft-import-item="m1"]').count() === 2)
   check('两条候选都摆出来了（同一条指标）', await page.locator('[data-draft-import-item="m1"]').count() === 2,
     String(await page.locator('[data-draft-import-item="m1"]').count()))
   // 只对第二条候选的那一格点接受
@@ -1858,6 +1863,308 @@ await section('验证反例：页面写的是「还不能算验证通过」，�
   check('结论按 data 属性核：不是 verified', await panel.getAttribute('data-draft-validation') === 'unverified',
     await panel.getAttribute('data-draft-validation'))
   check('页面没有报错', errors.length === 0, errors.slice(0, 2).join('；'))
+})
+
+await section('语义问数：常用叫法可输入多个，对象日期绑定按版本保存', async () => {
+  const state = makeState({ draft: draftOf({ draft: {
+    metrics: [{ id: 'm1', name: '日 OEE', grain: '工厂、日单值' }], metric_count: 1,
+    entry_fields: ['start', 'end', 'plant'].map(name => ({ name, type: 'string', required: true })),
+  } }), validations: { records: [], summary: summaryOf({ verdict: 'none', status: null }) } })
+  state.patch = body => {
+    state.draft = { ...state.draft, revision: 8, metrics: [{ ...state.draft.metrics[0], semantic: body.operations[0].value }] }
+    return { json: clone(state.draft) }
+  }
+  const { page, errors } = await pageOn(state)
+  await expand(page, state.draft)
+  const panel = page.locator('[data-query-semantics]')
+  await panel.locator('summary').click()
+  await panel.getByLabel('常用叫法（逗号分隔）').fill('OEE，设备综合效率')
+  await panel.getByLabel('汇总与缺失规则').fill('按实际开班时长加权，缺失不写零')
+  await panel.getByLabel('按日期查询').check()
+  await panel.getByLabel('开始（含）').selectOption('start')
+  await panel.getByLabel('结束（不含）').selectOption('end')
+  await panel.getByLabel('日期规则说明').fill('按已确认的生产日归属')
+  await panel.getByRole('button', { name: '添加对象类型', exact: true }).click()
+  await panel.getByLabel('对象类型', { exact: true }).fill('工厂')
+  await panel.getByLabel('绑定参数').selectOption('plant')
+  await panel.getByRole('button', { name: '添加对象', exact: true }).click()
+  await panel.getByLabel('工厂 value', { exact: true }).fill('P100')
+  await panel.getByLabel('工厂 label', { exact: true }).fill('工厂甲')
+  await panel.getByLabel('已确认上述定义与取数实现一致，发布后启用直接问数').check()
+  // 普通 HTTP 部署中没有 randomUUID，仍要能保存；这不是生成安全凭据。
+  await page.evaluate(() => Object.defineProperty(window.crypto, 'randomUUID', { value: undefined, configurable: true }))
+  await panel.getByRole('button', { name: '保存问数定义' }).click()
+  await until(() => patchBodies(state).length)
+  const body = patchBodies(state)[0]
+  check('单次字段变更带基准版本和目标卡', body?.expected_revision === 7 && body?.target?.card_id === 'card' && !!body?.request_id)
+  check('多个常用叫法均保留', JSON.stringify(body?.operations[0]?.value?.aliases) === JSON.stringify(['OEE', '设备综合效率']))
+  check('实体编号绑定到工厂参数', body?.operations[0]?.value?.entities[0]?.field === 'plant'
+    && body.operations[0].value.entities[0].members[0].value === 'P100')
+  check('默认只允许单日，未暗中启用月汇总', JSON.stringify(body?.operations[0]?.value?.time?.periods) === '["day"]')
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('语义编辑恢复：保存其他指标保留未保存内容并使用新版本', async () => {
+  const state = makeState({ draft: draftOf({ draft: {
+    metrics: [{ id: 'm1', name: '指标甲' }, { id: 'm2', name: '指标乙' }], metric_count: 2,
+  } }), validations: { records: [], summary: summaryOf({ verdict: 'none', status: null }) } })
+  state.patch = body => {
+    const op = body.operations[0]
+    state.draft = { ...state.draft, revision: state.draft.revision + 1,
+      metrics: state.draft.metrics.map(metric => metric.id === op.metric_id ? { ...metric, semantic: op.value } : metric) }
+    return { json: clone(state.draft) }
+  }
+  const { page, errors } = await pageOn(state)
+  await expand(page, state.draft)
+  const first = page.locator('[data-query-semantics]').nth(0)
+  const second = page.locator('[data-query-semantics]').nth(1)
+  await first.locator('summary').click()
+  await second.locator('summary').click()
+  await first.getByLabel('汇总与缺失规则').fill('甲的汇总规则')
+  await second.getByLabel('汇总与缺失规则').fill('乙尚未保存的规则')
+  await first.getByRole('button', { name: '保存问数定义' }).click()
+  await until(() => state.draft.revision === 8)
+  await until(async () => !await first.getByText('有未保存的修改；保存其他指标不会覆盖这里的内容。').count())
+  check('保存甲后乙仍展开且保留输入', await second.getByLabel('汇总与缺失规则').isVisible()
+    && await second.getByLabel('汇总与缺失规则').inputValue() === '乙尚未保存的规则')
+  await second.getByRole('button', { name: '保存问数定义' }).click()
+  await until(() => patchBodies(state).length === 2)
+  check('乙按新版本保存原编辑内容', patchBodies(state)[1]?.expected_revision === 8
+    && patchBodies(state)[1]?.operations[0]?.value?.aggregation === '乙尚未保存的规则')
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('语义编辑恢复：同指标外部更新阻止覆盖并可载入最新版', async () => {
+  const state = makeState({ draft: draftOf({ draft: {
+    metrics: [{ id: 'm1', name: '指标甲' }, { id: 'm2', name: '指标乙' }], metric_count: 2,
+  } }), validations: { records: [], summary: summaryOf({ verdict: 'none', status: null }) } })
+  state.patch = body => {
+    state.draft = { ...state.draft, revision: 9, metrics: [
+      { ...state.draft.metrics[0], semantic: body.operations[0].value },
+      { ...state.draft.metrics[1], semantic: { version: 1, enabled: false, aliases: [], grain: '',
+        aggregation: '其他人更新的规则', time: null, entities: [] } },
+    ] }
+    return { json: clone(state.draft) }
+  }
+  const { page, errors } = await pageOn(state)
+  await expand(page, state.draft)
+  const first = page.locator('[data-query-semantics]').nth(0)
+  const second = page.locator('[data-query-semantics]').nth(1)
+  await first.locator('summary').click()
+  await second.locator('summary').click()
+  await second.getByLabel('汇总与缺失规则').fill('乙本地未保存的规则')
+  await first.getByRole('button', { name: '保存问数定义' }).click()
+  const reload = second.getByRole('button', { name: '载入最新配置（放弃本地修改）' })
+  await reload.waitFor({ state: 'visible' })
+  check('同指标发生冲突时保留输入并禁止保存', await second.getByRole('button', { name: '保存问数定义' }).isDisabled()
+    && await second.getByLabel('汇总与缺失规则').inputValue() === '乙本地未保存的规则')
+  await reload.click()
+  check('明确放弃后载入服务端配置并可继续保存', await second.getByLabel('汇总与缺失规则').inputValue() === '其他人更新的规则'
+    && await second.getByRole('button', { name: '保存问数定义' }).isEnabled())
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('语义编辑恢复：关闭重开后旧保存响应不覆盖新详情', async () => {
+  const state = makeState({ draft: draftOf({ draft: {
+    metrics: [{ id: 'm1', name: '指标甲' }], metric_count: 1,
+  } }), validations: { records: [], summary: summaryOf({ verdict: 'none', status: null }) } })
+  let release
+  state.patch = body => new Promise(resolve => { release = () => resolve({ json: {
+    ...clone(state.draft), revision: 8,
+    metrics: [{ ...state.draft.metrics[0], semantic: body.operations[0].value }],
+  } }) })
+  const { page, errors } = await pageOn(state)
+  await expand(page, state.draft)
+  const panel = page.locator('[data-query-semantics]')
+  await panel.locator('summary').click()
+  await panel.getByLabel('汇总与缺失规则').fill('旧保存内容')
+  await panel.getByRole('button', { name: '保存问数定义' }).click()
+  await until(() => release)
+  await page.locator(`[data-draft="${state.draft.id}"] [data-draft-toggle]`).click()
+  state.draft = { ...state.draft, revision: 9, metrics: [{ id: 'm1', name: '新版本指标' }] }
+  await expand(page, state.draft)
+  release()
+  await page.waitForTimeout(200)
+  check('旧响应没有覆盖重开的新版本', (await panel.innerText()).includes('新版本指标'))
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('语义编辑恢复：慢网络起草轮询不并发堆积', async () => {
+  const state = makeState({ draft: draftOf({ draft: { status: 'drafting' } }),
+    validations: { records: [], summary: summaryOf({ verdict: 'none', status: null }) } })
+  const original = state.reply
+  let requests = 0, active = 0, peak = 0
+  state.reply = async (method, path, body, url) => {
+    if (method === 'GET' && path === `/ledger/drafts/${state.draft.id}` && ++requests > 1) {
+      active++; peak = Math.max(peak, active)
+      await new Promise(resolve => setTimeout(resolve, 3000))
+      active--
+    }
+    return original(method, path, body, url)
+  }
+  const { page, errors } = await pageOn(state)
+  await expand(page, state.draft)
+  await page.waitForTimeout(8500)
+  check('两轮以上慢请求仍最多一个在途', requests >= 3 && peak === 1, `requests=${requests}, peak=${peak}`)
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('语义编辑恢复：补充缺失指标候选可合并回原稿', async () => {
+  const item = id => ({ id, name: id, kind: 'metric', status: 'definition_only', fields: {},
+    dependencies: [], source: { document_id: 'doc', line: 1, quote: id } })
+  const originalDraft = draftOf({ draft: { status: 'questions_open',
+    metrics: [{ id: 'm1', name: '已有指标', source_definition_id: 'def1' }], metric_count: 1,
+    selected_definition_ids: ['def1', 'def2'],
+    semantic_inventory: { version: 1, items: [item('def1'), item('def2')], rules: [], warnings: [] },
+  } })
+  const state = makeState({ draft: clone(originalDraft),
+    validations: { records: [], summary: summaryOf({ verdict: 'none', status: null }) } })
+  const originalReply = state.reply
+  let continued, merged, mergeAttempts = 0
+  state.reply = async (method, path, body, url) => {
+    if (method === 'POST' && path === `/ledger/drafts/${originalDraft.id}/continue`) {
+      continued = body
+      state.draft = { ...clone(originalDraft), id: 'd-candidate', title: '补充指标候选', revision: 3,
+        metrics: [{ id: 'm2', name: '补充指标', source_definition_id: 'def2' }],
+        origin: { continuation_from: { draft_id: originalDraft.id, revision: 7, merge_required: true } } }
+      return { json: { draft_id: state.draft.id, status: state.draft.status, original_draft_id: originalDraft.id, merge_required: true } }
+    }
+    if (method === 'GET' && path === `/ledger/drafts/${originalDraft.id}` && state.draft.id !== originalDraft.id)
+      return { json: { ...clone(originalDraft), revision: 8 } }
+    if (method === 'POST' && path === '/ledger/drafts/d-candidate/merge') {
+      mergeAttempts++
+      if (mergeAttempts === 1) return { status: 409, json: { detail: '原稿已变化，请核对后重试' } }
+      merged = body
+      state.draft = { ...clone(originalDraft), revision: 9, metrics: [...originalDraft.metrics, ...state.draft.metrics] }
+      return { json: { ...clone(state.draft), merged_candidate_id: 'd-candidate' } }
+    }
+    return originalReply(method, path, body, url)
+  }
+  const { page, errors } = await pageOn(state)
+  await expand(page, state.draft)
+  let panel = page.locator('[data-draft-continuation]')
+  await panel.getByLabel('补充说明').fill('使用已核实的产量字段')
+  await panel.getByRole('button', { name: '继续处理未完成指标' }).click()
+  await until(() => continued)
+  check('继续请求包含基准版本和补充说明', continued?.expected_revision === 7 && continued?.guidance === '使用已核实的产量字段')
+  await panel.getByRole('button', { name: '合并补充指标到原稿' }).waitFor({ state: 'visible' })
+  await panel.getByRole('button', { name: '合并补充指标到原稿' }).click()
+  await panel.getByText('原稿已变化，请核对后重试', { exact: false }).first().waitFor({ state: 'visible' })
+  check('版本冲突保留候选和重试入口', state.draft.id === 'd-candidate'
+    && await panel.getByRole('button', { name: '合并补充指标到原稿' }).isEnabled())
+  await panel.getByRole('button', { name: '合并补充指标到原稿' }).click()
+  await until(() => merged)
+  check('合并采用原稿最新版本及候选版本', merged?.expected_revision === 8 && merged?.candidate_revision === 3)
+  await until(async () => await page.locator('[data-query-semantics]').count() === 2)
+  check('合并后回到保留已有指标的原稿', await page.locator('[data-query-semantics]').count() === 2
+    && state.draft.metrics[0].name === '已有指标')
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('语义问数：定义清单保留未实现项，无数据源指标不能被选择', async () => {
+  const item = (id, name, status) => ({ id, name, kind: 'metric', status, section: 'OEE 系列', formula: '原文公式',
+    policy: '缺失不写零', fields: { 指标: name, 公式: '原文公式' }, dependencies: [],
+    source: { document_id: 'doc', line: 8, quote: '| 原文公式 |' } })
+  const state = makeState({ draft: draftOf({ draft: {
+    status: 'path_pending', workflow_id: null, revision: null, card_id: null, metrics: [], entry_fields: [],
+    semantic_inventory: { version: 1, note: '尚未绑定数据', rules: [], items: [
+      item('day', '日 OEE', 'definition_only'), item('missing', '人均效率', 'unavailable'),
+    ] },
+  } }), validations: { records: [], summary: summaryOf({ verdict: 'none', status: null }) } })
+  const original = state.reply
+  let implementation
+  state.reply = async (method, p, body, url) => {
+    if (p === '/datasources/names') return { json: [{ id: 'source', name: '合成测试库', enabled: true }] }
+    if (method === 'POST' && p.endsWith('/implement')) {
+      implementation = body
+      return { status: 202, json: { draft_id: state.draft.id, status: 'drafting' } }
+    }
+    return original(method, p, body, url)
+  }
+  const { page, errors } = await pageOn(state)
+  await expand(page, state.draft)
+  const panel = page.locator('[data-semantic-inventory]')
+  check('默认不要求逐项勾选', await panel.locator('input[type="checkbox"]').count() === 0)
+  await panel.getByRole('button', { name: '仅处理部分指标', exact: true }).click()
+  check('无数据源定义保留但禁选', await panel.getByLabel('选择 人均效率', { exact: true }).isDisabled())
+  await panel.getByLabel('选择 日 OEE', { exact: true }).check()
+  await panel.getByLabel('用于实现的数据源').selectOption('source')
+  await panel.getByRole('button', { name: '开始处理选中的 1 项' }).click()
+  await until(() => implementation)
+  check('只提交选中的定义和数据源', JSON.stringify(implementation) === JSON.stringify({ selected: ['day'], datasource_id: 'source' }))
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('自动处理：默认全部、无需手动分批，持续展示进度和缺口', async () => {
+  const items = Array.from({ length: 13 }, (_, i) => ({ id: `metric-${i}`, name: `指标${i}`, kind: 'metric',
+    status: 'definition_only', fields: {}, dependencies: [], source: { document_id: 'doc', line: i + 1, quote: '原文' } }))
+  items.push({ ...items[0], id: 'missing', name: '无来源指标', status: 'unavailable' })
+  const state = makeState({ draft: draftOf({ draft: {
+    status: 'path_pending', datasource_id: null, workflow_id: null, revision: null, card_id: null,
+    metrics: [], entry_fields: [], semantic_inventory: { version: 1, rules: [], items },
+  } }), validations: { records: [], summary: summaryOf({ verdict: 'none', status: null }) } })
+  const original = state.reply
+  let implementation
+  state.reply = async (method, p, body, url) => {
+    if (p === '/datasources/names') return { json: [{ id: 'source', name: '唯一已授权测试库', enabled: true }] }
+    if (method === 'POST' && p.endsWith('/implement')) {
+      implementation = body
+      state.draft = { ...state.draft, status: 'drafting', selected_definition_ids: items.slice(0, 13).map(i => i.id),
+        implementation_mode: 'all', implementation_progress: { total: 13, completed: 6, pending: 7, blocked: 0, active_names: ['指标6'] },
+        definition_issues: [{ definition_id: 'missing', name: '无来源指标', reason: '原文注明无数据源' }] }
+      return { status: 202, json: { draft_id: state.draft.id, status: 'drafting' } }
+    }
+    return original(method, p, body, url)
+  }
+  const { page, errors } = await pageOn(state)
+  await expand(page, state.draft)
+  const panel = page.locator('[data-semantic-inventory]')
+  check('默认清单没有勾选框', await panel.locator('input[type="checkbox"]').count() === 0)
+  check('预告全部可实现项，排除无来源项', (await panel.innerText()).includes('将自动处理 13 项'))
+  await panel.getByRole('button', { name: '仅处理部分指标', exact: true }).click()
+  for (let i = 0; i < 7; i++) await panel.getByLabel(`选择 指标${i}`, { exact: true }).check()
+  check('可选范围不受内部六项批次限制', await panel.getByRole('button', { name: '开始处理选中的 7 项' }).isEnabled())
+  await panel.getByRole('button', { name: '恢复处理全部指标', exact: true }).click()
+  await panel.getByRole('button', { name: '自动处理全部可实现指标', exact: true }).click()
+  await until(() => implementation)
+  check('默认提交全部模式，没有偷偷沿用手选范围', JSON.stringify(implementation) === '{"datasource_id":"source"}')
+  await panel.locator('[data-implementation-progress]').waitFor()
+  const text = await panel.innerText()
+  check('持续进度说明已生成和待处理数', text.includes('已生成 6 项，待处理 7 项') && text.includes('正在处理：指标6'))
+  check('单独说明待补充来源的指标', text.includes('另有 1 项'))
+  check('不用用户再添加下一批', !text.includes('下一批') && !text.includes('最多选择 6'))
+  check('页面没有报错', errors.length === 0, errors.join('；'))
+})
+
+await section('旧口径迁移：显示粒度缺口，按检查版本准备独立草稿', async () => {
+  const state = makeState({ draft: draftOf(), validations: { records: [], summary: summaryOf({ verdict: 'none', status: null }) } })
+  const original = state.reply
+  let migration
+  state.reply = async (method, p, body, url) => {
+    if (p.endsWith('/migration') && method === 'GET') return { json: {
+      revision: 7, metrics_total: 1, metrics_needing_work: 1, can_rebuild: true,
+      note: '这是静态迁移检查，不代表查询结果已验证',
+      metrics: [{ card_id: 'card', metric_id: 'm1', name: '日 OEE', query_count: 1,
+        findings: [{ code: 'scalar_unproven', message: '最终取数未收敛为单行' }], guidance: '比率不能简单平均' }],
+    } }
+    if (p.endsWith('/migration') && method === 'POST') {
+      migration = body
+      return { status: 201, json: { draft_id: state.draft.id, status: 'path_pending' } }
+    }
+    return original(method, p, body, url)
+  }
+  const { page, errors } = await pageOn(state)
+  await expand(page, state.draft)
+  const panel = page.locator('[data-migration-panel]')
+  await panel.getByRole('button', { name: '检查问数与取数粒度' }).click()
+  await panel.getByText('共 1 项，1 项需处理').waitFor()
+  await panel.locator('details summary').click()
+  check('逐项显示粒度问题', await panel.getByText('最终取数未收敛为单行', { exact: true }).isVisible())
+  check('说明静态检查不等于验证通过', (await panel.innerText()).includes('不代表查询结果已验证'))
+  await panel.getByRole('button', { name: '从原文准备独立迁移草稿' }).click()
+  await until(() => migration)
+  check('迁移基于刚检查的版本，未整份覆盖旧图', JSON.stringify(migration) === '{"expected_revision":7}')
+  check('页面没有报错', errors.length === 0, errors.join('；'))
 })
 
 check('整个检查没有弹出原生对话框', dialogs.length === 0, dialogs.slice(0, 2).join('；'))

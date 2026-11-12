@@ -110,12 +110,14 @@ def prompt_fingerprint() -> str:
     from app.engine import analysis_claims, evidence, review
     from app.engine.investigation import INVESTIGATION_VERSION, InvestigationPolicy
     from app.tools.builtin.analysis import METHOD_GUIDE
+    from app.tools.ontology import ONTOLOGY_GUIDE
 
     parts = [copilot.NODE_REFERENCE, copilot._STREAM_PROTOCOL,
              copilot._user_message(copilot.GenerateIn(instruction="{question}", intent="answer"), patch=False),
              turn.RETRY_WITH_BASE, turn.RETRY_FROM_SCRATCH,
              str(getattr(review, "REVIEW_SYSTEM", "") or getattr(review, "SYSTEM_PROMPT", "")),
-             METHOD_GUIDE.id, METHOD_GUIDE.text, evidence.ANALYSIS_PROMPT, evidence.ANALYSIS_SEE_ONLY_PROMPT,
+             METHOD_GUIDE.id, METHOD_GUIDE.text, ONTOLOGY_GUIDE.id, ONTOLOGY_GUIDE.text,
+             evidence.ANALYSIS_PROMPT, evidence.ANALYSIS_SEE_ONLY_PROMPT,
              analysis_claims.ANALYSIS_RULES_PROMPT, analysis_claims.ANALYSIS_NONE_PROMPT,
              analysis_claims.ANALYSIS_REPAIR_PROMPT, analysis_claims.LEXICON_VERSION,
              INTENT_VERSION, analysis_gaps_fix(), INVESTIGATION_VERSION, InvestigationPolicy().model_dump()]
@@ -245,6 +247,7 @@ async def start(session: AsyncSession, suite: EvalSuite, variants: Sequence[Mapp
                                    "assistant_model": models.get("assistant"), "writer_model": models.get("writer"),
                                    "catalog_mode": (variant.get("catalog") or {}).get("mode"),
                                    "analysis_tools": variant_rules.analysis_tools(variant),
+                                   "ontology_tools": variant_rules.ontology_tools(variant),
                                    "snapshot_artifact": snapshot, "cron": cron},
                       counts={"total": len(cases) * repeats, "done": 0})
         session.add(run)
@@ -554,7 +557,8 @@ class EvalExecution(runtime.JobRun):
                           arm=arm.name, repeat=unit.repeat,
                           assistant=arm.variant.get("assistant") or {}, writer=arm.variant.get("writer") or {},
                           view=arm.view, analysis=self.analysis,
-                          analysis_tools=variant_rules.analysis_tools(arm.variant) == "on")
+                          analysis_tools=variant_rules.analysis_tools(arm.variant) == "on",
+                          ontology_tools=variant_rules.ontology_tools(arm.variant) == "on")
         driver = Driver(question, datasource_ids=list(case.get("datasource_ids") or []), ctx=ctx, on_phase=on_phase)
         try:
             if case.get("kind") == "workflow":

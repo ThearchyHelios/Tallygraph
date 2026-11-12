@@ -421,6 +421,30 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                  metrics=[m["id"] for m in lacking], metric_names=[m["name"] for m in lacking],
                  reason=lacking[0]["no_data_reason"],
                  message="指标" + "".join(f"「{m['name']}」" for m in lacking) + lacking[0]["no_data_reason"])
+    if violated := [m for m in metrics if m.get("contract_findings")]:
+        raw_findings = [
+            dict(f) if isinstance(f, Mapping) else str(f)
+            for m in violated
+            for f in (m.get("contract_findings") or [])
+            if f
+        ]
+        first_finding = raw_findings[0] if raw_findings else ""
+        detail = (
+            str(first_finding.get("detail") or first_finding.get("code") or "触发指标数值契约异常")
+            if isinstance(first_finding, Mapping)
+            else (str(first_finding) or "触发指标数值契约异常")
+        )
+        ctx.emit(
+            EventType.LOG,
+            level="warn",
+            code="metric_contract_violated",
+            metric=violated[0]["id"],
+            metrics=[m["id"] for m in violated],
+            metric_names=[m["name"] for m in violated],
+            findings=raw_findings,
+            reason=detail,
+            message="指标" + "".join(f"「{m['name']}」" for m in violated) + f"触发数值契约告警：{detail}",
+        )
     card = {
         "kind": "metric_set",
         "validation_version": 1,

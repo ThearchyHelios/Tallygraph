@@ -1654,7 +1654,7 @@ export interface ConversationTurn {
 /** 问数据一轮在服务端的任务现在怎样。status 用后台任务的状态词；stage 是在哪一步；attempt_seq 是这一次尝试从哪一条事件开始 */
 export interface ChatTurnJob {
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
-  stage: 'build' | 'run' | 'waiting' | 'review' | null
+  stage: 'ground' | 'build' | 'run' | 'waiting' | 'review' | null
   mode: string
   run_id: string | null
   attempt: number
@@ -1731,6 +1731,16 @@ export interface ReviewSignal {
   reason?: string
 }
 
+export interface AnomalyEscalation {
+  available: boolean
+  mode: 'prompt' | 'auto'
+  auto_escalate: boolean
+  button_label: string
+  signals: string[]
+  reason: string
+  follow_up_instruction: string
+}
+
 export interface ReviewResult {
   /** ok=没问题 / annotated=加了说明 / rewritten=重写过 / reverted=重写里有新数字被退回 */
   verdict: 'ok' | 'annotated' | 'rewritten' | 'reverted'
@@ -1749,6 +1759,8 @@ export interface ReviewResult {
    * 是 null。老服务端没有这个字段，问数据页照原来的规则自己判
    */
   retry_instruction?: string | null
+  /** 简单问数命中硬异常信号时的跨源本体排查升级提示（P1） */
+  anomaly_escalation?: AnomalyEscalation | null
   /** 复核这一次的用量（服务端 providers/usage.py 的汇总，没调模型时全 0）：这一轮的花费 = 助手 + 运行 + 复核 */
   usage?: {
     cost_usd?: number | null; unpriced_calls?: number; calls?: number; input_tokens?: number; output_tokens?: number
@@ -2596,6 +2608,47 @@ export interface AnalysisItem {
   from?: string
   params?: Record<string, any>
   hypothesis?: string
+}
+
+/** 数据源健康核查步骤（source_health / health_seal）的单条问题与单表检查明细 */
+export interface EvidenceHealthIssue {
+  code?: string
+  severity?: 'alert' | 'warn' | 'info' | string
+  source?: string
+  table?: string | null
+  message?: string
+}
+
+export interface EvidenceHealthTable {
+  source?: string
+  table?: string
+  status?: string
+  date_column?: string | null
+  data_range?: (string | null)[] | null
+  basis?: string | null
+  gaps?: number
+}
+
+export interface EvidenceHealthStep {
+  step: 'source_health' | 'health_seal' | string
+  alias?: string
+  node_id?: string | null
+  label?: string | null
+  call_id?: string
+  artifact?: string | null
+  eid?: string
+  eid_ok?: boolean
+  rendered?: string
+  render_ok?: boolean
+  hash_ok?: boolean | null
+  verdict?: 'healthy' | 'degraded' | 'anomalous' | string
+  phrase?: string
+  sources?: string[]
+  issues?: EvidenceHealthIssue[]
+  tables?: EvidenceHealthTable[]
+  ledger?: boolean
+  sealed?: boolean
+  note?: string
 }
 
 export interface EvidenceStep extends Omit<EvidenceInput, 'status'> {

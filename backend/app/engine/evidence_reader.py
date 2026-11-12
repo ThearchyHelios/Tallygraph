@@ -46,6 +46,8 @@ class Sealed:
     retrievals: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: 封存范围内台账里记过的分析结论：工件 id → {node_id, exec, call_id / item, inputs}
     analyses: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: 封存范围内台账里记过的数据源健康度快照：工件 id → {node_id, exec, call_id, source_name, status}
+    source_healths: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: 封存时记下的清单哈希（没封存的是 None）：旧答案的猜测按 (run_id, 它) 缓存
     manifest_hash: str | None = None
     #: 运行记录上的 manifest_seq 原值（老运行是 None）：按需裁判追加判定前核对封存没换过
@@ -201,6 +203,10 @@ async def read_sealed(run_id: str) -> Sealed:
                 elif entry.get("kind") == LEDGER_KIND:
                     out.analyses.setdefault(artifact, {
                         "node_id": node_id, **{k: entry[k] for k in ("exec", "call_id", "item", "inputs")
+                                               if entry.get(k) is not None}})
+                elif entry.get("kind") == "source_health":
+                    out.source_healths.setdefault(artifact, {
+                        "node_id": node_id, **{k: entry[k] for k in ("exec", "call_id", "verdict", "sources", "issue_count")
                                                if entry.get(k) is not None}})
     return out
 

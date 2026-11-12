@@ -7,15 +7,16 @@ import { errorMessage } from '../../lib/errors'
 import { formatCost, formatDateTime, shortId } from '../../lib/format'
 import { EVAL_TEXT } from '../../lib/termsEval'
 import type {
-  EvalAnalysisTools, EvalCatalogMode, EvalEstimate, EvalRun, EvalSnapshot, EvalStartBody, EvalSuite, EvalVariant,
+  EvalAnalysisTools, EvalCatalogMode, EvalEstimate, EvalOntologyTools, EvalRun, EvalSnapshot, EvalStartBody, EvalSuite, EvalVariant,
 } from '../../typesEval'
 import { ModelPick } from './parts'
 
 const T = EVAL_TEXT.start
-const MODES = ['single', 'ab', 'catalog', 'analysis_tools'] as const
+const MODES = ['single', 'ab', 'catalog', 'analysis_tools', 'ontology_tools'] as const
 type Mode = (typeof MODES)[number]
 const CATALOG_MODES: EvalCatalogMode[] = ['live', 'reviewed', 'off', 'snapshot']
 const ANALYSIS_TOOLS: EvalAnalysisTools[] = ['on', 'off']
+const ONTOLOGY_TOOLS: EvalOntologyTools[] = ['on', 'off']
 
 /** 一臂的变体（表单里的样子）：全部键都在，交上去之前不改形状 */
 export function blankVariant(base?: Partial<EvalVariant>): EvalVariant {
@@ -25,6 +26,7 @@ export function blankVariant(base?: Partial<EvalVariant>): EvalVariant {
     judge: base?.judge ?? false,
     catalog: { mode: base?.catalog?.mode ?? 'live', snapshot: base?.catalog?.snapshot ?? null },
     analysis: { tools: base?.analysis?.tools ?? 'on' },
+    ontology: { tools: base?.ontology?.tools ?? 'on' },
     repeats: base?.repeats ?? 1,
     label: base?.label ?? null,
   }
@@ -45,9 +47,9 @@ export function snapshotLabel(s: EvalSnapshot): string {
  * 重复次数，名字。题集设置里的「默认变体」也用它（定时评测按默认变体评）。预设对照里由预设定的那一项（目录、分析工具）不摆
  */
 export function ArmFields({ idPrefix, value, onChange, snapshots, withLabel = false, labelIndex = 0, hideCatalog = false,
-  hideAnalysis = false }: {
+  hideAnalysis = false, hideOntology = false }: {
   idPrefix: string; value: EvalVariant; onChange: (v: EvalVariant) => void; snapshots: EvalSnapshot[]
-  withLabel?: boolean; labelIndex?: number; hideCatalog?: boolean; hideAnalysis?: boolean
+  withLabel?: boolean; labelIndex?: number; hideCatalog?: boolean; hideAnalysis?: boolean; hideOntology?: boolean
 }) {
   const set = (patch: Partial<EvalVariant>) => onChange({ ...value, ...patch })
   const usable = usableSnapshots(snapshots)
@@ -92,6 +94,14 @@ export function ArmFields({ idPrefix, value, onChange, snapshots, withLabel = fa
           <select id={`${idPrefix}-analysis`} className="field w-24" value={value.analysis.tools} data-eval-analysis-tools=""
                   onChange={(e) => set({ analysis: { tools: e.target.value as EvalAnalysisTools } })}>
             {ANALYSIS_TOOLS.map((m) => <option key={m} value={m}>{T.analysisToolsMode[m]}</option>)}
+          </select>
+        </Field>
+      )}
+      {!hideOntology && (
+        <Field label={T.ontologyTools} htmlFor={`${idPrefix}-ontology`} hint={T.ontologyToolsHint}>
+          <select id={`${idPrefix}-ontology`} className="field w-24" value={value.ontology?.tools ?? 'on'} data-eval-ontology-tools=""
+                  onChange={(e) => set({ ontology: { tools: e.target.value as EvalOntologyTools } })}>
+            {ONTOLOGY_TOOLS.map((m) => <option key={m} value={m}>{T.ontologyToolsMode[m]}</option>)}
           </select>
         </Field>
       )}
@@ -145,7 +155,7 @@ export function StartDialog({ open, onClose, suite, evaluations, onStarted }: {
         const repeats = Math.max(first.repeats, 3)
         return cur.length >= 2 ? cur : [{ ...first, repeats, label: first.label || 'A' }, { ...first, repeats, label: 'B' }]
       }
-      return [m === 'catalog' || m === 'analysis_tools' ? { ...first, repeats: Math.max(first.repeats, 3) } : first]
+      return [m === 'catalog' || m === 'analysis_tools' || m === 'ontology_tools' ? { ...first, repeats: Math.max(first.repeats, 3) } : first]
     })
   }
 
@@ -160,6 +170,10 @@ export function StartDialog({ open, onClose, suite, evaluations, onStarted }: {
     if (mode === 'analysis_tools') {
       const { analysis: _a, label: _l, ...rest } = v
       return { preset: 'analysis_tools', variant: rest, ...base }
+    }
+    if (mode === 'ontology_tools') {
+      const { ontology: _o, label: _l, ...rest } = v
+      return { preset: 'ontology_tools', variant: rest, ...base }
     }
     return { variant: v, ...base }
   }, [mode, arms, reviewedArm, baseline])
@@ -224,7 +238,7 @@ export function StartDialog({ open, onClose, suite, evaluations, onStarted }: {
 
         {mode !== 'ab' && (
           <ArmFields idPrefix="eval-arm-0" value={arms[0] ?? blankVariant()} snapshots={snapshots} hideCatalog={mode === 'catalog'}
-                     hideAnalysis={mode === 'analysis_tools'} onChange={(v) => setArms([v])} />
+                     hideAnalysis={mode === 'analysis_tools'} hideOntology={mode === 'ontology_tools'} onChange={(v) => setArms([v])} />
         )}
         {mode === 'catalog' && (
           <label className="flex items-center gap-2 text-xs">

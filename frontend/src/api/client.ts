@@ -41,6 +41,7 @@ import { capabilities, endpoints, notify } from './capabilities'
 import { blueprints, files, personal, templates } from './blueprints'
 // 问数据的一轮在服务端跑（编排完善第 1 波）：发起、看、停，实时流在 chatTurns.ts 的 streamChatTurn
 import { chatTurns } from './chatTurns'
+import { ontology } from './ontology'
 
 // 请求层搬到了 http.ts（见那边的说明）。原先从这里导出的照旧从这里导出，调用方不用改；
 // 请求函数也一并转出，给不在 api/ 下、又想直接发请求的地方用。api/ 下的命名空间文件请直接从 http.ts 导入
@@ -867,6 +868,10 @@ export const api = {
       get<{ report?: { node_id?: string; doc_artifact?: string }; alias?: string; rendered?: string | null
             chain?: EvidenceSegmentDetail['chain']; seal?: EvidenceSegmentDetail['seal']; redacted?: EvidenceSegmentDetail['redacted'] }>(
         `/runs/${encodeURIComponent(runId)}/evidence/analyses/${encodeURIComponent(alias)}${qs({ report: opts?.report })}`, opts),
+    health: (runId: string, alias: string, opts?: RequestOptions & { report?: string }) =>
+      get<{ report?: { node_id?: string; doc_artifact?: string }; alias?: string; rendered?: string | null
+            chain?: EvidenceSegmentDetail['chain']; seal?: EvidenceSegmentDetail['seal']; redacted?: EvidenceSegmentDetail['redacted'] }>(
+        `/runs/${encodeURIComponent(runId)}/evidence/health/${encodeURIComponent(alias)}${qs({ report: opts?.report })}`, opts),
     /**
      * 审计表：每个有状态的片段按状态分组（有出处 / 无证据 / 可疑实体 / 旧运行猜测），附上封存核对的结果。
      * groups 只要这几组（none、suspicious…）
@@ -1002,6 +1007,8 @@ export const api = {
 
   // 问数据的一轮（服务端跑整轮：发起、看、停）
   chatTurns,
+  // 业务本体：标准业务实体与跨口径指标拓扑
+  ontology,
 }
 
 /**

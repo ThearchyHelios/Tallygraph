@@ -153,10 +153,25 @@ WARN_CODES: dict[str, tuple[str, str]] = {
     REFUSED_CODE: (REFUSED_CODE, DEGRADED),
     # 口径卡上用到两次查询的指标没做成可比性检查（探查失败、算不了）：指标照常算，两期能不能直接比要人自己核对
     "metric_comparability_skipped": ("metric_comparability_skipped", DEGRADED),
+    # 指标本体与跨源穿透异常信号（P1）：默认只说明、不进 RETRYABLE，由 anomaly_escalation 决定提示按钮或自动升级最多 1 轮
+    "metric_contract_violated": ("metric_contract_violated", DEGRADED),
+    "ontology_reconcile_alert": ("ontology_reconcile_alert", DEGRADED),
+    "source_health_anomalous": ("source_health_anomalous", DEGRADED),
 }
 #: 分析调用写错了、后来同一个分析工具一次都没做成（tool.error 带 call_error，见 scan）：这几次分析没做成，同 analysis_refused
 #: 是缺口不是断裂。它不是日志代码，是 scan 从工具事件里认出来的信号种类
 ANALYSIS_CALL_FAILED = "analysis_call_failed"
+METRIC_CONTRACT_VIOLATED = "metric_contract_violated"
+ONTOLOGY_RECONCILE_ALERT = "ontology_reconcile_alert"
+SOURCE_HEALTH_ANOMALOUS = "source_health_anomalous"
+#: 可触发「沿本体排查关联数据源」诊断升级提示（或 auto 模式下最多 1 轮自动升级）的硬异常信号（P1）
+ESCALATION_SIGNALS = frozenset({
+    METRIC_CONTRACT_VIOLATED,
+    "query_no_data",
+    "metric_no_data",
+    ONTOLOGY_RECONCILE_ALERT,
+    SOURCE_HEALTH_ANOMALOUS,
+})
 
 # 这些 kind 重跑一次大概率能好：原因说得清，且不是「问题本身没问明白」。
 # 工具参数错了、步数不够、图没校验过，都属于改一下再来一遍就行的。
@@ -167,7 +182,19 @@ REBUILD = {"query_no_data", "metric_no_data"}
 
 #: 只写说明、不自动重来的信号（00-总方案 §3.7）：都是缺口（DEGRADED）、不进 RETRYABLE / REBUILD。一次运行的信号全是
 #: 这几种时复核不叫模型，说明就照信号原话写（review）：答案照常、报告里已经标出，叫一次模型只是把同一句话换个说法
-NOTE_ONLY = frozenset({"investigation_incomplete", "report_analysis_claims", REFUSED_CODE, "metric_comparability_skipped", ANALYSIS_CALL_FAILED})
+NOTE_ONLY = frozenset({
+    "investigation_incomplete",
+    "report_analysis_claims",
+    REFUSED_CODE,
+    "metric_comparability_skipped",
+    ANALYSIS_CALL_FAILED,
+})
+#: 指标本体与数据源健康硬告警在默认 prompt 模式下同样只做说明、不触发自动复核模型改写
+ONTOLOGY_NOTE_ONLY = frozenset({
+    METRIC_CONTRACT_VIOLATED,
+    ONTOLOGY_RECONCILE_ALERT,
+    SOURCE_HEALTH_ANOMALOUS,
+})
 #: 「有 n 次分析没做成」那条信号里最多点名几次，其余写「……」
 _ANALYSIS_SHOWN = 3
 
@@ -221,6 +248,7 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
     # 不区分的话，参数自动纠正这条路每修一次就报一次「答案不可信」。
     recovered: set[str] = set()
     failed_at: dict[str, int] = {}
+    used_ontology_neighbors = False
     #: 节点名：node.started 带着画布上的名字，报失败时写名字，不写节点 id
     titles: dict[str, str] = {}
     for i, e in enumerate(rows):
@@ -229,6 +257,8 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
         if etype == EventType.NODE_STARTED and data.get("label"):
             titles.setdefault(str(_event_field(e, "node_id") or ""), str(data["label"]))
         tool = str(data.get("tool") or "")
+        if etype in (EventType.TOOL_START, EventType.TOOL_END) and tool == "ontology_neighbors":
+            used_ontology_neighbors = True
         if etype == EventType.TOOL_ERROR and tool:
             failed_at.setdefault(tool, i)
         elif etype == EventType.TOOL_END and tool and tool in failed_at:
@@ -311,6 +341,19 @@ def scan(events: Iterable[Any], output: Mapping[str, Any] | None = None) -> list
             reason = data.get("reason")
             if message:
                 add(kind, message[:300], severity, reason if isinstance(reason, str) and reason else None)
+
+        elif etype == EventType.TOOL_END:
+            tool = str(data.get("tool") or "")
+            art = data.get("analysis_artifact")
+            if isinstance(art, Mapping) and art.get("op") == "reconcile":
+                if art.get("verdict") in ("diverged", "missing_counterpart") and not used_ontology_neighbors:
+                    phrase = str(art.get("phrase") or "").strip() or "跨源指标对账结果出现显著背离或缺对手方数据"
+                    add(ONTOLOGY_RECONCILE_ALERT, phrase[:300], DEGRADED)
+            health_art = data.get("health_artifact")
+            if isinstance(health_art, Mapping) and health_art.get("verdict") == "anomalous":
+                if not (output and output.get("_evidence")):
+                    phrase = str(health_art.get("phrase") or "").strip() or "数据源健康探查发现同步或码值异常"
+                    add(SOURCE_HEALTH_ANOMALOUS, phrase[:300], DEGRADED)
 
     # 先插靠后的那条（位置一样时先插后出现的），靠前那条的位置就不受影响
     for kind in sorted(slots, key=lambda k: slots[k], reverse=True):
@@ -599,8 +642,8 @@ async def review(
     fallback_note = "；".join(s.detail for s in signals if s.severity == BROKEN) or "；".join(
         s.detail for s in signals
     )
-    if signals and all(s.kind in NOTE_ONLY for s in signals):
-        # 只写说明、不自动重来（NOTE_ONLY）：不叫模型，照信号原话说明
+    if signals and all(s.kind in (NOTE_ONLY | ONTOLOGY_NOTE_ONLY) for s in signals):
+        # 只写说明、不自动重来（NOTE_ONLY / ONTOLOGY_NOTE_ONLY）：不叫模型，照信号原话说明
         return ReviewResult(verdict="annotated", note=fallback_note, retry=False, signals=signals, severity=severity)
 
     messages = [("system", REVIEW_SYSTEM),

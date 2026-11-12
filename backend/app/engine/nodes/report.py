@@ -547,6 +547,15 @@ class _MaskedCells:
             snap = None
         self._memo[artifact] = await _cited_masks(snap, source, self._masks, artifact) if isinstance(snap, dict) else {}
 
+    async def all_query_masks(self) -> dict[str, dict[str, list[str]]]:
+        """预读当前目录全部查询快照的遮罩列映射，供快速直查在直通组装前过滤遮罩列。"""
+        for entry in self._catalog.values():
+            if isinstance(entry, dict) and entry.get("kind") == "query":
+                artifact = entry.get("artifact")
+                if isinstance(artifact, str) and artifact and artifact not in self._memo:
+                    await self._read(artifact, entry.get("source"))
+        return {a: m for a, m in self._memo.items() if m}
+
 
 def _masked_said(hits: list[dict[str, Any]]) -> str:
     """报告引用了遮罩列的那几处在缺口、日志里怎么说：「引用了 2 处取自遮罩列的格子（「v:Q2.r0.tel」、…）」，引用了值取自
@@ -791,19 +800,155 @@ async def _store(doc: dict[str, Any], ctx: NodeContext) -> str | None:
         return None
 
 
+async def _run_fast_inline_report(state: GraphState, ctx: NodeContext, on_violation: str) -> dict[str, Any]:
+    """快速直查专用零模型直通证据封装：0 次 LLM 调用、< 10ms 纯内存组装 report_doc 与封存事件。"""
+    from app.api.evidence import withheld_metrics
+    from app.chat.direct_evidence import normalize_and_bind_fast_citations
+    from app.engine.evidence import iter_segments
+
+    started = time.perf_counter()
+    source = str(ctx.cfg("reuse_answer_from", ""))
+    previous = (state.get("nodes") or {}).get(source) or {}
+    raw_answer = str(
+        previous.get("raw_text") if isinstance(previous.get("raw_text"), str) else (previous.get("text") or "")
+    ).strip()
+    shown_fallback = str(previous.get("text") or raw_answer).strip()
+    evidence_on = ledger_enabled(ctx.run)
+    zero_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0, "calls": 0}
+    upstream_model = str(previous.get("model") or "evidence")
+
+    def _plain_pass(text_val: str) -> dict[str, Any]:
+        res = {
+            "text": text_val,
+            "doc_artifact": None,
+            "stats": {},
+            "violations": [],
+            "repairs": 0,
+            "model": upstream_model,
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+            "answer_reused": True,
+            "writer_calls": 0,
+            **({"claims": "off", "analysis_claims": "off"} if evidence_on else {}),
+        }
+        upd: dict[str, Any] = {"nodes": {ctx.node.id: res}, "usage": zero_usage}
+        if ctx.cfg("emit_message", True):
+            upd["messages"] = [AIMessage(content=text_val or "（空）")]
+        var_name = ctx.cfg("assign_to", "")
+        if var_name:
+            upd["vars"] = {var_name: text_val}
+        return upd
+
+    if not evidence_on or not raw_answer:
+        return _plain_pass(shown_fallback)
+
+    spec = ctx.run.spec
+    upstream = {**state, "nodes": {k: v for k, v in (state.get("nodes") or {}).items() if k != ctx.node.id}}
+    catalog = report_catalog(upstream, spec, ctx.node)  # type: ignore[arg-type]
+    if not any(entry.get("kind") == "query" for entry in catalog.values()):
+        return _plain_pass(shown_fallback)
+
+    withheld = await withheld_metrics(catalog, nodes=state.get("nodes") or {}, ledger=state.get("evidence") or [])
+    catalog = withhold_metrics(catalog, withheld, _masked_word())
+    masked = _MaskedCells(catalog)
+    query_masks = await masked.all_query_masks()
+
+    prepared = normalize_and_bind_fast_citations(_unfenced(raw_answer), catalog, masked_columns=query_masks)
+    entities = report_entities(spec, ctx.node) == "link"
+    allow = report_allowance(spec, ctx.node)
+    doc = await masked(
+        compose_doc(
+            prepared,
+            catalog,
+            node_id=ctx.run.global_id(ctx.node.id),
+            run_id=ctx.run.run_id,
+            allow_numbers=allow,
+            cells_allowed=True,
+            entities=entities,
+            absence=False,
+            analysis_claims=None,
+        )
+    )
+    text = doc["markdown"]
+    has_cited = doc["stats"].get("numbers_cited", 0) > 0 or any(
+        s.get("state") == "deterministic" for s in iter_segments(doc)
+    )
+    if not has_cited:
+        return _plain_pass(text)
+
+    doc_artifact = await _store(doc, ctx)
+    if doc_artifact:
+        ctx.emit(
+            EventType.REPORT_CHECKED,
+            doc_artifact=doc_artifact,
+            ok=not doc["violations"],
+            stats=doc["stats"],
+            violations=doc["violations"][:20],
+            repairs=0,
+            on_violation=on_violation,
+            failed=False,
+            claims="off",
+            analysis_claims="off",
+        )
+        ctx.emit(
+            EventType.LOG,
+            level="info",
+            code="report_answer_reused",
+            message="已零延迟核验查询证据并生成可点击溯源文档",
+        )
+
+    result = {
+        "text": text,
+        "doc_artifact": doc_artifact,
+        "stats": doc["stats"],
+        "violations": doc["violations"][:20],
+        "repairs": 0,
+        "model": upstream_model,
+        "duration_ms": int((time.perf_counter() - started) * 1000),
+        "answer_reused": True,
+        "writer_calls": 0,
+        "claims": "off",
+        "analysis_claims": "off",
+        **({"masked_metrics": withheld} if withheld else {}),
+    }
+    updates: dict[str, Any] = {"nodes": {ctx.node.id: result}, "usage": zero_usage}
+    if ctx.cfg("emit_message", True):
+        updates["messages"] = [AIMessage(content=text or "（空）")]
+    var_name = ctx.cfg("assign_to", "")
+    if var_name:
+        updates["vars"] = {var_name: text}
+    return updates
+
+
 async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     numbers, max_repairs = _options(ctx)
     on_violation = str(ctx.cfg("on_violation", "") or "") or await _default_on_violation(ctx.run.run_id)
     if on_violation not in ON_VIOLATION:
         raise NodeError(ctx.node.id, _only("on_violation", ("flag", "fail"), on_violation))
 
-    async with SessionLocal() as session:
-        try:
-            model, model_id = await get_chat_model(session, _model_spec(ctx))
-        except ProviderNotConfigured as e:
-            raise NodeError(ctx.node.id, not_configured(e)) from e
-        # 写作目录的篇幅按这个模型的上下文窗口定（evidence.catalog_budget）
-        window = await model_window(session, _model_spec(ctx), model_id)
+    if ctx.cfg("ask_data_optimization") == 2:
+        return await _run_fast_inline_report(state, ctx, on_violation)
+
+    candidate = ""
+    if ctx.cfg("ask_data_optimization") == 1 and ledger_enabled(ctx.run) \
+            and await _run_class(ctx.run.run_id) == "exploratory":
+        source = str(ctx.cfg("reuse_answer_from", ""))
+        parents = {e.source for e in ctx.run.spec.edges if e.target == ctx.node.id}
+        agent_ids = {n.id for n in ctx.run.spec.nodes if n.type == NodeType.AGENT}
+        previous = (state.get("nodes") or {}).get(source) or {}
+        raw_answer = previous.get("text")
+        if source in parents & agent_ids and not previous.get("limited") and isinstance(raw_answer, str) \
+                and 0 < len(raw_answer.strip()) <= 1200 and re.search(r"\[\[(?:v|m):", raw_answer) \
+                and not leaked_markup(raw_answer):
+            candidate = raw_answer
+
+    model, model_id, window = None, "evidence", 4096
+    if not candidate:
+        async with SessionLocal() as session:
+            try:
+                model, model_id = await get_chat_model(session, _model_spec(ctx))
+            except ProviderNotConfigured as e:
+                raise NodeError(ctx.node.id, not_configured(e)) from e
+            window = await model_window(session, _model_spec(ctx), model_id)
 
     spec = ctx.run.spec
     # 目录按上游的产出建：这个节点自己上一次的产出（循环里重跑时）不算，它记下的 masked_metrics 这一次重新认
@@ -866,7 +1011,13 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     nudged = False
 
     async def draft(payload: list[BaseMessage]) -> tuple[BaseMessage, str]:
-        nonlocal nudged
+        nonlocal nudged, model, model_id
+        if model is None:
+            async with SessionLocal() as session:
+                try:
+                    model, model_id = await get_chat_model(session, _model_spec(ctx))
+                except ProviderNotConfigured as e:
+                    raise NodeError(ctx.node.id, not_configured(e)) from e
         stream = _RenderedStream(ctx, catalog, cells)
         began = time.perf_counter()
         response = await _invoke_streaming(model, payload, stream, model_id)  # type: ignore[arg-type]
@@ -904,8 +1055,18 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             doc["analysis_scope"] = scope
         return doc
 
-    response, raw = await draft(messages)
-    doc = await compose(raw)
+    reused = False
+    if candidate and claims != CLAIMS_JUDGE and not failed and not writer.trimmed \
+            and not any(entry.get("truncated") for entry in catalog.values()):
+        doc = await compose(candidate)
+        reused = not doc["violations"] and doc["stats"].get("numbers_cited", 0) > 0
+    if reused:
+        response = AIMessage(content=candidate)
+        ctx.emit(EventType.LOG, level="info", code="report_answer_reused",
+                 message="已直接核验问数答案和引用证据，无需再次调用模型撰写")
+    else:
+        response, raw = await draft(messages)
+        doc = await compose(raw)
     repairs = 0
     while (blocking := _blocking(doc["violations"], numbers)) and repairs < max_repairs \
             and not (repairs and not _again(blocking, analysis)):
@@ -986,7 +1147,8 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             f"报告有 {len(blocking)} 处未通过核对（已要求重写 {repairs} 次）：{head}{more}。{_fail_advice(blocking)}",
         )
 
-    usage = {key: sum(one[key] for one in spent) for key in spent[0]}
+    usage = ({key: sum(one[key] for one in spent) for key in spent[0]} if spent else
+             {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0, "calls": 0})
     usage["cost_usd"] = round(usage["cost_usd"], 6)
     text = doc["markdown"]
     result = {
@@ -997,6 +1159,7 @@ async def run_report(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         "repairs": repairs,
         "model": model_id,
         "duration_ms": int((time.perf_counter() - started) * 1000),
+        **({"answer_reused": reused, "writer_calls": len(spent)} if ctx.cfg("ask_data_optimization") == 1 else {}),
         **({"claims": claims} if evidence_on else {}),
         # 分析说法核对的处置：出口按它和文档里记的那一项判 strict 要不要记缺口（升级前的运行没有这个键）
         **({"analysis_claims": analysis} if evidence_on else {}),

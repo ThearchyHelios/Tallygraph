@@ -510,8 +510,270 @@ export interface DraftDefinition {
   citations?: DraftCitation[]
 }
 
+export interface QuerySemantics {
+  version: 1
+  enabled: boolean
+  aliases: string[]
+  grain: string
+  aggregation: string
+  time: null | { start: string; end: string; timezone: string; basis: 'calendar_day' | 'production_day'; periods: ('day' | 'month')[]; description: string }
+  entities: { field: string; label: string; entity_key?: string | null; members: { value: string; label: string; aliases: string[] }[] }[]
+}
+
+export type OntologyLinkKind = 'factor' | 'reconciles_with' | 'upstream_driver'
+export type OntologyFactorRole = 'numerator' | 'denominator' | 'multiplier' | 'addend' | 'subtrahend' | 'component'
+export type OntologyStatus = 'proposed' | 'verified' | 'confirmed' | 'rejected'
+
+export interface MetricOntologyTarget {
+  workflow_id: string
+  card_id: string
+  metric_id: string
+  version?: number
+}
+
+export interface MetricOntologyLink {
+  id?: string
+  kind: OntologyLinkKind
+  target: MetricOntologyTarget
+  status?: OntologyStatus
+  source?: 'human' | 'rule' | 'docdraft' | 'ai' | string
+  role?: OntologyFactorRole
+  entity_key?: string
+  lag_periods?: number
+  abs_tol?: number
+  rel_tol?: number
+  rationale?: string
+  citations?: Record<string, unknown>[]
+}
+
+export interface CanonicalEntityMember {
+  value: string
+  label: string
+  aliases: string[]
+  source_codes?: Record<string, string>
+}
+
+export interface CanonicalEntityBinding {
+  id?: string
+  source_id?: string | null
+  source_name: string
+  table_name: string
+  column_name: string
+  status: OntologyStatus
+  source: 'human' | 'rule' | 'ai' | 'profile' | string
+  note?: string
+  reason?: string
+  updated_at?: string
+  updated_by?: string | null
+}
+
+export interface CanonicalEntityCaliberParam {
+  id?: string
+  workflow_id: string
+  card_id?: string
+  param_name: string
+  status: OntologyStatus
+  source: 'human' | 'rule' | 'ai' | 'profile' | string
+  note?: string
+}
+
+export interface CanonicalEntity {
+  id: string
+  key: string
+  label: string
+  description: string
+  aliases: string[]
+  members: CanonicalEntityMember[]
+  bindings: CanonicalEntityBinding[]
+  caliber_params?: CanonicalEntityCaliberParam[]
+  version: number
+  created_by?: string | null
+  updated_by?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface WorkflowOntologyMetric {
+  metric_id: string
+  name: string
+  unit: string
+  contract?: Record<string, unknown> | null
+  links: MetricOntologyLink[]
+  lineage: { node_id?: string; source: string; tables: string[] }[]
+}
+
+export interface WorkflowOntologyCard {
+  workflow_id: string
+  workflow_name: string
+  version: number
+  card_id: string
+  title: string
+  caliber: string
+  sources: string[]
+  tables_by_source: Record<string, string[]>
+  metrics: WorkflowOntologyMetric[]
+}
+
+export interface WorkflowOntologyEdge {
+  id: string
+  kind: OntologyLinkKind
+  status: OntologyStatus
+  source: string
+  role?: OntologyFactorRole | null
+  entity_key?: string | null
+  lag_periods?: number
+  abs_tol?: number | null
+  rel_tol?: number | null
+  rationale?: string
+  from: { workflow_id: string; version: number; card_id: string; metric_id: string }
+  to: { workflow_id: string; version?: number | null; card_id: string; metric_id: string }
+}
+
+export interface WorkflowOntology {
+  workflow_id: string
+  version: number
+  cards: WorkflowOntologyCard[]
+  edges: WorkflowOntologyEdge[]
+  issues: { level: string; code: string; message: string; node_id?: string | null; field?: string | null }[]
+}
+
+export interface OntologyGraph {
+  cards: WorkflowOntologyCard[]
+  edges: WorkflowOntologyEdge[]
+  entities: CanonicalEntity[]
+  table_bridges?: Record<string, unknown>[]
+}
+
+export interface EntityAttachmentOut {
+  attachment_id: string
+  title: string
+  mime: string
+  char_count: number
+  chunk_count: number
+  saved_to_kb: boolean
+  document_id?: string | null
+  collection?: string | null
+}
+
+export interface EntityPatchChange {
+  id: string
+  op: 'upsert_entity' | 'upsert_binding' | 'remove_binding' | 'upsert_member' | 'upsert_caliber_param' | string
+  entity_key: string
+  entity_label: string
+  summary: string
+  before?: unknown
+  after?: unknown
+  reason: string
+  op_payload: Record<string, unknown>
+}
+
+export interface EntityApplyPatchOut {
+  applied_count: number
+  created_entities: number
+  updated_entities: number
+  bindings_changed: number
+  caliber_params_changed: number
+  members_changed: number
+  entities: CanonicalEntity[]
+  problems?: string[]
+}
+
+export interface EntityAssistantMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface EntityAssistantRequest {
+  messages: EntityAssistantMessage[]
+  source_ids?: string[]
+  focus_entity_key?: string | null
+  attachment_ids?: string[]
+  document_ids?: string[]
+  pending_ops?: Record<string, unknown>[]
+}
+
+export type EntityAssistantEvent =
+  | { type: 'text'; delta: string }
+  | {
+      type: 'query'
+      source: string
+      sql: string
+      columns: string[]
+      rows: unknown[][]
+      row_count: number
+      truncated: boolean
+      error?: string | null
+    }
+  | {
+      type: 'proposal'
+      changes: EntityPatchChange[]
+      expected_versions: Record<string, number>
+    }
+  | { type: 'done'; usage?: { input_tokens?: number; output_tokens?: number }; queries?: number }
+  | { type: 'error'; code?: string; message: string }
+
+export interface EntityDiscoveryJob {
+  id: string
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | string
+  source_ids: string[]
+  document_ids: string[]
+  attachment_ids: string[]
+  note: string
+  phase: string
+  summary: {
+    sources_scanned?: number
+    source_names?: string[]
+    tables_scanned?: number
+    columns_scanned?: number
+    workflows_scanned?: number
+    documents_scanned?: number
+    doc_titles?: string[]
+    chunks_scanned?: number
+    model_id?: string
+    step_index?: number
+    step_total?: number
+    progress_pct?: number
+    model_chars?: number
+    ops_detected?: number
+    candidate_keys?: string[]
+    applied_count?: number
+    created_entities?: number
+    updated_entities?: number
+    proposed_bindings?: number
+    proposed_params?: number
+    added_members?: number
+    skipped_count?: number
+    skipped_reasons?: string[]
+    touched_entities?: { id: string; key: string; label: string }[]
+  }
+  error?: string | null
+  started_by?: string | null
+  started_at?: string | null
+  finished_at?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface EntityDiscoveryActiveOut {
+  job: EntityDiscoveryJob | null
+  latest: EntityDiscoveryJob | null
+}
+
+export interface SemanticInventory {
+  version: number
+  note: string
+  warnings?: { document_id: string; line: number; quote: string; reason: string }[]
+  items: { id: string; name: string; kind: 'input' | 'metric'; section: string; formula: string; policy: string;
+    status: 'definition_only' | 'unavailable'; dependencies: string[]; implementation: string;
+    fields: Record<string, string>; source: { document_id: string; line: number; span: number[]; quote: string } }[]
+  rules: { document_id: string; section: string; text: string; line: number; span: number[] }[]
+}
+
 /** 草稿里的一条指标：业务定义 + 取数表达式；取数 SQL 在草稿图上（CaliberDraft.sql），这里不返回。 */
 export interface DraftMetric {
+  source_definition_id?: string
+  semantic?: QuerySemantics
+  links?: MetricOntologyLink[]
   id?: string
   name: string
   synonyms?: string[]
@@ -661,6 +923,7 @@ export interface DraftDocument {
 
 /** GET /api/ledger/drafts 的一条：只有计数和状态，正文用 GET /api/ledger/drafts/{id} 看 */
 export interface CaliberDraftSummary {
+  definition_count?: number
   id: string
   title: string
   status: CaliberDraftStatus
@@ -924,8 +1187,20 @@ export interface DraftChangeReceipt {
   binding: DraftBinding
 }
 
+export interface DraftDefinitionDiagnostic {
+  kind?: 'needs_info' | 'validation_failed' | string
+  reasons?: string[]
+  questions?: string[]
+}
+
 /** GET /api/ledger/drafts/{id}：payload 摊平在上层（documents / metrics / dropped / open_questions / alignment） */
 export interface CaliberDraft extends CaliberDraftSummary {
+  semantic_inventory?: SemanticInventory
+  selected_definition_ids?: string[]
+  implementation_mode?: 'all' | 'selected'
+  definition_issues?: { definition_id: string; name: string; reason: string }[]
+  implementation_progress?: { total: number; completed: number; pending: number; blocked: number; active_names: string[] }
+  definition_diagnostics?: Record<string, DraftDefinitionDiagnostic>
   job?: { status: string; attempt: number; error?: string | null; retryable: boolean }
 
   /**
@@ -988,7 +1263,9 @@ export interface CaliberDraft extends CaliberDraftSummary {
   collection?: string | null
   datasource_id?: string | null
   /** 起草时的文档 id 和附加要求 */
-  origin?: { documents?: string[]; guidance?: string }
+  origin?: { documents?: string[]; guidance?: string; fixed_filters?: string
+    continuation_from?: { draft_id: string; workflow_id?: string; revision: number; merge_required: boolean; merged_revision?: number }
+  }
   created_by?: string | null
   updated_at?: string | null
   workflow_name?: string | null

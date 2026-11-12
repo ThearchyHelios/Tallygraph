@@ -72,6 +72,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import StatementError
 
 from app.analysis.contract import CATALOG_PREFIX, LABELS as ANALYSIS_LABELS, LEDGER_KIND, is_result, method_label
+from app.data.source_health import LEDGER_KIND as HEALTH_KIND, is_health_result
 from app.api.coded import CodedHTTPException
 from app.core.artifact_store import load
 from app.core.events import EventType
@@ -411,9 +412,25 @@ def _graph_of(report: _Report, sealed: _Sealed, inputs: dict[str, Any]) -> tuple
             # 输入快照的 Q…，下钻的上一层 A…），图上看得出 A3 是从 Q2 算出来的
             item.update({k: entry[k] for k in ("op", "mode", "status", "verdict", "item", "call_id")
                          if entry.get(k) is not None})
+            targets = [t for t in dict.fromkeys(_catalog_alias_of(catalog, a) for a in entry.get("inputs") or [])
+                       if t and t != alias]
+            input_sources = {
+                str(catalog[t].get("source"))
+                for t in targets
+                if isinstance(catalog.get(t), dict) and catalog[t].get("source")
+            }
+            if len(input_sources) > 1 or entry.get("op") in ("reconcile", "cochange"):
+                item["cross_source"] = True
             edges.extend({"from": alias, "to": target, "rel": "derived_from", "report": report.node_id}
-                         for target in dict.fromkeys(_catalog_alias_of(catalog, a) for a in entry.get("inputs") or [])
-                         if target and target != alias)
+                         for target in targets)
+        elif entry.get("kind") == HEALTH_KIND:
+            item.update({k: entry[k] for k in ("verdict", "sources", "issue_count", "call_id")
+                         if entry.get(k) is not None})
+            checked_sources = {str(s) for s in entry.get("sources") or [] if s}
+            edges.extend({"from": alias, "to": q_alias, "rel": "health_of", "report": report.node_id}
+                         for q_alias, q_entry in catalog.items()
+                         if isinstance(q_entry, dict) and q_entry.get("kind") == "query"
+                         and str(q_entry.get("source") or "") in checked_sources)
         elif entry.get("kind") in ENTITY_KINDS:
             # 表和字段：叫什么、出现在哪几次查询里、来历（表结构快照 / SQL / 结果列）各自封存了没有
             item.update({k: entry[k] for k in ("name", "table", "tables", "qualified", "source") if entry.get(k)})
@@ -845,6 +862,8 @@ async def _chain(seg: dict[str, Any], doc: dict[str, Any], sealed: _Sealed,
     if cite.get("kind") == LEDGER_KIND or (cite.get("kind") == "cell" and entry.get("kind") == LEDGER_KIND):
         # 分析结论：判定语、具名标量、结果表的一格都接同一条链（判定 → 方法 → 计算 → 输入 → 复算 → 封存）
         return await _analysis_chain(seg, cite, entry, doc, sealed, masks)
+    if cite.get("kind") == HEALTH_KIND:
+        return _health_chain(seg, cite, entry, sealed)
     if cite.get("kind") == "cell":
         locator = cite.get("locator") or {}
         # 只有直接引用的单元格才可能推断来源（P4-SPEC 2.8.2）。指标链里的查询步骤不带：指标片段的推断来源只会
@@ -890,10 +909,13 @@ _OP_SETTINGS: dict[str, tuple[str, ...]] = {
     "trend": ("trend_min_points", "trend_alpha", "min_history", "max_history"),
     "differ": ("differ_alpha", "min_n", "min_expected"),
     "comparable": (),
+    "reconcile": ("reconcile_rel_tol", "reconcile_abs_tol"),
+    "cochange": ("k_warn", "k_alert", "min_history", "max_history", "cochange_max_lag"),
 }
 #: 输入的角色（analysis.contract.AnalysisInput.role）给人看的叫法；比率拆解的 headline 是整体比率，不是总数
 _INPUT_ROLES = {"data": "数据", "base": "基期", "target": "本期", "headline_base": "基期总数",
-                "headline_target": "本期总数", "parent": "上一层拆解"}
+                "headline_target": "本期总数", "parent": "上一层拆解",
+                "primary": "主侧数据", "counterpart": "对侧数据", "driver": "上游驱动"}
 _RATIO_ROLES = {"headline_base": "基期整体比率", "headline_target": "本期整体比率"}
 #: 闭合核对：headline 的那一格对着结论里的哪个数（细案 01 §2.1、§2.2）。可加拆解对各段之和（base_total / target_total），
 #: 比率拆解对整体比率，即各段分子之和 ÷ 分母之和（r_base_total / r_target_total）
@@ -909,6 +931,64 @@ def _analysis_of(artifact: str) -> tuple[dict[str, Any] | None, bool | None]:
     """取回一份分析结论：(结论, hash_ok)。哈希对不上的 (None, False)，取不回来的 (None, None)，内容不是分析结论的 (None, None)。"""
     content, ok = _fetch(artifact) if artifact else (None, None)
     return (content, ok) if ok is True and is_result(content) else (None, False if ok is False else None)
+
+
+def _health_of(artifact: str) -> tuple[dict[str, Any] | None, bool | None]:
+    """取回一份数据源健康结论：(结论, hash_ok)。"""
+    content, ok = _fetch(artifact) if artifact else (None, None)
+    return (content, ok) if ok is True and is_health_result(content) else (None, False if ok is False else None)
+
+
+def _health_chain(seg: dict[str, Any], cite: dict[str, Any], entry: dict[str, Any],
+                  sealed: _Sealed) -> list[dict[str, Any]]:
+    """数据源健康结论的出处链：健康核查判定 → 封存。"""
+    alias = str(cite.get("alias") or entry.get("alias") or "")
+    artifact = str(entry.get("artifact") or "")
+    result, hash_ok = _health_of(artifact)
+    info = sealed.source_healths.get(artifact)
+    in_ledger = sealed.trusted and (str(entry.get("node_id") or ""), artifact) in sealed.ledger
+    eid = make_eid(HEALTH_KIND, artifact or None, {})
+    phrase = result.get("phrase") if isinstance(result, dict) else None
+    rendered = None
+    if isinstance(phrase, str):
+        with contextlib.suppress(RenderError):
+            rendered = render_cell(phrase, kind="text")
+    judged: dict[str, Any] = {
+        "step": HEALTH_KIND,
+        "alias": alias,
+        "node_id": entry.get("node_id"),
+        "label": _node_label(sealed, entry.get("node_id")) or None,
+        **({k: entry[k] for k in ("call_id",) if entry.get(k)}),
+        "artifact": artifact or None,
+        "eid": entry.get("eid"),
+        "eid_ok": entry.get("eid") == eid,
+        "rendered": seg.get("text"),
+        "render_ok": rendered is not None and rendered == seg.get("text"),
+        "hash_ok": hash_ok,
+    }
+    seal = {
+        "step": "health_seal",
+        "alias": alias,
+        "node_id": entry.get("node_id"),
+        "artifact": artifact or None,
+        "ledger": info is not None,
+        "hash_ok": hash_ok,
+        "eid_ok": judged["eid_ok"],
+        "sealed": in_ledger and hash_ok is True and judged["eid_ok"],
+    }
+    if info is None:
+        seal["note"] = "这份数据源健康核查不属于封存范围内的任何事件，不能作为证据展示"
+    if result is None:
+        judged["note"] = "数据源健康核查与哈希不一致，疑似被修改" if hash_ok is False else "无法读取数据源健康核查"
+        return [judged, seal]
+    judged.update(
+        verdict=result.get("verdict"),
+        phrase=result.get("phrase"),
+        sources=list(result.get("sources") or []),
+        issues=list(result.get("issues") or []),
+        tables=list(result.get("tables") or []),
+    )
+    return [judged, seal]
 
 
 def _catalog_alias_of(catalog: dict[str, Any], artifact: Any) -> str | None:
@@ -3202,7 +3282,7 @@ async def evidence_provenance(run_id: str, segment_id: str, report: str | None =
 def _export_cite_key(seg: dict[str, Any]) -> tuple | None:
     """数字 / 取值 / 判定语片段的引用键：同一处引用（同一个指标、同一格、同一条分析结论的同一项、同样的换算）共用一条
     出处链。别的片段（表名、引文）的链跟着片段走，不归并。具名标量的键另接在后面：没有它的引用键和以前一模一样。"""
-    if seg.get("kind") not in ("number", "value", LEDGER_KIND):
+    if seg.get("kind") not in ("number", "value", LEDGER_KIND, HEALTH_KIND):
         return None
     cite = seg.get("cite")
     if not isinstance(cite, dict):
@@ -3996,7 +4076,7 @@ def _scope_catalog(sealed: _Sealed, report_node: str) -> dict[str, Any]:
     from app.engine.nodes.report import report_catalog
     from app.engine.schema import GraphSpec
 
-    entries = [e for e in sealed.entries if e.get("kind") != LEDGER_KIND]
+    entries = [e for e in sealed.entries if e.get("kind") not in (LEDGER_KIND, HEALTH_KIND)]
     try:
         spec = GraphSpec.model_validate(sealed.graph)
         node = spec.node_map().get(report_node)
@@ -4088,6 +4168,8 @@ def _note(seg: dict[str, Any], unit: dict[str, Any]) -> str:
                 "仅核对它存在且本次用到，不核对其业务含义")
     if seg.get("state") == "deterministic" and seg.get("kind") == "quote":
         return "这段原话在知识库检索命中的片段中逐字出现（空白归一化后比对），已由系统核对"
+    if seg.get("state") == "deterministic" and cite.get("kind") == HEALTH_KIND:
+        return "判定语由系统按数据源健康核查规则算出、按固定模板写成，未经模型转写；各项核查与封存见出处链"
     if seg.get("state") == "deterministic" and cite.get("kind") == LEDGER_KIND:
         if (cite.get("locator") or {}).get("key"):
             return "这个数取自分析结论的具名的数，由系统按固定规则显示，未经模型转写"
@@ -4666,7 +4748,7 @@ SEAL_NONE = "未封存：运行尚未结束，或正停在人工审批"
 _CSV_LABELS: dict[str, dict[Any, str]] = {
     "group": dict(GROUPS),
     "kind": {"number": "数字", "value": "值", "entity": "表名、字段名", "quote": "引文", "claim": "结论句",
-             "violation": "违规", LEDGER_KIND: "分析判定"},
+             "violation": "违规", LEDGER_KIND: "分析判定", HEALTH_KIND: "数据源健康"},
     "state": {"deterministic": "有出处", "none": "无证据", "candidate": "候选"},
     "issue": {"uncited_number": "没有出处的数字", "unresolved_ref": "引用无法解析", "unknown_entity": "疑似不存在的名称",
               "unverified_entity": "无法核实", "uncited_claim": "结论句未附依据", "no_candidate": "未找到候选",
@@ -4676,7 +4758,7 @@ _CSV_LABELS: dict[str, dict[Any, str]] = {
               "causal_unsupported": "因果说法没有依据",
               **{code: "文档不一致" for code in _INTEGRITY}},
     "evidence_kind": {"metric": "口径卡指标", "cell": "查询单元格", "input": "运行输入", "table": "表", "column": "字段",
-                      "quote": "知识库原话", "query": "查询结果", LEDGER_KIND: "分析结论"},
+                      "quote": "知识库原话", "query": "查询结果", LEDGER_KIND: "分析结论", HEALTH_KIND: "数据源健康"},
     "sealed": {True: "是", False: "否", None: "—"},
 }
 #: 电子表格会把以这些字符开头的格子当公式算：报告、答案里的字来自模型，照原样写进去就能被人利用

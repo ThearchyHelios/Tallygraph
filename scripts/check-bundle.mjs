@@ -925,7 +925,7 @@ await section('样本页：各种形状', async () => {
       await phrase.getAttribute('aria-label'))
     const detail = await detailText(page, phrase)
     check('analysis：点开判定语：判定语、判定标准、方法与版本（服务端带的叫法）', detail.includes('判定语')
-      && detail.includes('一段占总变化的一半以上算主要来源') && detail.includes('变化拆解（可加） · decompose.additive@1'),
+      && detail.includes('一段占总变化的一半以上算主要来源') && detail.includes('变化拆解（可加） · decompose.additive@2'),
       detail.replace(/\s+/g, ' ').slice(0, 300))
     // 这三份分析都是 Agent 现场做的（台账条目带 call_id）：那一句照旧标「Agent 写的假设」
     check('analysis：……附带说明、Agent 写的假设', detail.includes('附带说明') && detail.includes('Agent 写的假设')

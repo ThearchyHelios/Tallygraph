@@ -29,7 +29,7 @@ from typing import Any
 #: time_role / refund_rule 是 K04 的业务定义字段（统计时间口径、退款处理）：改了定义身份就变，绑定同步状态跟着重判。
 SEMANTIC_FIELDS = ("id", "name", "expression", "unit", "decimals", "format", "kind", "definition", "params", "external",
                    "rule", "assessment", "grain", "time_field", "numerator", "denominator", "dimensions", "filters",
-                   "contract", "time_role", "refund_rule")
+                   "contract", "time_role", "refund_rule", "semantic", "links")
 
 
 def _blank(value: Any) -> bool:

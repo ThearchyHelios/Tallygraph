@@ -236,6 +236,12 @@ def _typed_metric(metric: Mapping[str, Any], hidden: str | None) -> dict[str, An
     value = metric.get("value")
     out["value"] = exact(value)
     out["value_type"] = typed(value)
+    if metric.get("contract_findings"):
+        out["contract_findings"] = [
+            dict(f) if isinstance(f, Mapping) else str(f)
+            for f in metric["contract_findings"]
+            if f
+        ]
     out["quality"] = _metric_quality(metric)
     return out
 
@@ -1586,8 +1592,10 @@ class CaliberQueryArgs(BaseModel):
     workflow: str = Field(description="口径所在的工作流：工作流 id，或唯一的工作流名字")
     card: str = Field(description="工作流里那张口径卡的节点 id：一次只算一张卡")
     metric_ids: list[str] = Field(min_length=1, description="这次要算的指标 id，可以多个；空的不当整卡")
-    inputs: dict[str, Any] = Field(default_factory=dict,
-                                   description="这次入口的取值：{字段：值}，按入口声明的类型校验（日期写 YYYY-MM-DD）")
+    inputs: dict[str, Any] = Field(
+        default_factory=dict,
+        description="这次入口的取值：{字段：值}，按入口声明的类型校验（日期写 YYYY-MM-DD；跨源穿透传入对侧编码或标准实体键时由平台自动对齐换算）",
+    )
 
 
 @register(
@@ -1607,6 +1615,8 @@ async def caliber_query(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
       `parent_run_id`），不失去父关系；超时、失败、遮罩、空指标照实交回 `ok=False`，绝不冒充成功；
     - 交回的结果与交互工作台同一种形状：metrics + queries 数组（每条带 query_id / execution_id / attempt、工件、来源、
       参数材料），节点据此把每条 query artifact 以合法引用记进父 Run 的证据。"""
+    extra_entity_inputs = kwargs.pop("entity_inputs", None)
+    extra_from_source = kwargs.pop("from_source", None)
     args = CaliberQueryArgs(**kwargs)
     from app.db.base import SessionLocal
     from app.db.models import Run
@@ -1636,8 +1646,25 @@ async def caliber_query(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
             purpose = HOST_PURPOSE if run_class == "formal" else DEFAULT_PURPOSE
             declared_budget = options.get(BUDGET_OPTION)
             workflow_id = await _workflow_id(session, args.workflow)
+            effective_inputs = dict(args.inputs or {})
+            alignments: list[dict[str, Any]] = []
+            if effective_inputs or extra_entity_inputs:
+                from app.auth.chat_policy import restricted_actor
+                from app.tools.ontology import align_caliber_inputs
+
+                is_restricted = await restricted_actor(session, actor)
+                effective_inputs, alignments = await align_caliber_inputs(
+                    session,
+                    workflow_id=workflow_id,
+                    card_id=args.card,
+                    inputs=effective_inputs,
+                    entity_inputs=extra_entity_inputs if isinstance(extra_entity_inputs, Mapping) else None,
+                    from_source=str(extra_from_source) if extra_from_source else None,
+                    restricted=is_restricted,
+                )
             outcome = await execute(
-                session, workflow_id=workflow_id, card_id=args.card, metric_ids=args.metric_ids, inputs=args.inputs,
+                session, workflow_id=workflow_id, card_id=args.card, metric_ids=args.metric_ids,
+                inputs=effective_inputs,
                 purpose=purpose, actor=actor, parent_run_id=parent, run_options=options,
                 data_versions=versions if isinstance(versions, Mapping) else None,
                 budget=declared_budget if isinstance(declared_budget, Mapping) else None, trace=trace,
@@ -1647,7 +1674,36 @@ async def caliber_query(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
         # 拒（没发起）在工具这一层是一条失败，不是一份结果：机器码带在报错里，节点、Agent 的失败信息按它认这一档，
         # 不用去解析中文
         raise ValueError(f"{e.message}（{e.code}）") from None
-    return {"tool": CALIBER_QUERY, "kind": CALIBER_QUERY, **outcome.as_dict()}
+    out_payload: dict[str, Any] = {"tool": CALIBER_QUERY, "kind": CALIBER_QUERY, **outcome.as_dict()}
+    if alignments:
+        out_payload["ontology_alignment"] = alignments
+    violated = [m for m in out_payload.get("metrics") or [] if isinstance(m, Mapping) and m.get("contract_findings")]
+    emit_fn = getattr(ctx, "emit", None)
+    if violated and callable(emit_fn):
+        import inspect
+        from app.core.events import EventType
+
+        first_finding = (violated[0].get("contract_findings") or [""])[0]
+        detail = (
+            str(first_finding.get("detail") or first_finding.get("code") or "触发指标数值契约异常")
+            if isinstance(first_finding, Mapping)
+            else (str(first_finding) or "触发指标数值契约异常")
+        )
+        emitted = emit_fn(
+            EventType.LOG,
+            level="warn",
+            code="metric_contract_violated",
+            workflow_id=out_payload.get("workflow_id"),
+            card_id=out_payload.get("card_id"),
+            metric=violated[0].get("id"),
+            metrics=[m.get("id") for m in violated],
+            metric_names=[m.get("name") or m.get("id") for m in violated],
+            reason=detail,
+            message="指标" + "".join(f"「{m.get('name') or m.get('id')}」" for m in violated) + f"触发数值契约告警：{detail}",
+        )
+        if inspect.isawaitable(emitted):
+            await emitted
+    return out_payload
 
 
 async def _workflow_id(session: AsyncSession, ref: str) -> str:

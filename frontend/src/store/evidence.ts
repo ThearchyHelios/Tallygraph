@@ -96,6 +96,8 @@ export const askKey = (runId: string, report: string | undefined, unit: string) 
 
 /** 分析范围里一个编号的片段 id 前缀（证据面板拼的「scope:A1」，不在正文里；同服务端导出页的 SCOPE_REF） */
 export const SCOPE_SEG = 'scope:'
+/** 数据源健康核查的片段 id 前缀（「health:H1」） */
+export const HEALTH_SEG = 'health:'
 
 /**
  * 片段的缓存键：`runId:segId`。一次运行里有好几份报告时片段 id 会撞（每份都从 s0 数起），
@@ -169,6 +171,11 @@ export const useEvidence = create<EvidenceState>((set, get) => {
           report: r.report, chain: r.chain ?? [], seal: r.seal, redacted: r.redacted,
           // 不带 text：范围里的这一项写的是文档自己记着的判定语，正文这份是不是封存的那一份按工件 id 认
           segment: { id: segmentId, kind: 'analysis' },
+        }))
+        : segmentId.startsWith(HEALTH_SEG)
+        ? api.evidence.health(runId, segmentId.slice(HEALTH_SEG.length), { report }).then((r) => ({
+          report: r.report, chain: (r.chain ?? []) as unknown as EvidenceSegmentDetail['chain'], seal: r.seal, redacted: r.redacted,
+          segment: { id: segmentId, kind: 'source_health' },
         }))
         : api.evidence.segment(runId, segmentId, { report }))),
     // 最近一次运行 → 它封存范围内的报告核对（report.checked）。审计接口的 reports 带着结论句策略（claims，

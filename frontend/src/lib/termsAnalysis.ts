@@ -13,13 +13,14 @@
  */
 import { formatNumber } from './format'
 
-/** 五个算子（contract.OPS），按契约的先后 */
-export const ANALYSIS_OPS = ['decompose', 'baseline', 'trend', 'differ', 'comparable'] as const
+/** 算子（contract.OPS），按契约的先后 */
+export const ANALYSIS_OPS = ['decompose', 'baseline', 'trend', 'differ', 'comparable', 'reconcile', 'cochange'] as const
 export type AnalysisOp = (typeof ANALYSIS_OPS)[number]
 
 /** 算子的叫法：contract.OP_LABELS */
 export const ANALYSIS_OP_LABEL: Record<AnalysisOp, string> = {
   decompose: '变化拆解', baseline: '波动基线', trend: '趋势判断', differ: '差异检验', comparable: '可比性检查',
+  reconcile: '跨源对账', cochange: '伴随异动',
 }
 
 /** 模式的叫法：contract.MODE_LABELS（比率拆解和比率比较都叫「比率」） */
@@ -189,12 +190,15 @@ export const ANALYSIS_TEXT = {
       by: '维度列', period: '期次列', base: '基期', target: '本期', measure: '度量列', numerator: '分子列', denominator: '分母列',
       product: '乘积列', factors: '因子列', label: '度量的叫法', basis: '比较方式', grain: '期次粒度', lag: '和往前第几期比',
       pairs: '只比这几对', reference: '对照组', mean: '均值列', sd: '标准差列', sum: '合计列', sumsq: '平方和列', n: '样本数列',
-      value: '值列',
+      value: '值列', target_by: '对侧维度列', target_measure: '对侧度量列', unit_factor: '单位换算系数',
+      target_period: '驱动期次列', driver_measure: '驱动度量列',
     } as Record<string, string>,
     paramPlaceholder: {
       by: 'region', period: 'week', base: '2026-W41', target: '2026-W42', measure: 'gmv', numerator: 'refunds',
       denominator: 'orders', product: 'gmv', factors: 'orders、aov', label: '销售额', lag: '1', reference: '华东',
       mean: 'avg_amount', sd: 'sd_amount', sum: 'sum_amount', sumsq: 'sumsq_amount', n: 'orders', value: 'amount',
+      target_by: 'workcenter_code', target_measure: 'mirror_qty', unit_factor: '1', target_period: 'shift_date',
+      driver_measure: 'downtime_min',
     } as Record<string, string>,
     paramHint: {
       label: '系统写判定语时用；不写数字、百分号和单位，留空则用列名或数据目录中的名称',

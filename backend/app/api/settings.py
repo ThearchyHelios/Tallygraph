@@ -988,6 +988,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "agent_max_steps": 100,
         "agent_budget_tokens": 2_000_000,
         "agent_budget_usd": None,
+        # 问数简单查询撞上硬异常信号时的处置策略（P1）：prompt（默认，正常交付并提示一键本体排查）/ auto（自动升级最多 1 轮）
+        "anomaly_escalation_mode": "prompt",
     },
     "limits": {
         "max_graph_steps": app_settings.max_graph_steps,
@@ -1018,6 +1020,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 
+ANOMALY_ESCALATION_MODES = ("prompt", "auto")
+
+
 async def run_defaults(session: AsyncSession) -> dict[str, Any]:
     """设置里 run 这一组，没存过的键补内置默认。
 
@@ -1026,6 +1031,12 @@ async def run_defaults(session: AsyncSession) -> dict[str, Any]:
     """
     row = await session.get(Setting, "run")
     return {**DEFAULT_SETTINGS["run"], **((row.value if row else None) or {})}
+
+
+async def anomaly_escalation_mode(session: AsyncSession) -> str:
+    """问数简单查数命中硬异常时的本体排查升级策略：默认 prompt，明确设为 auto 时自动发起最多 1 轮诊断升级。"""
+    raw = (await run_defaults(session)).get("anomaly_escalation_mode")
+    return str(raw) if raw in ANOMALY_ESCALATION_MODES else "prompt"
 
 
 def tool_approval_default(run: dict[str, Any]) -> str:
@@ -1163,6 +1174,14 @@ async def put_settings(
     from app.tools.trust import SETTING_KEY as TRUST_KEY
 
     # 先查后写：一组里有一项不对就整个请求不落库，免得存下半组
+    if "run" in payload.values and isinstance(payload.values["run"], dict):
+        if "anomaly_escalation_mode" in payload.values["run"]:
+            mode = payload.values["run"]["anomaly_escalation_mode"]
+            if mode is not None and mode not in ANOMALY_ESCALATION_MODES:
+                raise HTTPException(
+                    422,
+                    f"异常升级策略（run.anomaly_escalation_mode）只能是 {' 或 '.join(ANOMALY_ESCALATION_MODES)}，当前为「{mode}」",
+                )
     if JUDGE_GROUP in payload.values and (problem := judge_problem(payload.values[JUDGE_GROUP])):
         raise HTTPException(422, problem)
     if VERIFY_GROUP in payload.values and (problem := verify_problem(payload.values[VERIFY_GROUP])):

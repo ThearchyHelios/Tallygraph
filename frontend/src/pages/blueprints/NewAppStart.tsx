@@ -61,7 +61,7 @@ export function NewAppStart() {
           <BackLink to="/apps?tab=apps" label={APP_TEXT.backToApps} />
           {!ready ? <Skeleton rows={4} />
             : !scope ? (
-              <EmptyState icon={<LayoutGrid size={28} />} title={NEW_APP_TEXT.personalOff} body={NEW_APP_TEXT.personalOffBody}
+              <EmptyState offline={false} icon={<LayoutGrid size={28} />} title={NEW_APP_TEXT.personalOff} body={NEW_APP_TEXT.personalOffBody}
                           action={<Link to="/chat" className="btn btn-sm">{NEW_APP_TEXT.goChat}</Link>} />
             ) : (
               <>

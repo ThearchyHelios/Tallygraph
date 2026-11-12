@@ -129,9 +129,25 @@ export function cellText(v: unknown): string {
   return String(v)
 }
 
+const DIAGNOSIS_STAGE_LABELS: Record<string, string> = {
+  health_and_contract: '数据源健康与契约',
+  slice_localization: '切片定位',
+  ontology_penetration: '跨源本体穿透',
+}
+
 /** 一个期望是从哪里取什么：「「gmv」第 1 行」「指标「gmv」」「按「地区」配对的多行」…… */
 export function expectationText(e: EvalExpectation): string {
-  if (e.kind === 'investigation') return `${e.status === 'partial' ? '明确保留调查缺口' : '完成调查'}${e.minimum_depth != null ? `，至少下钻 ${e.minimum_depth} 层` : ''}${e.max_queries != null ? `，最多查询 ${e.max_queries} 次` : ''}`
+  if (e.kind === 'investigation') {
+    const bits = [
+      e.status === 'partial' ? '明确保留调查缺口' : '完成调查',
+      e.require_source_health ? '需先核查数据源健康' : null,
+      e.min_ontology_hops != null ? `至少跨本体 ${e.min_ontology_hops} 跳` : null,
+      e.diagnosis_stage ? `诊断阶段：${DIAGNOSIS_STAGE_LABELS[e.diagnosis_stage] ?? e.diagnosis_stage}` : null,
+      e.minimum_depth != null ? `至少下钻 ${e.minimum_depth} 层` : null,
+      e.max_queries != null ? `最多查询 ${e.max_queries} 次` : null,
+    ].filter(Boolean)
+    return bits.join('，')
+  }
   const E = T.expectation
   let text: string
   switch (e.kind) {

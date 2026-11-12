@@ -45,6 +45,9 @@ CATALOG_LABEL = {"live": "当前目录", "reviewed": "只用已核实和已确�
 #: 分析工具开、关（变体的 analysis.tools）
 ANALYSIS_TOOLS = ("on", "off")
 ANALYSIS_TOOLS_LABEL = {"on": "开", "off": "关"}
+#: 本体穿透开、关（变体的 ontology.tools）
+ONTOLOGY_TOOLS = ("on", "off")
+ONTOLOGY_TOOLS_LABEL = {"on": "开", "off": "关"}
 REPEATS_MAX = 5
 #: 定时跑 1 次，A/B 对照缺省 3 次（评测-D10）
 SCHEDULE_REPEATS = 1
@@ -52,7 +55,7 @@ PAIR_REPEATS = 3
 #: 一次 A/B 最多几臂（目录贡献对照最多三臂）
 ARMS_MAX = 3
 LABEL_MAX = 40
-_KEYS = ("assistant", "writer", "judge", "catalog", "analysis", "repeats", "label")
+_KEYS = ("assistant", "writer", "judge", "catalog", "analysis", "ontology", "repeats", "label")
 
 
 def _invalid(message: str, field_name: str) -> CaseInvalid:
@@ -104,6 +107,10 @@ def normalize_variant(raw: Any, *, judge_default: bool = False, repeats_default:
     if not isinstance(analysis, Mapping) or set(analysis) - {"tools"} \
             or analysis.get("tools", "on") not in ANALYSIS_TOOLS:
         raise _invalid(f"变体的分析工具需要是 {{tools}}，tools 只能是 {'、'.join(ANALYSIS_TOOLS)}（开、关）", "variant.analysis")
+    ontology = {} if raw.get("ontology") is None else raw["ontology"]
+    if not isinstance(ontology, Mapping) or set(ontology) - {"tools"} \
+            or ontology.get("tools", "on") not in ONTOLOGY_TOOLS:
+        raise _invalid(f"变体的本体穿透需要是 {{tools}}，tools 只能是 {'、'.join(ONTOLOGY_TOOLS)}（开、关）", "variant.ontology")
     repeats = raw.get("repeats", repeats_default)
     if isinstance(repeats, bool) or not isinstance(repeats, int) or not 1 <= repeats <= REPEATS_MAX:
         raise _invalid(f"每题重复的次数需要是 1 到 {REPEATS_MAX} 的整数", "variant.repeats")
@@ -113,13 +120,19 @@ def normalize_variant(raw: Any, *, judge_default: bool = False, repeats_default:
     return {"assistant": _model_pair(raw.get("assistant"), "助手模型", "variant.assistant"),
             "writer": _model_pair(raw.get("writer"), "写作模型", "variant.writer"),
             "judge": judge, "catalog": {"mode": catalog["mode"], "snapshot": snapshot},
-            "analysis": {"tools": analysis.get("tools", "on")}, "repeats": repeats,
+            "analysis": {"tools": analysis.get("tools", "on")},
+            "ontology": {"tools": ontology.get("tools", "on")}, "repeats": repeats,
             "label": (label or "").strip()[:LABEL_MAX] or None}
 
 
 def analysis_tools(variant: Mapping[str, Any]) -> str:
     """这一臂的分析工具开不开：on / off。加这一项之前的变体（存着的老评测）没有它，按开。"""
     return "off" if (variant.get("analysis") or {}).get("tools") == "off" else "on"
+
+
+def ontology_tools(variant: Mapping[str, Any]) -> str:
+    """这一臂的本体穿透开不开：on / off。加这一项之前的变体（存着的老评测）没有它，按开。"""
+    return "off" if (variant.get("ontology") or {}).get("tools") == "off" else "on"
 
 
 def catalog_preset(base: Mapping[str, Any], *, reviewed: bool = False) -> list[dict[str, Any]]:
@@ -135,6 +148,12 @@ def analysis_tools_preset(base: Mapping[str, Any]) -> list[dict[str, Any]]:
     """「分析工具的贡献」预设对照：分析工具开 vs 关。模型、目录、裁判、重复次数照 base。"""
     return [{**copy.deepcopy(dict(base)), "analysis": {"tools": tools}, "label": f"分析工具{ANALYSIS_TOOLS_LABEL[tools]}"}
             for tools in ANALYSIS_TOOLS]
+
+
+def ontology_tools_preset(base: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """「本体穿透的贡献」预设对照：本体穿透开 vs 关。模型、目录、分析工具、裁判、重复次数照 base。"""
+    return [{**copy.deepcopy(dict(base)), "ontology": {"tools": tools}, "label": f"本体穿透{ONTOLOGY_TOOLS_LABEL[tools]}"}
+            for tools in ONTOLOGY_TOOLS]
 
 
 def arm_name(variant: Mapping[str, Any], index: int) -> str:
@@ -221,6 +240,8 @@ def variant_key(variant: Mapping[str, Any], models: Mapping[str, Any]) -> str:
             "snapshot": catalog.get("snapshot") if catalog.get("mode") == "snapshot" else None}
     if analysis_tools(variant) == "off":
         body["analysis_tools"] = "off"
+    if ontology_tools(variant) == "off":
+        body["ontology_tools"] = "off"
     return content_hash(canonical_json(body))[:16]
 
 
@@ -231,12 +252,15 @@ def describe(variant: Mapping[str, Any], models: Mapping[str, Any] | None = None
     parts = [f"助手 {models.get('assistant') or (variant.get('assistant') or {}).get('model') or '缺省'}",
              f"写作 {models.get('writer') or (variant.get('writer') or {}).get('model') or '各节点自己的'}",
              CATALOG_LABEL.get(catalog.get("mode") or "live", "当前目录"),
-             f"分析工具{ANALYSIS_TOOLS_LABEL[analysis_tools(variant)]}",
-             f"结论裁判{'开' if variant.get('judge') else '关'}", f"每题 {variant.get('repeats') or 1} 次"]
+             f"分析工具{ANALYSIS_TOOLS_LABEL[analysis_tools(variant)]}"]
+    if ontology_tools(variant) == "off":
+        parts.append(f"本体穿透{ONTOLOGY_TOOLS_LABEL['off']}")
+    parts += [f"结论裁判{'开' if variant.get('judge') else '关'}", f"每题 {variant.get('repeats') or 1} 次"]
     return " · ".join(parts)
 
 
-__all__ = ["ANALYSIS_TOOLS", "ANALYSIS_TOOLS_LABEL", "ARMS_MAX", "CATALOG_LABEL", "CATALOG_MODES", "PAIR_REPEATS",
+__all__ = ["ANALYSIS_TOOLS", "ANALYSIS_TOOLS_LABEL", "ARMS_MAX", "CATALOG_LABEL", "CATALOG_MODES",
+           "ONTOLOGY_TOOLS", "ONTOLOGY_TOOLS_LABEL", "PAIR_REPEATS",
            "REPEATS_MAX", "Resolved", "SCHEDULE_REPEATS", "VARIANT_INVALID", "VARIANT_UNAVAILABLE", "analysis_tools",
-           "analysis_tools_preset", "arm_name", "catalog_preset", "describe", "normalize_variant", "resolve_models",
-           "snapshot_artifact", "variant_key", "view_of"]
+           "analysis_tools_preset", "arm_name", "catalog_preset", "describe", "normalize_variant", "ontology_tools",
+           "ontology_tools_preset", "resolve_models", "snapshot_artifact", "variant_key", "view_of"]

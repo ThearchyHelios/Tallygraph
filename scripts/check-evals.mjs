@@ -549,7 +549,7 @@ await section('导航：评测在设置前面、⌥0；使用者看不到', asyn
   const nav = builder.page.locator('nav[aria-label="主导航"]')
   await nav.waitFor()
   const labels = await nav.locator('li > a[aria-keyshortcuts] > span:not([aria-hidden])').allInnerTexts()
-  check('搭建者：导航里有「评测」，紧挨着排在「设置」前面', labels.at(-1) === '设置' && labels.at(-2) === '评测', labels.join(','))
+  check('搭建者：导航末尾依次为「评测」「口径」「设置」', labels.slice(-3).join(',') === '评测,口径,设置', labels.join(','))
   const key = await nav.locator('a[href="/evals"]').getAttribute('aria-keyshortcuts')
   check('「评测」的快捷键是 ⌥0', key === 'Alt+0', key)
   await builder.page.locator('main').click({ position: { x: 600, y: 300 } }).catch(() => {})

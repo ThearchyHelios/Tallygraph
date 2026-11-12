@@ -74,6 +74,8 @@ class TurnContext:
     analysis: Mapping[str, Any] | None = None
     #: 变体：分析工具开不开（variants.analysis_tools）。关的那一臂建图时助手看不到分析工具（TurnDriver 的 analysis_tools）
     analysis_tools: bool = True
+    #: 变体：本体穿透开不开（variants.ontology_tools）。关的那一臂建图时助手看不到本体工具与邻居提示
+    ontology_tools: bool = True
 
 
 async def writer_usage(run_ids: list[str]) -> dict[str, Any]:
@@ -163,7 +165,7 @@ class Driver(TurnDriver):
                  on_phase: Callable[[str], Awaitable[None]] | None = None) -> None:
         super().__init__(question, datasource_ids=datasource_ids, on_phase=on_phase,
                          provider=ctx.assistant.get("provider"), model=ctx.assistant.get("model"),
-                         analysis_tools=ctx.analysis_tools)
+                         analysis_tools=ctx.analysis_tools, ontology_tools=ctx.ontology_tools)
         self.ctx = ctx
 
     def catalog_view(self) -> Any:

@@ -3200,7 +3200,7 @@ await section('分析卡：叫法和服务端契约一字不差（算子、模�
   })
   const same = (a, b) => JSON.stringify(Object.entries(a).sort()) === JSON.stringify(Object.entries(b).sort())
   const diff = (a, b) => Object.keys({ ...a, ...b }).filter((k) => a[k] !== b[k]).map((k) => `${k}：${a[k]} ≠ ${b[k]}`).join('；')
-  check('从 contract.py 读出了 OP_LABELS、MODE_LABELS、LABELS、RANGES', Object.keys(dict('OP_LABELS')).length === 5
+  check('从 contract.py 读出了 OP_LABELS、MODE_LABELS、LABELS、RANGES', Object.keys(dict('OP_LABELS')).length === 7
     && Object.keys(dict('MODE_LABELS')).length === 6 && Object.keys(dict('LABELS')).length >= 17 && Object.keys(ranges).length >= 17)
   check('算子的叫法和 OP_LABELS 一字不差', same(t.op, dict('OP_LABELS')), diff(t.op, dict('OP_LABELS')))
   check('模式的叫法和 MODE_LABELS 一字不差', same(t.mode, dict('MODE_LABELS')), diff(t.mode, dict('MODE_LABELS')))

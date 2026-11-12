@@ -38,6 +38,9 @@ SCOPE_KEY = "analysis_scope"
 ANALYSIS_TOOLS = frozenset(contract.TOOL_NAMES.values())
 #: 交回 agent 的那一段开头的编号写法，和查询的「【证据 Qn】」一个样子
 REPLY_HEAD = "【分析 {alias}】"
+#: 数据源健康度工具交回 agent 的编号写法（证据目录里编成 H1、H2……）
+HEALTH_PREFIX = "H"
+HEALTH_REPLY_HEAD = "【健康 {alias}】"
 #: 调用写错时交回 agent 的那句的开头：说清没有记成结论，下一步照着改
 CALL_ERROR_HEAD = "分析调用有误，没有记成结论："
 #: agent 写的「这次在验证什么」最多留多少字（只在证据面板显示，不进正文）
@@ -82,6 +85,19 @@ class AnalysisScope:
     probe_cache: dict[str, Any] = field(default_factory=dict)
     #: 已经换成工件库里那份完整快照的编号（prepare 每份只取回一次）
     prepared: set[str] = field(default_factory=set)
+    #: 数据源健康度核查结论：编号 Hn → 健康度结果 / 工件 id
+    source_healths: dict[str, dict[str, Any]] = field(default_factory=dict)
+    health_artifacts: dict[str, str] = field(default_factory=dict)
+    #: 本体穿透状态跟踪（重放时按 tool_step 返回值复现，保证确定性）
+    ontology_neighbors: list[dict[str, Any]] = field(default_factory=list)
+    focal_calibers: set[str] = field(default_factory=set)
+    focal_sources: set[str] = field(default_factory=set)
+    queried_calibers: set[str] = field(default_factory=set)
+    queried_sources: set[str] = field(default_factory=set)
+    traversed_targets: set[str] = field(default_factory=set)
+    contract_violations: list[dict[str, Any]] = field(default_factory=list)
+    ontology_hops: int = 0
+    cross_queries: int = 0
 
     def add_query(self, alias: str, snapshot: InputSnapshot) -> None:
         self.queries[alias] = snapshot
@@ -96,6 +112,97 @@ class AnalysisScope:
         self.results[alias] = result
         self.artifacts[alias] = artifact
         return alias
+
+    def next_health_alias(self) -> str:
+        """下一份数据源健康度核查在本节点的编号（H1、H2……）。"""
+        return f"{HEALTH_PREFIX}{len(self.source_healths) + 1}"
+
+    def add_health(self, result: Mapping[str, Any], artifact: str) -> str:
+        """记一份数据源健康度结论，返回编号 H1、H2……。"""
+        alias = self.next_health_alias()
+        self.source_healths[alias] = dict(result)
+        self.health_artifacts[alias] = artifact
+        return alias
+
+    def record_ontology_neighbors(
+        self,
+        neighbors: Iterable[Mapping[str, Any]],
+        focal_metrics: Iterable[Mapping[str, Any]] = (),
+    ) -> None:
+        """幂等记录 1 跳已确认本体邻居与起点口径/数据源。"""
+        if not self.focal_calibers and not self.focal_sources:
+            for fm in focal_metrics:
+                wf_id = str(fm.get("workflow_id") or "").strip()
+                card_id = str(fm.get("card_id") or "").strip()
+                if wf_id:
+                    self.focal_calibers.add(f"{wf_id}:{card_id}" if card_id else wf_id)
+                for src in fm.get("sources") or []:
+                    if src:
+                        self.focal_sources.add(str(src))
+        existing = {
+            (
+                str(n.get("kind") or ""),
+                str((n.get("target") or {}).get("workflow_id") or ""),
+                str((n.get("target") or {}).get("card_id") or ""),
+                str((n.get("target") or {}).get("metric_id") or ""),
+            )
+            for n in self.ontology_neighbors
+        }
+        for nb in neighbors:
+            target = nb.get("target") or {}
+            key = (
+                str(nb.get("kind") or ""),
+                str(target.get("workflow_id") or ""),
+                str(target.get("card_id") or ""),
+                str(target.get("metric_id") or ""),
+            )
+            if key not in existing:
+                existing.add(key)
+                self.ontology_neighbors.append(dict(nb))
+
+    def record_query_target(
+        self,
+        *,
+        sources: Iterable[str] = (),
+        workflow_id: str | None = None,
+        card_id: str | None = None,
+        violations: Iterable[Mapping[str, Any]] = (),
+    ) -> None:
+        """记录查询命中的口径或数据源，自动统计跨源查询数与本体跳数。"""
+        clean_sources = [str(s).strip() for s in sources if s and str(s).strip()]
+        cal_key = f"{workflow_id}:{card_id}" if workflow_id and card_id else (str(workflow_id) if workflow_id else "")
+
+        first_touch = not self.focal_calibers and not self.focal_sources
+        if first_touch:
+            if cal_key:
+                self.focal_calibers.add(cal_key)
+            self.focal_sources.update(clean_sources)
+        else:
+            is_cross = False
+            if cal_key and cal_key not in self.focal_calibers:
+                is_cross = True
+                self.traversed_targets.add(f"caliber:{cal_key}")
+            for src in clean_sources:
+                if self.focal_sources and src not in self.focal_sources:
+                    is_cross = True
+                    if not cal_key:
+                        self.traversed_targets.add(f"source:{src}")
+            if is_cross:
+                self.cross_queries += 1
+                self.ontology_hops = len(self.traversed_targets)
+
+        if cal_key:
+            self.queried_calibers.add(cal_key)
+        if workflow_id:
+            self.queried_calibers.add(str(workflow_id))
+        self.queried_sources.update(clean_sources)
+
+        seen_v = {(v.get("metric_id"), v.get("detail")) for v in self.contract_violations}
+        for v in violations:
+            vkey = (v.get("metric_id"), v.get("detail"))
+            if vkey not in seen_v:
+                seen_v.add(vkey)
+                self.contract_violations.append(dict(v))
 
     def resolve(self, name: str) -> InputSnapshot | None:
         return self.queries.get(str(name).strip())
@@ -384,8 +491,113 @@ def hypothesis_of(value: Any) -> str | None:
     return text[:HYPOTHESIS_MAX] if text else None
 
 
+def health_payload_of(content: Any) -> dict[str, Any] | None:
+    """source_health 工具交回的 JSON → {artifact, result}；不是健康度结果的返回 None。"""
+    from app.data.source_health import is_health_result
+
+    data = content
+    if isinstance(data, str):
+        if not data.lstrip().startswith("{"):
+            return None
+        try:
+            data = json.loads(data)
+        except ValueError:
+            return None
+    if not isinstance(data, dict):
+        return None
+    artifact = data.get("artifact")
+    result = data.get("result")
+    if not (isinstance(artifact, str) and artifact and is_health_result(result)):
+        return None
+    return {"artifact": artifact, "result": dict(result)}
+
+
+def health_reply_text(alias: str, result: Mapping[str, Any]) -> str:
+    """交回模型的数据源健康度摘要：「【健康 Hn】」加紧凑 JSON。"""
+    body: dict[str, Any] = {
+        "verdict": result.get("verdict"),
+        "phrase": result.get("phrase"),
+        "sources": [
+            {
+                k: s[k]
+                for k in ("source", "source_label", "verdict", "issue_count", "phrase")
+                if isinstance(s, Mapping) and k in s
+            }
+            for s in (result.get("sources") or [])
+            if isinstance(s, Mapping)
+        ],
+        "issues": list(result.get("issues") or []),
+    }
+    if result.get("caliber_ref"):
+        body["caliber_ref"] = result["caliber_ref"]
+    return HEALTH_REPLY_HEAD.format(alias=alias) + "\n" + json.dumps(body, ensure_ascii=False, default=str)
+
+
+def health_event_view(result: Mapping[str, Any], alias: str | None = None) -> dict[str, Any]:
+    """source_health 在 tool.end 上附带的简要判定视图。"""
+    return {
+        "alias": alias,
+        "verdict": result.get("verdict"),
+        "phrase": result.get("phrase") or "",
+        "issue_count": len(result.get("issues") or []),
+    }
+
+
+def record_ontology_call(scope: AnalysisScope | None, name: str, content: Any) -> None:
+    """在 tool_step 返回之后幂等记录 ontology_neighbors / caliber_query / db_query 的跨源穿透状态（支持节点重放）。"""
+    if scope is None:
+        return
+    data = content
+    if isinstance(data, str):
+        if not data.lstrip().startswith("{"):
+            return
+        try:
+            data = json.loads(data)
+        except ValueError:
+            return
+    if not isinstance(data, Mapping):
+        return
+
+    if name == "ontology_neighbors" and data.get("kind") == "ontology_neighbors":
+        scope.record_ontology_neighbors(
+            data.get("neighbors") or [],
+            focal_metrics=data.get("focal_metrics") or [],
+        )
+        return
+
+    if name == "caliber_query" and data.get("workflow_id"):
+        q_sources = [
+            str(q.get("data_source") or "")
+            for q in (data.get("queries") or [])
+            if isinstance(q, Mapping) and q.get("data_source")
+        ]
+        violations: list[dict[str, Any]] = []
+        for m in data.get("metrics") or []:
+            if not isinstance(m, Mapping):
+                continue
+            for chk in (m.get("quality") or {}).get("checks") or []:
+                if isinstance(chk, Mapping) and chk.get("code") == "metric_contract":
+                    violations.append({
+                        "metric_id": m.get("id"),
+                        "name": m.get("name"),
+                        "detail": chk.get("detail"),
+                    })
+        scope.record_query_target(
+            sources=q_sources,
+            workflow_id=str(data.get("workflow_id") or "") or None,
+            card_id=str(data.get("card_id") or "") or None,
+            violations=violations,
+        )
+        return
+
+    if name.startswith("db_query__") and data.get("source"):
+        scope.record_query_target(sources=[str(data["source"])])
+
+
 __all__ = [
-    "ANALYSIS_TOOLS", "CALL_ERROR_HEAD", "REFUSED_CODE", "REPLY_HEAD", "SCOPE_KEY", "AnalysisScope", "call_error_text", "context_of",
-    "event_view", "hypothesis_of", "input_snapshot", "is_analysis_tool", "masked_of", "payload_of", "prepare", "reply_text",
-    "run_snapshot", "scope_of", "settings_of", "store", "tool_context",
+    "ANALYSIS_TOOLS", "CALL_ERROR_HEAD", "HEALTH_PREFIX", "HEALTH_REPLY_HEAD", "REFUSED_CODE", "REPLY_HEAD",
+    "SCOPE_KEY", "AnalysisScope", "call_error_text", "context_of", "event_view", "health_event_view",
+    "health_payload_of", "health_reply_text", "hypothesis_of", "input_snapshot", "is_analysis_tool", "masked_of",
+    "payload_of", "prepare", "record_ontology_call", "reply_text", "run_snapshot", "scope_of", "settings_of", "store",
+    "tool_context",
 ]

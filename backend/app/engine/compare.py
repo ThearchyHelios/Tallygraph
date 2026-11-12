@@ -115,10 +115,11 @@ _CFG_KEYS: dict[str, frozenset[str]] = {
     # 自己从不写这三项，默认设置改了就算它跟着变（报告节点自己写了的也算，宁可多算）
     "output": frozenset({"fields", "contract", "evidence_from", "metrics_from", "entities"}),
     "transform": frozenset({"mode", "expression", "template", "assign_to"}),
-    "llm": _MODEL_KEYS | {"system", "skills", "use_history", "prompt", "output_schema", "emit_message", "assign_to"},
+    "llm": _MODEL_KEYS | {"system", "skills", "use_history", "prompt", "output_schema", "emit_message", "assign_to",
+                          "ask_data_optimization"},
     "agent": _MODEL_KEYS | {"system", "skills", "use_history", "prompt", "output_schema", "cite_fields", "tools",
                             "memory_scope", "collection", "parallel_tools", "max_steps", "budget_tokens", "investigation",
-                            "budget_usd", "approval", "emit_message", "assign_to"},
+                            "budget_usd", "approval", "emit_message", "assign_to", "ask_data_optimization"},
     "supervisor": frozenset({"agents", "max_rounds", "on_exhausted", "goal", "provider", "model", "max_tokens",
                              "max_parallel", "approval", "emit_message", "assign_to"}),
     "subgraph": frozenset({"workflow_id", "workflow_version", "input", "assign_to"}),
@@ -135,7 +136,7 @@ _CFG_KEYS: dict[str, frozenset[str]] = {
     "metrics": frozenset({"metrics", "caliber", "caliber_version", "on_missing", "assign_to"}),
     "report": _MODEL_KEYS | {"numbers", "claims", "judge", "entities", "max_repairs", "system", "instructions",
                              "on_violation", "evidence_from", "metrics_from", "emit_message", "assign_to",
-                             "analysis_claims", "analysis_scope"},
+                             "analysis_claims", "analysis_scope", "ask_data_optimization", "reuse_answer_from"},
 }
 #: 只在调模型时才读的（_calls_model）：条件分支让模型分类、结构校验让模型修复（默认开着）、知识检索用模型重排
 _CFG_KEYS_IF: dict[str, frozenset[str]] = {

@@ -504,7 +504,6 @@ function PaletteView() {
   const current = Math.min(active, Math.max(flat.length - 1, 0))
   const optionId = (i: number) => `${listId}-opt-${i}`
 
-  useEffect(() => { setActive(0) }, [query])
   useEffect(() => {
     document.getElementById(optionId(current))?.scrollIntoView({ block: 'nearest' })
     // 只跟着选中项走：用户拿滚轮翻列表时，别因为别的数据刷新把他拽回去
@@ -565,7 +564,11 @@ function PaletteView() {
             placeholder="搜索页面、工作流、运行、对话或命令"
             className="h-full min-w-0 flex-1 bg-transparent text-base text-fg outline-none placeholder:text-faint"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              // 搜索结果与默认选中项同步提交；不能在 effect 中重置，否则快速 Enter 会执行旧索引。
+              setQuery(e.target.value)
+              setActive(0)
+            }}
             autoComplete="off"
             spellCheck={false}
           />

@@ -860,6 +860,7 @@ export interface LookEvent {
   reason?: string
   elapsed_ms: number
   objects: LookObject[]
+  kinds?: string[]
 }
 
 // ---------------------------------------------------------------------------

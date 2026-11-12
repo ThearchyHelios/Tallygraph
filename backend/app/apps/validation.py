@@ -6,12 +6,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.engine.schema import GraphSpec
 
 
-async def gate_issues(session: AsyncSession, graph: Any, level: str) -> list[dict[str, Any]] | None:
+async def gate_issues(
+    session: AsyncSession, graph: Any, level: str, *, workflow_id: str | None = None,
+) -> list[dict[str, Any]] | None:
     from app.data.catalog_impact import open_structure_issues
     from app.data.sqlcheck import graph_sources, load_checkers_by_name
     from app.engine.governance import publish_issues
     from app.engine.lint_process import load_subgraphs, with_subgraphs
     from app.engine.provider_refs import load_providers
+    from app.ledger.ontology import ontology_publish_issues
 
     try:
         spec = GraphSpec.model_validate(graph)
@@ -21,4 +24,5 @@ async def gate_issues(session: AsyncSession, graph: Any, level: str) -> list[dic
     providers = await load_providers(session, spec)
     with with_subgraphs(await load_subgraphs(session, spec)):
         issues = [i.model_dump() for i in publish_issues(spec, level=level, checkers=checkers, providers=providers)]
-    return issues + await open_structure_issues(session, spec)
+    ontology_issues = await ontology_publish_issues(session, spec, workflow_id=str(workflow_id or ""))
+    return issues + ontology_issues + await open_structure_issues(session, spec)

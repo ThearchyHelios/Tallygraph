@@ -855,8 +855,8 @@ EVALUATION_NOT_FOUND = "eval_evaluation_not_found"
 PAIR_NOT_FOUND = "eval_pair_not_found"
 RESULT_NOT_FOUND = "eval_result_not_found"
 CLEANED = "eval_details_cleaned"
-#: 预设对照：目录贡献（当前目录 vs 关，可加只用已核实的项）、分析工具贡献（开 vs 关）
-PRESETS = ("catalog", "catalog_reviewed", "analysis_tools")
+#: 预设对照：目录贡献（当前目录 vs 关，可加只用已核实的项）、分析工具贡献（开 vs 关）、本体穿透贡献（开 vs 关）
+PRESETS = ("catalog", "catalog_reviewed", "analysis_tools", "ontology_tools")
 
 
 def _refused(e: CaseInvalid) -> CodedHTTPException:
@@ -865,8 +865,8 @@ def _refused(e: CaseInvalid) -> CodedHTTPException:
 
 async def _arms(session: AsyncSession, suite: EvalSuite, body: dict[str, Any]) -> list[dict[str, Any]]:
     """请求体 → 规范化的几臂变体：{variant}（一臂，不写用题集的缺省变体）、{arms: [变体…]}（A/B）或 {preset: catalog |
-    catalog_reviewed | analysis_tools}（目录贡献对照：当前目录 vs 关，可加只用已核实的项；分析工具贡献对照：开 vs 关；别的项
-    照 variant 或题集的缺省）。A/B 缺省每题 3 次。"""
+    catalog_reviewed | analysis_tools | ontology_tools}（目录贡献对照：当前目录 vs 关，可加只用已核实的项；分析工具贡献对照：
+    开 vs 关；本体穿透贡献对照：开 vs 关；别的项照 variant 或题集的缺省）。A/B 缺省每题 3 次。"""
     from app.eval import variants as variant_rules
 
     judge = bool((await _site(session))["judge"])
@@ -880,6 +880,8 @@ async def _arms(session: AsyncSession, suite: EvalSuite, body: dict[str, Any]) -
                                                    judge_default=judge, repeats_default=variant_rules.PAIR_REPEATS)
             if preset == "analysis_tools":
                 return variant_rules.analysis_tools_preset(base)
+            if preset == "ontology_tools":
+                return variant_rules.ontology_tools_preset(base)
             return variant_rules.catalog_preset(base, reviewed=preset == "catalog_reviewed")
         if raw_arms is not None:
             if not isinstance(raw_arms, list) or not 2 <= len(raw_arms) <= variant_rules.ARMS_MAX:
