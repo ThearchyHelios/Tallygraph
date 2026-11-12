@@ -201,6 +201,12 @@ def supports_adaptive_thinking(model: str) -> bool:
     return _norm(model).startswith(_ADAPTIVE_THINKING_PREFIXES)
 
 
+def requires_thinking(model: str) -> bool:
+    """该模型是否强制始终开启思考（如 catalog 中标注 thinking='always' 的模型，传 disabled 会被服务方拒绝）。"""
+    target = _norm(model)
+    return any(_norm(entry["id"]) == target and entry.get("thinking") == "always" for entry in ANTHROPIC_MODELS)
+
+
 def supports_effort(model: str) -> bool:
     return _norm(model).startswith(_EFFORT_PREFIXES)
 

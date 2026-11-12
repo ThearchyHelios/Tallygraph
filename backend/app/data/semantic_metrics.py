@@ -1313,6 +1313,7 @@ def compile_metric_sql(
 
     safe_limit = max(1, min(int(limit or 200), 1000))
     metric_col_alias = _quote_ident(str(m.get("key") or "metric_value"), kind, is_alias=True)
+    desc_clause = _desc_order_clause(kind)
 
     if calc_mode == "sql_template" and sql_template:
         slots_used = {tok.group(1).strip().lower() for tok in _SLOT_TOKEN_RE.finditer(sql_template)}
@@ -1333,14 +1334,14 @@ def compile_metric_sql(
             if group_exprs:
                 sql += " GROUP BY " + ", ".join(group_exprs)
                 if not order_parts:
-                    order_parts.append(f"{len(select_parts)} DESC")
+                    order_parts.append(f"{len(select_parts)} {desc_clause}")
             if order_parts:
                 sql += " ORDER BY " + ", ".join(order_parts)
             sql = _apply_row_limit(sql, safe_limit, kind, force_if_missing=bool(group_exprs))
             return sql, alignments
 
         if group_exprs and not tpl_order_parts:
-            tpl_order_parts.append(f"{len(dim_selects) + 1} DESC")
+            tpl_order_parts.append(f"{len(dim_selects) + 1} {desc_clause}")
 
         period_days_sql = _compute_period_days_sql(
             source=source,
@@ -1392,11 +1393,19 @@ def compile_metric_sql(
     if group_exprs:
         sql += " GROUP BY " + ", ".join(group_exprs)
         if not order_parts:
-            order_parts.append(f"{len(select_parts)} DESC")
+            order_parts.append(f"{len(select_parts)} {desc_clause}")
     if order_parts:
         sql += " ORDER BY " + ", ".join(order_parts)
     sql = _apply_row_limit(sql, safe_limit, kind, force_if_missing=bool(group_exprs))
     return sql, alignments
+
+
+def _desc_order_clause(kind: str | None) -> str:
+    """Oracle / PostgreSQL 默认 DESC 将 NULL 排在最前（NULLS FIRST），外层套 ROWNUM 或 LIMIT 时会把有效数值行截掉。"""
+    k = (kind or "").strip().lower()
+    if k in ("oracle", "postgres", "postgresql", "sqlite"):
+        return "DESC NULLS LAST"
+    return "DESC"
 
 
 async def probe_latest_metric_date(
@@ -1497,6 +1506,392 @@ async def preview_metric(
 
 
 # --------------------------------------------------------------------------
+# 通用关联维表 / 字典配置表发现与低基数分类列实探（零行业/列名硬编码）
+# --------------------------------------------------------------------------
+
+_GENERIC_AUDIT_COL_KEYS = frozenset(
+    {
+        "id",
+        "rowid",
+        "createdat",
+        "updatedat",
+        "createtime",
+        "updatetime",
+        "createdby",
+        "updatedby",
+        "creator",
+        "updater",
+        "isdeleted",
+        "deleted",
+        "delflag",
+        "version",
+        "remark",
+        "remarks",
+        "note",
+        "notes",
+        "memo",
+        "description",
+        "sort",
+        "sortorder",
+        "seq",
+    }
+)
+
+
+def _sql_type_family(ctype: str) -> str:
+    t = (ctype or "").strip().lower()
+    if not t:
+        return "other"
+    if any(k in t for k in ("date", "time", "timestamp")):
+        return "temporal"
+    if any(k in t for k in ("char", "text", "string", "clob", "enum", "json")):
+        return "string"
+    if any(k in t for k in ("float", "double", "real")):
+        return "float"
+    if any(k in t for k in ("int", "serial", "bit")):
+        return "int"
+    if any(k in t for k in ("num", "dec", "money")):
+        return "int" if re.search(r"\(\s*\d+\s*,\s*0\s*\)", t) else "numeric"
+    return "other"
+
+
+def _is_compact_lookup_table(
+    tinfo: Mapping[str, Any] | None,
+    *,
+    visible_notes: Mapping[str, Any] | None = None,
+    masked_set: set[str] | None = None,
+) -> bool:
+    """判断物理表是否为紧凑的维表、码表、枚举字典或元数据配置表（纯结构与目录角色判定）。"""
+    if not isinstance(tinfo, Mapping):
+        return False
+    v_notes = visible_notes or {}
+    t_kind = str((v_notes.get("kind") or {}).get("value") or "").strip().lower() if isinstance(v_notes.get("kind"), Mapping) else ""
+    if t_kind in ("fact", "log", "snapshot"):
+        return False
+    masked = masked_set or set()
+    unmasked_cols = [
+        c
+        for c in (tinfo.get("columns") or [])
+        if isinstance(c, Mapping) and c.get("name") and name_key(str(c["name"])) not in masked
+    ]
+    if t_kind in ("dimension", "config") and 2 <= len(unmasked_cols) <= 24:
+        return True
+    if not (2 <= len(unmasked_cols) <= 16):
+        return False
+    families = [_sql_type_family(str(c.get("type") or "")) for c in unmasked_cols]
+    str_cnt = sum(1 for f in families if f == "string")
+    num_measure_cnt = sum(1 for f in families if f in ("float", "numeric"))
+    temporal_cnt = sum(1 for f in families if f == "temporal")
+    return str_cnt >= 2 and str_cnt * 2 >= len(unmasked_cols) and num_measure_cnt <= 3 and temporal_cnt <= 2
+
+
+def find_companion_lookup_tables(
+    tables: Mapping[str, Any],
+    selected_tables: Sequence[str],
+    *,
+    visible_by_table: Mapping[str, Mapping[str, Any]] | None = None,
+    rel_graph: Mapping[str, Sequence[Any]] | None = None,
+    masked_set: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """基于关系图（FK / 目录关系）与高区分度共享键（IDF），通用发现候选事实表关联的紧凑维表或字典配置表。"""
+    if not isinstance(tables, Mapping) or not tables or not selected_tables:
+        return []
+    masked = masked_set or set()
+    vis_map = visible_by_table or {}
+
+    col_table_freq: dict[str, int] = {}
+    table_cols_by_key: dict[str, dict[str, tuple[str, str]]] = {}
+    table_col_counts: dict[str, int] = {}
+    for tname, tinfo in tables.items():
+        if not isinstance(tinfo, Mapping):
+            continue
+        raw_cols = [c for c in (tinfo.get("columns") or []) if isinstance(c, Mapping) and c.get("name")]
+        table_col_counts[str(tname)] = len(raw_cols)
+        ck_map: dict[str, tuple[str, str]] = {}
+        for c in raw_cols:
+            cname = str(c["name"])
+            ck = name_key(cname)
+            if not ck or ck in masked or ck in _GENERIC_AUDIT_COL_KEYS:
+                continue
+            fam = _sql_type_family(str(c.get("type") or ""))
+            if fam in ("temporal", "float"):
+                continue
+            ck_map[ck] = (cname, fam)
+        table_cols_by_key[str(tname)] = ck_map
+        for ck in ck_map:
+            col_table_freq[ck] = col_table_freq.get(ck, 0) + 1
+
+    max_shared_freq = max(3, int(len(tables) * 0.45))
+    lookup_candidates = {
+        str(tname)
+        for tname, tinfo in tables.items()
+        if _is_compact_lookup_table(tinfo, visible_notes=vis_map.get(str(tname)), masked_set=masked)
+    }
+    if not lookup_candidates:
+        return []
+
+    found_by_name: dict[str, dict[str, Any]] = {}
+    for src_tbl in selected_tables:
+        if src_tbl not in table_cols_by_key:
+            continue
+        src_col_cnt = table_col_counts.get(src_tbl, 0)
+        src_keys = table_cols_by_key[src_tbl]
+
+        # 1) 显式关系图（外键、目录确认关系、命名推断关系）连接到的紧凑维表/配置表
+        for edge in (rel_graph or {}).get(src_tbl, ()):
+            target = str(getattr(edge, "to_table", "") or "")
+            if not target or target == src_tbl or target not in lookup_candidates:
+                continue
+            from_cols = [
+                str(c)
+                for c in (getattr(edge, "from_columns", None) or ())
+                if name_key(str(c)) not in masked
+            ]
+            to_cols = [
+                str(c)
+                for c in (getattr(edge, "to_columns", None) or ())
+                if name_key(str(c)) not in masked
+            ]
+            if not from_cols or not to_cols:
+                continue
+            entry = found_by_name.get(target)
+            t_col_cnt = table_col_counts.get(target, 99)
+            score = (0 if getattr(edge, "status", "") in ("verified", "confirmed") else 1, t_col_cnt, target)
+            if entry is None or score < entry["_score"]:
+                found_by_name[target] = {
+                    "table_name": target,
+                    "linked_to": src_tbl,
+                    "source_columns": from_cols,
+                    "lookup_columns": to_cols,
+                    "col_count": t_col_cnt,
+                    "_score": score,
+                }
+
+        # 2) 无外键视图 / 宽表与紧凑字典表之间的高区分度同名键匹配
+        for target in lookup_candidates:
+            if target == src_tbl:
+                continue
+            t_col_cnt = table_col_counts.get(target, 99)
+            t_kind = (
+                str(((vis_map.get(target) or {}).get("kind") or {}).get("value") or "").strip().lower()
+                if isinstance((vis_map.get(target) or {}).get("kind"), Mapping)
+                else ""
+            )
+            if t_col_cnt >= src_col_cnt and t_kind not in ("dimension", "config"):
+                continue
+            tgt_keys = table_cols_by_key.get(target) or {}
+            shared_cks = [
+                ck
+                for ck in src_keys
+                if ck in tgt_keys and col_table_freq.get(ck, 999) <= max_shared_freq
+            ]
+            if not shared_cks:
+                continue
+            shared_cks.sort(key=lambda ck: col_table_freq.get(ck, 999))
+            best_freq = col_table_freq.get(shared_cks[0], 99)
+            score = (2, best_freq, t_col_cnt, target)
+            entry = found_by_name.get(target)
+            if entry is None or score < entry["_score"]:
+                found_by_name[target] = {
+                    "table_name": target,
+                    "linked_to": src_tbl,
+                    "source_columns": [src_keys[ck][0] for ck in shared_cks[:2]],
+                    "lookup_columns": [tgt_keys[ck][0] for ck in shared_cks[:2]],
+                    "col_count": t_col_cnt,
+                    "_score": score,
+                }
+
+    results = sorted(found_by_name.values(), key=lambda x: x["_score"])
+    for item in results:
+        item.pop("_score", None)
+    return results
+
+
+async def probe_schema_lookup_and_discriminators(
+    ds: DataSource,
+    tables: Mapping[str, Any],
+    selected_tables: Sequence[str],
+    *,
+    visible_by_table: Mapping[str, Mapping[str, Any]] | None = None,
+    rel_graph: Mapping[str, Sequence[Any]] | None = None,
+    masked_set: set[str] | None = None,
+    bound_entity_cols: set[tuple[str, str]] | None = None,
+) -> str:
+    """在提取口径/拆解目录时，通用实探候选表的低基数分类/粒度列取值与紧凑字典配置表内容，杜绝跨类混算与编码盲猜。"""
+    if not isinstance(tables, Mapping) or not tables or not selected_tables:
+        return ""
+    masked = masked_set or set()
+    vis_map = visible_by_table or {}
+    ent_cols = bound_entity_cols or set()
+
+    companions = find_companion_lookup_tables(
+        tables,
+        selected_tables,
+        visible_by_table=vis_map,
+        rel_graph=rel_graph,
+        masked_set=masked,
+    )
+
+    # 收集候选低基数分类/粒度/类型鉴别列：(table_name, col_name, priority)
+    disc_candidates: list[tuple[int, str, str]] = []
+    seen_disc: set[tuple[str, str]] = set()
+
+    def _add_disc(prio: int, tbl: str, col_name: str) -> None:
+        key = (tbl, name_key(col_name))
+        if not col_name or key[1] in masked or key[1] in _GENERIC_AUDIT_COL_KEYS or key in seen_disc:
+            return
+        seen_disc.add(key)
+        disc_candidates.append((prio, tbl, col_name))
+
+    for comp in companions:
+        if comp["col_count"] <= 10:
+            for sc in comp["source_columns"]:
+                _add_disc(0, comp["linked_to"], sc)
+
+    for tname in selected_tables:
+        tinfo = tables.get(tname)
+        if not isinstance(tinfo, Mapping):
+            continue
+        if _is_compact_lookup_table(tinfo, visible_notes=vis_map.get(tname), masked_set=masked):
+            continue
+        v_notes = vis_map.get(tname) or {}
+        col_notes = v_notes.get("columns") if isinstance(v_notes.get("columns"), Mapping) else {}
+        raw_cols = [c for c in (tinfo.get("columns") or []) if isinstance(c, Mapping) and c.get("name")]
+        fams = [(str(c["name"]), _sql_type_family(str(c.get("type") or ""))) for c in raw_cols]
+        num_cnt = sum(1 for _, f in fams if f in ("float", "numeric", "int"))
+        str_cols = [n for n, f in fams if f == "string" and name_key(n) not in masked and name_key(n) not in _GENERIC_AUDIT_COL_KEYS]
+
+        for cname, _ in fams:
+            cn = col_notes.get(cname) if isinstance(col_notes, Mapping) else None
+            c_meas = (
+                str((cn.get("measure") or {}).get("value") or "").strip().lower()
+                if isinstance(cn, Mapping) and isinstance(cn.get("measure"), Mapping)
+                else ""
+            )
+            if c_meas in ("status", "attribute"):
+                _add_disc(1, tname, cname)
+
+        # 对典型异构表（键值窄表 1～2 个数值列，或多指标宽表 >=8 个数值列），抽样未绑定实体的字符分类列验证是否为低基数分区列
+        if (1 <= num_cnt <= 2 and len(str_cols) >= 2) or (num_cnt >= 8 and str_cols):
+            t_short = name_key(tname.rsplit(".", 1)[-1])
+            for sc in str_cols[:4]:
+                if (t_short, name_key(sc)) not in ent_cols:
+                    _add_disc(2, tname, sc)
+
+    disc_candidates.sort(key=lambda x: x[0])
+
+    sampled_disc_lines: list[str] = []
+    for _, tname, cname in disc_candidates[:5]:
+        q_col = _format_col_ref(ds, tname, cname)
+        q_tbl = _format_table_ref(ds, tname)
+        sql = _apply_row_limit(
+            f"SELECT DISTINCT {q_col} FROM {q_tbl} WHERE {q_col} IS NOT NULL ORDER BY 1",
+            21,
+            ds.kind,
+            force_if_missing=True,
+        )
+        try:
+            res = await run_query(ds, sql, limits=QueryLimits(timeout_seconds=3, max_rows=21))
+        except Exception:  # noqa: BLE001
+            continue
+        vals = [str(r[0]) for r in (res.rows or []) if r and r[0] is not None and str(r[0]).strip()]
+        # 仅保留 1～20 个不同值的真实低基数分类/粒度/状态列；高基数业务主键自动排除
+        if 1 <= len(vals) <= 20 and not res.truncated:
+            lits = "、".join(_sql_literal(v) for v in vals)
+            sampled_disc_lines.append(f"- 表 `{tname}` 低基数分类/粒度列 `{cname}` 实探全部取值（共 {len(vals)} 种）：{lits}")
+
+    lookup_lines: list[str] = []
+    char_budget = 3400
+    compact_dicts = [c for c in companions if c["col_count"] <= 10]
+    for comp in compact_dicts[:3]:
+        if char_budget <= 0:
+            break
+        lt_name = comp["table_name"]
+        lt_info = tables.get(lt_name) or {}
+        unmasked_cols = [
+            str(c["name"])
+            for c in (lt_info.get("columns") or [])
+            if isinstance(c, Mapping) and c.get("name") and name_key(str(c["name"])) not in masked
+        ][:10]
+        if len(unmasked_cols) < 2:
+            continue
+        sel_exprs = [_format_col_ref(ds, lt_name, c) for c in unmasked_cols]
+        q_lt = _format_table_ref(ds, lt_name)
+        sql = _apply_row_limit(
+            f"SELECT {', '.join(sel_exprs)} FROM {q_lt} ORDER BY 1, 2",
+            160,
+            ds.kind,
+            force_if_missing=True,
+        )
+        try:
+            lres = await run_query(ds, sql, limits=QueryLimits(timeout_seconds=3, max_rows=160))
+        except Exception:  # noqa: BLE001
+            continue
+        if not lres.rows or len(lres.rows) > 150:
+            continue
+
+        join_pair = " = ".join(
+            f"{comp['linked_to']}.{sc} ↔ {lt_name}.{lc}"
+            for sc, lc in zip(comp["source_columns"], comp["lookup_columns"])
+        )
+        lookup_lines.append(
+            f"- 关联字典/配置维表 `{lt_name}`（关联键：{join_pair}；字段：{', '.join(unmasked_cols)}）："
+        )
+        key_col_name = comp["lookup_columns"][0] if comp["lookup_columns"] else unmasked_cols[0]
+        key_idx = next((i for i, c in enumerate(unmasked_cols) if name_key(c) == name_key(key_col_name)), 0)
+
+        if len(lres.rows) <= 12:
+            for r in lres.rows:
+                kv = "，".join(
+                    f"{unmasked_cols[i]}={_sql_literal(r[i])}"
+                    for i in range(min(len(unmasked_cols), len(r)))
+                    if r[i] is not None and str(r[i]).strip() != ""
+                )
+                if kv:
+                    row_line = f"  · {kv}"
+                    lookup_lines.append(row_line)
+                    char_budget -= len(row_line)
+        else:
+            grouped: dict[str, list[str]] = {}
+            other_idxs = [i for i in range(len(unmasked_cols)) if i != key_idx]
+            for r in lres.rows:
+                if key_idx >= len(r) or r[key_idx] is None:
+                    continue
+                k_val = str(r[key_idx]).strip()
+                rest_vals = [
+                    str(r[i]).strip()
+                    for i in other_idxs
+                    if i < len(r) and r[i] is not None and str(r[i]).strip() != ""
+                ]
+                if not k_val or not rest_vals:
+                    continue
+                item_s = " / ".join(rest_vals)
+                bucket = grouped.setdefault(k_val, [])
+                if item_s not in bucket:
+                    bucket.append(item_s)
+            for k_val, items in grouped.items():
+                line = f"  · {unmasked_cols[key_idx]}={_sql_literal(k_val)}：{'；'.join(items[:32])}"
+                if len(line) > char_budget:
+                    line = line[:char_budget] + "…"
+                lookup_lines.append(line)
+                char_budget -= len(line)
+                if char_budget <= 0:
+                    break
+
+    if not sampled_disc_lines and not lookup_lines:
+        return ""
+
+    out = [
+        "\n【关联字典配置表与低基数分类列实探】",
+        "若同一物理表存在多种记录类型、汇总层级或由字典表定义的字段分组，不同分类下度量列含义或粒度可能不同，严禁不加筛选直接全表混算：",
+        *sampled_disc_lines,
+        *lookup_lines,
+        "建模注意：若指标仅适用于特定业务分类、层级或配置组，必须在 `filter_sql`（单表模式）或 `WHERE`（模板模式）中使用主事实表实探出的精确字面值限定过滤条件（注意保留前导零或大小写，切勿臆造码值），并将核心业务层级列放入 `dimensions`。",
+    ]
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
 # AI 辅助从数据目录与业务文档批量提取指标卡片
 # --------------------------------------------------------------------------
 
@@ -1512,10 +1907,11 @@ SUGGEST_SYSTEM_PROMPT = """你是 AgentLab 的「语义指标建模专家」。�
      · sql_template 写单条只读 SELECT 或 WITH ... SELECT 语句，不含分号与 SQL 注释；
      · 仅允许使用以下安全槽位：{{select_dims}}（放在 SELECT 开头用于动态展开分组列）、{{and_where}}（放在 WHERE 1=1 之后承接日期与维度筛选）、{{where}}、{{group_by}}、{{order_by}}、{{period_days}}、{{date_from}}、{{date_to}}、{{limit}}；
      · 多表模板下，date_column 与 dimensions[].column 必须带主表别名前缀（如 "s.stat_date"、"s.line_code"），table_name 填主事实表名；若表旁标注了「SQL 全名：<schema.table>」，在 sql_template 的 FROM / JOIN 中务必使用该带 schema 前缀的全名；
-     · 严格遵循目标数据源方言语法：例如当方言为 oracle 时，严禁写 LIMIT（行数限制由系统自动套外层 ROWNUM）、严禁写 CAST(... AS TEXT)（转字符用 TO_CHAR、转数值用 TO_NUMBER）、表或子查询别名不要写 AS（写 FROM tbl t）。
-5. 若数据目录注明某度量列为「存量（stock，不可跨期直接求和）」，优先使用 AVG(...) 或在 description 中明确标注「存量指标，多日查询请开启按日分组查看趋势」。
-6. 若物理列旁标注了「已绑定标准实体：<entity_key>」，在对应 dimension 的 entity_key 字段填入该实体键。
-7. 避免与「已存在的指标标识」重复；提取文档或目录中最核心的 4～16 个业务指标（单表与多表复杂指标均可覆盖）。
+     · 严格遵循目标数据源方言语法：例如当方言为 oracle 时，严禁写 LIMIT（行数限制由系统自动套外层 ROWNUM）、严禁写 CAST(... AS TEXT)（转字符用 TO_CHAR、转数值用 TO_NUMBER）、表或子查询别名不要写 AS（写 FROM tbl t），排序统一交由 {{order_by}} 槽位展开（自动带 DESC NULLS LAST）。
+5. 同表异构记录、多粒度与字典驱动表隔离准则：若主事实表混存多种业务类型、汇总层级、科目/指标代码或由关联配置字典表区分字段含义的分组记录，严禁不加过滤直接跨类混算！必须在 filter_sql（单表模式）或模板 WHERE 中使用主表真实存储的精确码值限定目标分类或层级，并将核心下钻维度列完整放入 dimensions。
+6. 若数据目录注明某度量列为「存量（stock，不可跨期直接求和）」，优先使用 AVG(...) 或在 description 中明确标注「存量指标，多日查询请开启按日分组查看趋势」。
+7. 若物理列旁标注了「已绑定标准实体：<entity_key>」，在对应 dimension 的 entity_key 字段填入该实体键。
+8. 避免与「已存在的指标标识」重复；提取文档或目录中最核心的 4～16 个业务指标（单表与多表复杂指标均可覆盖）。
 
 单表指标示例：
 {
@@ -1620,11 +2016,18 @@ async def suggest_metrics_from_source(
     if existing_keys:
         lines.append(f"已存在的指标标识（请勿重复）：{', '.join(sorted(existing_keys))}")
     lines.append("\n【物理表与数据目录】")
+    raw_notes_map = {t: e.notes for t, e in entries.items()}
+    visible_by_table = {t: catalog.visible_notes(e.notes) for t, e in entries.items()}
+    rel_graph = catalog.relation_graph(raw_notes_map, schema_cache=cache)
+
     for tname in selected_tables:
         tinfo = tables.get(tname) or {}
-        notes = catalog.visible_notes(entries[tname].notes) if tname in entries else {}
+        notes = visible_by_table.get(tname) or {}
         t_label = (notes.get("label") or {}).get("value") if isinstance(notes.get("label"), Mapping) else ""
+        t_comment = str(tinfo.get("comment") or "").strip()
+        t_desc = (notes.get("description") or {}).get("value") if isinstance(notes.get("description"), Mapping) else ""
         t_grain = (notes.get("grain") or {}).get("value") if isinstance(notes.get("grain"), Mapping) else ""
+        t_dedup = (notes.get("dedup") or {}).get("value") if isinstance(notes.get("dedup"), Mapping) else ""
         b_date_raw = (notes.get("business_date") or {}).get("value") if isinstance(notes.get("business_date"), Mapping) else ""
         if isinstance(b_date_raw, Mapping):
             b_col = str(b_date_raw.get("column") or "").strip()
@@ -1637,19 +2040,23 @@ async def suggest_metrics_from_source(
         qualified_t = str(tinfo.get("qualified") or "").strip()
         if qualified_t and qualified_t != tname:
             head_bits.append(f"SQL 全名：{qualified_t}")
-        if t_label:
-            head_bits.append(f"中文名：{t_label}")
+        if t_label or t_comment:
+            head_bits.append(f"中文名：{t_label or t_comment}")
         if t_grain:
             head_bits.append(f"粒度：{t_grain}")
         if b_date:
             head_bits.append(f"业务日期列：{b_date}")
         if v_filt:
             head_bits.append(f"有效过滤：{v_filt}")
+        if t_dedup:
+            head_bits.append(f"去重约束：{t_dedup}")
+        if t_desc:
+            head_bits.append(f"说明：{str(t_desc)[:120]}")
         lines.append("- " + " ｜ ".join(head_bits))
         col_notes = notes.get("columns") if isinstance(notes.get("columns"), Mapping) else {}
         t_short = name_key(tname.rsplit(".", 1)[-1])
         col_descs: list[str] = []
-        for col in (tinfo.get("columns") or [])[:45]:
+        for col in (tinfo.get("columns") or [])[:90]:
             if not isinstance(col, Mapping) or not col.get("name"):
                 continue
             cname = str(col["name"])
@@ -1657,20 +2064,41 @@ async def suggest_metrics_from_source(
             if name_key(cname) in masked_set:
                 col_descs.append(f"  · {cname} ({ctype}) [遮罩列]")
                 continue
+            c_comment = str(col.get("comment") or "").strip()
             cn = col_notes.get(cname) if isinstance(col_notes, Mapping) else None
             c_label = (cn.get("label") or {}).get("value") if isinstance(cn, Mapping) and isinstance(cn.get("label"), Mapping) else ""
             c_unit = (cn.get("unit") or {}).get("value") if isinstance(cn, Mapping) and isinstance(cn.get("unit"), Mapping) else ""
             c_measure = (cn.get("measure") or {}).get("value") if isinstance(cn, Mapping) and isinstance(cn.get("measure"), Mapping) else ""
+            c_meaning = (cn.get("meaning") or {}).get("value") if isinstance(cn, Mapping) and isinstance(cn.get("meaning"), Mapping) else ""
+            c_codes_raw = (cn.get("codes") or {}).get("value") if isinstance(cn, Mapping) and isinstance(cn.get("codes"), Mapping) else None
+            c_codes_str = ""
+            if isinstance(c_codes_raw, Mapping) and c_codes_raw:
+                code_pairs = [f"{k}={v}" if v else str(k) for k, v in list(c_codes_raw.items())[:16]]
+                c_codes_str = f"码值：{'/'.join(code_pairs)}"
             ent_key = col_entity.get((t_short, name_key(cname)), "")
             extra_bits = [b for b in (
-                c_label,
+                c_label or c_comment,
                 f"单位：{c_unit}" if c_unit else "",
                 f"度量：{c_measure}" if c_measure else "",
+                f"含义：{str(c_meaning)[:100]}" if c_meaning else "",
+                c_codes_str,
                 f"已绑定标准实体：{ent_key}" if ent_key else "",
             ) if b]
             suffix = f" — {'，'.join(extra_bits)}" if extra_bits else ""
             col_descs.append(f"  · {cname} ({ctype}){suffix}")
         lines.extend(col_descs)
+
+    probe_hints = await probe_schema_lookup_and_discriminators(
+        ds,
+        tables,
+        selected_tables,
+        visible_by_table=visible_by_table,
+        rel_graph=rel_graph,
+        masked_set=masked_set,
+        bound_entity_cols=set(col_entity.keys()),
+    )
+    if probe_hints:
+        lines.append(probe_hints)
 
     doc_titles: list[str] = []
     if document_ids:

@@ -39,6 +39,7 @@ from app.data.semantic_metrics import (
     create_metric,
     list_metrics,
     metric_to_dict,
+    probe_schema_lookup_and_discriminators,
     update_metric,
 )
 from app.db.base import SessionLocal, utcnow
@@ -101,16 +102,18 @@ CATALOG_DECOMPOSE_SYSTEM_PROMPT = """你是 AgentLab 的「数据目录与字段
 3. changes[].path 仅支持以下规范路径：
    - 表级：
      · "label"：表中文名称（纯名词短语，勿写公式）
-     · "grain"：一行代表什么业务粒度（如 "每条产线每个班次每天一行"）
+     · "description"：表业务用途与多口径/多层级存储说明
+     · "grain"：一行代表什么业务粒度（如 "每个门店每天一行" 或 "混存多种汇总层级与分类记录"）
      · "business_date"：{"column": "物理日期列名", "rule": "统计归属说明（可空串）"}
-     · "valid_filter"：默认有效记录 SQL 过滤片段（如 "is_deleted = 0"，不含 WHERE）
-   - 列级（把 <col> 替换为真实物理列名，如 EXT_VAL_01）：
-     · "columns.<col>.label"：字段中文名或符号含义（纯名称，如 "计划开班时长"，严禁包含 =、/、*、SUM( 等计算公式符号！）
-     · "columns.<col>.unit"：单位（如 "秒"、"%"、"件"、"人次"）
-     · "columns.<col>.measure"：仅限 "flow"（流量，可跨日加总，如时长、产量）、"stock"（存量，不可跨期直接求和）、"ratio"（比率，如良品率）、"identifier"（编码标识）、"status"（状态码）、"attribute"（属性）
-     · "columns.<col>.meaning"：关键业务含义与存储说明（如 "底表直接存百分数如 99.65，引用时须除以 100，切勿重复乘 100"；注意文字中不要写等号公式，用自然中文表述）
-     · "columns.<col>.codes"：枚举码值字典，如 {"1": "正常", "0": "停用"}
-4. 特别留意工业宽表中的盲列（如 EXT_VAL_01～ATTRIBUTE55）：凡文档给出了字段对照或符号说明的，务必逐列提取 label、unit、measure 与 meaning！
+     · "valid_filter"：默认有效记录 SQL 过滤片段（如 "is_deleted = 0"，不含 WHERE；仅填全表通用的有效条件，若不同指标查不同分类切勿把某一分类锁死在表级 valid_filter）
+     · "dedup"：去重与防重算说明（如 "同表混存汇总行与明细行，聚合前必须按层级或类型列过滤"）
+   - 列级（把 <col> 替换为真实物理列名）：
+     · "columns.<col>.label"：字段中文名或符号含义（纯名称，严禁包含 =、/、*、SUM( 等计算公式符号！）
+     · "columns.<col>.unit"：单位（如 "元"、"秒"、"%"、"件"、"人次"）
+     · "columns.<col>.measure"：仅限 "flow"（流量，可跨日加总）、"stock"（存量，不可跨期直接求和）、"ratio"（比率）、"identifier"（编码标识）、"status"（状态/分类码）、"attribute"（属性/分组码）
+     · "columns.<col>.meaning"：关键业务含义与存储说明（如百分数存储方式、跨分类字段复用含义等；注意文字中不要写等号公式，用自然中文表述）
+     · "columns.<col>.codes"：枚举码值字典，如 {"1": "正常", "0": "停用"}（务必使用主表实探出的精确码值字符串作为 key）
+4. 同表异构、多粒度或字典驱动字段拆解准则：凡文档或【关联字典配置表与低基数分类列实探】给出了编码对照、层级说明或通用列映射的，务必完整提取分类列的 `codes`、度量列的 `label`/`unit`/`measure`/`meaning` 以及表级 `dedup` 或 `guardrail_notes` 防混算红线！
 """
 
 ENTITY_DECOMPOSE_SYSTEM_PROMPT = """你是 AgentLab 的「标准业务实体拆解专家」。请结合数据源物理表结构（含最新字段说明）与业务口径文档，识别多张表或业务提问中共用的核心维度实体（如产线、车间、机台、产品型号、不良原因、区域等），输出增量操作 JSON。
@@ -416,6 +419,7 @@ def _build_schema_prompt_block(
     masked_set: set[str],
     col_entity: Mapping[tuple[str, str], str],
     overlay_notes: Mapping[str, Mapping[str, Any]] | None = None,
+    probe_hints: str = "",
 ) -> str:
     lines: list[str] = [f"数据源：{ds.name}（方言：{ds.kind}）"]
     if (ds.kind or "").strip().lower() == "oracle":
@@ -466,7 +470,7 @@ def _build_schema_prompt_block(
 
         col_notes = notes.get("columns") if isinstance(notes.get("columns"), Mapping) else {}
         t_short = name_key(tname.rsplit(".", 1)[-1])
-        for col in (tinfo.get("columns") or [])[:75]:
+        for col in (tinfo.get("columns") or [])[:90]:
             if not isinstance(col, Mapping) or not col.get("name"):
                 continue
             cname = str(col["name"])
@@ -474,6 +478,7 @@ def _build_schema_prompt_block(
             if name_key(cname) in masked_set:
                 lines.append(f"  · {cname} ({ctype}) [遮罩列]")
                 continue
+            c_comment = str(col.get("comment") or "").strip()
             cn = col_notes.get(cname) if isinstance(col_notes, Mapping) else None
             c_label = (cn.get("label") or {}).get("value") if isinstance(cn, Mapping) and isinstance(cn.get("label"), Mapping) else ""
             c_unit = (cn.get("unit") or {}).get("value") if isinstance(cn, Mapping) and isinstance(cn.get("unit"), Mapping) else ""
@@ -483,20 +488,28 @@ def _build_schema_prompt_block(
                 if isinstance(cn, Mapping) and isinstance(cn.get("meaning"), Mapping)
                 else ((cn.get("note") or {}).get("value") if isinstance(cn, Mapping) and isinstance(cn.get("note"), Mapping) else "")
             )
+            c_codes_raw = (cn.get("codes") or {}).get("value") if isinstance(cn, Mapping) and isinstance(cn.get("codes"), Mapping) else None
+            c_codes_str = ""
+            if isinstance(c_codes_raw, Mapping) and c_codes_raw:
+                code_pairs = [f"{k}={v}" if v else str(k) for k, v in list(c_codes_raw.items())[:16]]
+                c_codes_str = f"码值：{'/'.join(code_pairs)}"
             ent_key = col_entity.get((t_short, name_key(cname)), "")
             extra_bits = [
                 b
                 for b in (
-                    c_label,
+                    c_label or c_comment,
                     f"单位：{c_unit}" if c_unit else "",
                     f"度量：{c_measure}" if c_measure else "",
                     f"含义：{c_meaning}" if c_meaning else "",
+                    c_codes_str,
                     f"已绑定标准实体：{ent_key}" if ent_key else "",
                 )
                 if b
             ]
             suffix = f" — {'，'.join(extra_bits)}" if extra_bits else ""
             lines.append(f"  · {cname} ({ctype}){suffix}")
+    if probe_hints:
+        lines.append(probe_hints)
     return "\n".join(lines)
 
 
@@ -690,7 +703,22 @@ async def _execute_job(job_id: str) -> None:
                 doc_budget -= len(snippet)
                 doc_sections.append(f"--- 文档《{bundle.title}》 ---\n{snippet}")
 
+            raw_notes_map = {t: e.notes for t, e in entries.items()}
+            visible_by_table = {t: catalog.visible_notes(e.notes) for t, e in entries.items()}
+            rel_graph = catalog.relation_graph(raw_notes_map, schema_cache=cache)
+            probe_hints = await probe_schema_lookup_and_discriminators(
+                ds,
+                tables,
+                selected_tables,
+                visible_by_table=visible_by_table,
+                rel_graph=rel_graph,
+                masked_set=masked_set,
+                bound_entity_cols=set(col_entity.keys()),
+            )
+
             prep_detail = f"已扫描 {len(selected_tables)} 张物理表"
+            if probe_hints:
+                prep_detail += "，实探关联配置维表与分类取值"
             if doc_sections:
                 prep_detail += f"，载入 {len(doc_sections)} 份口径文档"
             if any(d.get("created_now") for d in kb_documents):
@@ -722,7 +750,7 @@ async def _execute_job(job_id: str) -> None:
 
             if "catalog" in scopes:
                 t_cat = time.perf_counter()
-                if not doc_sections and not (job.note or "").strip():
+                if not doc_sections and not (job.note or "").strip() and not probe_hints:
                     steps = _update_step_list(
                         steps,
                         "catalog",
@@ -747,7 +775,7 @@ async def _execute_job(job_id: str) -> None:
                         steps=steps,
                     )
                     schema_block = _build_schema_prompt_block(
-                        ds, tables, selected_tables, entries, masked_set, col_entity
+                        ds, tables, selected_tables, entries, masked_set, col_entity, probe_hints=probe_hints
                     )
                     cat_prompt_parts = [schema_block]
                     if doc_sections:
@@ -884,6 +912,7 @@ async def _execute_job(job_id: str) -> None:
                     masked_set,
                     col_entity,
                     overlay_notes=overlay_notes,
+                    probe_hints=probe_hints,
                 )
                 met_lines = [enriched_schema_block]
                 if existing_metric_keys:
@@ -970,6 +999,7 @@ async def _execute_job(job_id: str) -> None:
                     masked_set,
                     col_entity,
                     overlay_notes=overlay_notes,
+                    probe_hints=probe_hints,
                 )
                 ent_lines = [enriched_schema_block]
                 if entities_list:

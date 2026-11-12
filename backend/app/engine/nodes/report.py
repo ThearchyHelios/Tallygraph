@@ -803,7 +803,7 @@ async def _store(doc: dict[str, Any], ctx: NodeContext) -> str | None:
 async def _run_fast_inline_report(state: GraphState, ctx: NodeContext, on_violation: str) -> dict[str, Any]:
     """快速直查专用零模型直通证据封装：0 次 LLM 调用、< 10ms 纯内存组装 report_doc 与封存事件。"""
     from app.api.evidence import withheld_metrics
-    from app.chat.direct_evidence import normalize_and_bind_fast_citations
+    from app.chat.direct_evidence import collect_fast_allow_numbers, normalize_and_bind_fast_citations
     from app.engine.evidence import iter_segments
 
     started = time.perf_counter()
@@ -855,6 +855,17 @@ async def _run_fast_inline_report(state: GraphState, ctx: NodeContext, on_violat
     prepared = normalize_and_bind_fast_citations(_unfenced(raw_answer), catalog, masked_columns=query_masks)
     entities = report_entities(spec, ctx.node) == "link"
     allow = report_allowance(spec, ctx.node)
+    if str(ctx.cfg("numbers", "off") or "off") == "off":
+        raw_input = state.get("input") if isinstance(state.get("input"), Mapping) else {}
+        question_str = str(raw_input.get("question") or "")
+        fast_allow = collect_fast_allow_numbers(
+            prepared,
+            catalog,
+            masked_columns=query_masks,
+            question=question_str,
+        )
+        if fast_allow:
+            allow = list(dict.fromkeys([*(allow or []), *fast_allow]))
     doc = await masked(
         compose_doc(
             prepared,

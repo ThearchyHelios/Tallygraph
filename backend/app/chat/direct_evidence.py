@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import re
@@ -20,6 +22,7 @@ from app.engine.evidence import (
     MARKER_RE,
     TABLE_MAX_COLS,
     _INLINE_SEE,
+    _SYNTAX_BLANK,
     _structural_number,
     parse_markers,
     placeholder,
@@ -27,7 +30,7 @@ from app.engine.evidence import (
     resolve_support,
 )
 from app.engine.expressions import cell_value, column_kind
-from app.engine.issuance import extract_numbers
+from app.engine.issuance import _close, _tolerance, extract_numbers
 
 MASKED_WORD = "已遮罩"
 
@@ -42,15 +45,24 @@ _INLINE_CODE_RE = re.compile(r"`+[^`\n]*`+")
 _MD_LINK_URL_RE = re.compile(r"\]\([^\)\n]*\)")
 _TABLE_SEP_LINE_RE = re.compile(r"^\s*\|[\s:\-|]+\|\s*$")
 _ZERO_ROW_COUNT_RE = re.compile(r"^\s*(?:行|条记录|条数据)")
+_NUMERIC_CODE_TEXT_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
+_LEADING_ZERO_INT_RE = re.compile(r"^[+-]?0\d+$")
+_ID_LIKE_COL_SUFFIXES = ("_id", "_code", "_no", "_key", "_type", "_group", "id", "code", "type", "group")
+_CN_MONTH_DAY_RE = re.compile(r"(?:\d{4}\s*年\s*)?\d{1,2}\s*月\s*\d{1,2}\s*[日号]?")
+_FORMULA_MUL_DIV_PREFIX_RE = re.compile(r"[×*÷/]\s*$")
 
 
 @dataclass(frozen=True)
 class _CellCandidate:
     alias: str
+    query_order: int
     row: int
     col: str
+    col_idx: int
     dec_value: Decimal
     row_keys: tuple[str, ...]
+    raw_text: str = ""
+    is_text_code: bool = False
 
 
 @dataclass
@@ -62,6 +74,7 @@ class _QueryInfo:
     rows: list[list[Any]]
     kinds: list[str | None]
     masked_lower: set[str]
+    truncated: bool = False
 
 
 def _to_decimal(val: Any) -> Decimal | None:
@@ -138,6 +151,7 @@ def _load_query_infos(
             rows=rows,
             kinds=kinds,
             masked_lower=masked_set,
+            truncated=bool(snap.get("truncated") or entry.get("truncated")),
         )
     return infos
 
@@ -352,9 +366,15 @@ def _sanitize_existing_markers(
     return "".join(out)
 
 
+def _alias_order(alias: str) -> int:
+    m = re.match(r"^Q(\d+)$", alias.strip(), re.I)
+    return int(m.group(1)) if m else 0
+
+
 def _build_cell_candidates(qinfos: dict[str, _QueryInfo]) -> list[_CellCandidate]:
     candidates: list[_CellCandidate] = []
-    for alias, qinfo in qinfos.items():
+    for q_pos, (alias, qinfo) in enumerate(qinfos.items()):
+        q_order = _alias_order(alias) or (q_pos + 1)
         for r_idx, row in enumerate(qinfo.rows):
             row_keys: list[str] = []
             for j, col in enumerate(qinfo.columns):
@@ -364,7 +384,9 @@ def _build_cell_candidates(qinfos: dict[str, _QueryInfo]) -> list[_CellCandidate
                 if val is None or isinstance(val, bool):
                     continue
                 s = str(val).strip()
-                if s and s != MASKED_WORD and (_to_decimal(val) is None or qinfo.kinds[j] == "text"):
+                col_low = col.lower()
+                is_id_col = j == 0 or col_low.endswith(_ID_LIKE_COL_SUFFIXES)
+                if s and s != MASKED_WORD and (_to_decimal(val) is None or qinfo.kinds[j] == "text" or is_id_col):
                     row_keys.append(s)
                 if isinstance(val, str) and re.match(r"^\d{4}-\d{2}(?:-\d{2})?", s):
                     row_keys.append(s[:10])
@@ -378,9 +400,28 @@ def _build_cell_candidates(qinfos: dict[str, _QueryInfo]) -> list[_CellCandidate
                 if not col.strip() or col != col.strip() or _UNSAFE_COL_RE.search(col):
                     continue
                 kind = qinfo.kinds[j]
-                if kind == "text":
-                    continue
                 raw_val = row[j]
+                if kind == "text":
+                    s_val = str(raw_val).strip() if raw_val is not None else ""
+                    if not s_val or s_val == MASKED_WORD or not _NUMERIC_CODE_TEXT_RE.match(s_val):
+                        continue
+                    dec_code = _to_decimal(s_val)
+                    if dec_code is None:
+                        continue
+                    candidates.append(
+                        _CellCandidate(
+                            alias=alias,
+                            query_order=q_order,
+                            row=r_idx,
+                            col=col,
+                            col_idx=j,
+                            dec_value=dec_code,
+                            row_keys=keys_tuple,
+                            raw_text=s_val,
+                            is_text_code=True,
+                        )
+                    )
+                    continue
                 parsed_val = cell_value(raw_val, kind)
                 dec = _to_decimal(parsed_val)
                 if dec is None:
@@ -388,10 +429,14 @@ def _build_cell_candidates(qinfos: dict[str, _QueryInfo]) -> list[_CellCandidate
                 candidates.append(
                     _CellCandidate(
                         alias=alias,
+                        query_order=q_order,
                         row=r_idx,
                         col=col,
+                        col_idx=j,
                         dec_value=dec,
                         row_keys=keys_tuple,
+                        raw_text=str(raw_val).strip() if raw_val is not None else "",
+                        is_text_code=False,
                     )
                 )
     return candidates
@@ -500,8 +545,17 @@ def _auto_bind_bare_numbers(
             if target_dec is None:
                 continue
 
+            has_leading_zero = bool(_LEADING_ZERO_INT_RE.match(raw_clean))
             matched: list[tuple[_CellCandidate, str | None]] = []
             for cand in cells:
+                if has_leading_zero:
+                    if cand.is_text_code and cand.raw_text == raw_clean:
+                        matched.append((cand, None))
+                    continue
+                if cand.is_text_code:
+                    if not tok.is_percent and not unit_conv and cand.raw_text == raw_clean:
+                        matched.append((cand, None))
+                    continue
                 if unit_conv and unit_scale is not None:
                     scaled_u = cand.dec_value / unit_scale
                     places = max(int(tok.decimals or 0), 0)
@@ -521,28 +575,50 @@ def _auto_bind_bare_numbers(
             if not matched:
                 continue
 
-            # 多候选消歧：先按同行出现的行键（如日期 2026-11-10、区域名「西区」）收窄
+            # 多候选消歧 1：按同行出现的行键命中数（如同时命中编码、名称、日期的明细行优先于仅命中编码的汇总行）收窄
             if len(matched) > 1:
-                by_row_key = [
-                    pair for pair in matched
-                    if pair[0].row_keys and any(rk in line for rk in pair[0].row_keys)
+                scored_rk = [
+                    (sum(1 for rk in pair[0].row_keys if rk in line), pair)
+                    for pair in matched
                 ]
-                if len(by_row_key) == 1:
-                    matched = by_row_key
-                elif len(by_row_key) > 1:
-                    matched = by_row_key
+                max_rk_hits = max((cnt for cnt, _ in scored_rk), default=0)
+                if max_rk_hits > 0:
+                    matched = [pair for cnt, pair in scored_rk if cnt == max_rk_hits]
 
-            # 若仍在 Markdown 表格行内且多列同值，按表头列名精确对齐收窄
+            # 多候选消歧 2：Markdown 表格行内先按表头列名精确对齐，表头改写为中文时再按同列数查询的列序号对齐
             if len(matched) > 1 and headers_here and len(pipe_positions) >= 2:
                 col_pos = sum(1 for p in pipe_positions if p < tok.start) - 1
                 if 0 <= col_pos < len(headers_here):
                     hdr = headers_here[col_pos].lower()
                     by_hdr = [pair for pair in matched if pair[0].col.lower() == hdr]
-                    if len(by_hdr) == 1:
+                    if by_hdr:
                         matched = by_hdr
+                    if len(matched) > 1:
+                        by_col_pos = [
+                            pair
+                            for pair in matched
+                            if pair[0].col_idx == col_pos
+                            and len(qinfos[pair[0].alias].columns) == len(headers_here)
+                        ]
+                        if by_col_pos:
+                            matched = by_col_pos
 
-            # 只在唯一无歧义命中某一个 (alias, row, col) 时才自动绑定，绝不瞎猜
+            # 多候选消歧 3：跨汇总/明细查询的同名列同值，或同编码字符串在多行重复出现时，确定性取最新查询首行
             unique_locs = {(c.alias, c.row, c.col) for c, _ in matched}
+            if len(unique_locs) > 1:
+                convs = {conv for _, conv in matched}
+                if len(convs) == 1:
+                    col_names = {c.col.lower() for c, _ in matched}
+                    all_same_text_code = all(c.is_text_code for c, _ in matched) and len({c.raw_text for c, _ in matched}) == 1
+                    if len(col_names) == 1 or all_same_text_code:
+                        matched = [
+                            max(
+                                matched,
+                                key=lambda pair: (pair[0].query_order, -pair[0].row, -pair[0].col_idx),
+                            )
+                        ]
+                        unique_locs = {(c.alias, c.row, c.col) for c, _ in matched}
+
             if len(unique_locs) != 1:
                 continue
 
@@ -671,6 +747,149 @@ def _dedupe_marker_echoes(
         out_lines.append(cur)
 
     return "".join(out_lines)
+
+
+def collect_fast_allow_numbers(
+    prepared_text: str,
+    catalog: dict[str, Any],
+    *,
+    masked_columns: Mapping[str, Any] | None = None,
+    question: str = "",
+    loader: Any = None,
+) -> list[str]:
+    """为快速直查（numbers=off）提取有事实依据的上下文豁免字面量，消除标题复述、公式常数与行数统计的误报，同时保留对真编造数字的拦截。"""
+    if not prepared_text or not prepared_text.strip():
+        return []
+
+    qinfos = _load_query_infos(catalog, masked_columns=dict(masked_columns) if masked_columns else None, loader=loader)
+    fences = _fenced_line_ranges(prepared_text)
+    inline_code_spans = [
+        m.span()
+        for m in _INLINE_CODE_RE.finditer(prepared_text)
+        if not _in_ranges(m.start(), m.end(), fences)
+    ]
+
+    # 构造与 compose_doc._bare_numbers 对齐的裸数字扫描面（抹去代码块与已绑定 [[...]] 标记）
+    chars = list(prepared_text)
+    for a, b in fences:
+        for k in range(max(0, a), min(len(chars), b)):
+            if chars[k] != "\n":
+                chars[k] = " "
+    for m in MARKER_RE.finditer(prepared_text):
+        for k in range(max(0, m.start()), min(len(chars), m.end())):
+            if chars[k] != "\n":
+                chars[k] = " "
+    for idx, ch in enumerate(chars):
+        if ch in _SYNTAX_BLANK:
+            chars[idx] = _SYNTAX_BLANK[ch]
+    masked_doc = "".join(chars)
+
+    bare_tokens = [t for t in extract_numbers(masked_doc) if not _structural_number(masked_doc, t)]
+    if not bare_tokens:
+        return []
+
+    verified_floats: set[float] = set()
+    verified_pct_floats: set[float] = set()
+
+    # 1) 用户原问题中显式给出的数字与编码（先剥离「11月11日」类中文月日，避免粘连编码如「210011月11」误拆成 210011）
+    if question and question.strip():
+        q_clean = _CN_MONTH_DAY_RE.sub(" ", question)
+        for qt in extract_numbers(q_clean):
+            verified_floats.add(float(qt.value))
+        for dm in re.finditer(r"(?<![A-Za-z0-9_.])\d+(?:\.\d+)?(?![A-Za-z0-9_])", q_clean):
+            try:
+                verified_floats.add(float(dm.group(0)))
+            except ValueError:
+                pass
+
+    # 2) 未遮罩查询快照中真实存在的单元格值（多列同值未能唯一绑定单个单元格时，数值本身仍有快照依据）与未截断结果集的精确计数
+    for cand in _build_cell_candidates(qinfos):
+        fv = float(cand.dec_value)
+        verified_floats.add(fv)
+        if not cand.is_text_code and "." in cand.raw_text and Decimal(0) < cand.dec_value < Decimal(1):
+            verified_pct_floats.add(float(cand.dec_value * Decimal(100)))
+
+    for qinfo in qinfos.values():
+        if qinfo.truncated or not qinfo.rows:
+            continue
+        verified_floats.add(float(len(qinfo.rows)))
+        for j, col in enumerate(qinfo.columns):
+            if col.lower() in qinfo.masked_lower:
+                continue
+            non_null_strs: list[str] = []
+            zero_cnt = 0
+            pos_cnt = 0
+            kind = qinfo.kinds[j]
+            for r in qinfo.rows:
+                if j >= len(r) or r[j] is None or r[j] == MASKED_WORD:
+                    continue
+                s = str(r[j]).strip()
+                if s:
+                    non_null_strs.append(s)
+                if kind != "text":
+                    dv = _to_decimal(cell_value(r[j], kind))
+                    if dv is not None:
+                        if dv == 0:
+                            zero_cnt += 1
+                        elif dv > 0:
+                            pos_cnt += 1
+            if non_null_strs:
+                verified_floats.add(float(len(set(non_null_strs))))
+                if kind == "text" or j == 0 or col.lower().endswith(_ID_LIKE_COL_SUFFIXES):
+                    for g_cnt in Counter(non_null_strs).values():
+                        verified_floats.add(float(g_cnt))
+            if zero_cnt > 0:
+                verified_floats.add(float(zero_cnt))
+            if pos_cnt > 0:
+                verified_floats.add(float(pos_cnt))
+
+    allow_out: list[str] = []
+    seen_allow: set[str] = set()
+
+    def _add_allow(token_str: str) -> None:
+        s = token_str.strip()
+        if s and s not in seen_allow:
+            seen_allow.add(s)
+            allow_out.append(s)
+
+    arabic_verified: list[tuple[Any, str]] = []
+    arabic_contextual: list[tuple[Any, str]] = []
+    arabic_unverified: list[Any] = []
+
+    for tok in bare_tokens:
+        is_arabic = any(ch.isascii() and ch.isdigit() for ch in tok.raw)
+        if not is_arabic:
+            # 中文数量词（如「两个班次」中的「两」）：仅当对应数值在查询事实中存在时放行原词字面量，不污染阿拉伯数字容差集
+            if any(_close(tok.value, vf, _tolerance(tok)) for vf in verified_floats):
+                _add_allow(tok.raw)
+            continue
+
+        norm_raw = tok.raw.rstrip("%％").strip()
+        matched_verified = any(_close(tok.value, vf, _tolerance(tok)) for vf in verified_floats) or (
+            tok.is_percent and any(_close(tok.value, pf, _tolerance(tok)) for pf in verified_pct_floats)
+        )
+        if matched_verified:
+            arabic_verified.append((tok, norm_raw))
+            continue
+
+        in_code = _in_ranges(tok.start, tok.end, inline_code_spans)
+        before_slice = prepared_text[max(0, tok.start - 6):tok.start]
+        is_pct_formula_const = abs(tok.value - 100.0) < 1e-9 and bool(_FORMULA_MUL_DIV_PREFIX_RE.search(before_slice))
+        if in_code or is_pct_formula_const:
+            arabic_contextual.append((tok, norm_raw))
+        else:
+            arabic_unverified.append(tok)
+
+    for tok, norm_raw in arabic_verified:
+        if not any(_close(u.value, tok.value, _tolerance(u)) for u in arabic_unverified):
+            _add_allow(norm_raw)
+
+    for tok, norm_raw in arabic_contextual:
+        # 上下文豁免（行内反引号字面量、乘除 100% 公式换算常数）绝不能连带放过正文里同值的无出处编造数字
+        if not any(_close(u.value, tok.value, _tolerance(u)) for u in arabic_unverified):
+            _add_allow(norm_raw)
+
+    return allow_out
 
 
 def normalize_and_bind_fast_citations(

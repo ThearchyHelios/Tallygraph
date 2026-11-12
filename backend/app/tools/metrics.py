@@ -12,16 +12,21 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.data import catalog
+from app.data.engine import masked_columns
 from app.data.entities import list_entities
+from app.data.names import name_key
 from app.data.semantic_metrics import (
     MetricInvalid,
     MetricNotFound,
     compile_metric_sql,
+    find_companion_lookup_tables,
     get_metric,
     is_empty_metric_result,
     probe_latest_metric_date,
@@ -159,7 +164,52 @@ async def run_metric_query(
 
         has_groups = bool(group_by_date or group_by)
         rows_data = payload.get("rows") if isinstance(payload.get("rows"), list) else []
-        if is_empty_metric_result(rows_data, has_groups=has_groups) and row.date_column:
+        all_metric_null = bool(
+            has_groups
+            and rows_data
+            and all(isinstance(r, (list, tuple)) and len(r) >= 2 and r[-1] is None for r in rows_data)
+        )
+        if all_metric_null:
+            payload["all_metric_values_null"] = True
+            payload["null_group_row_count"] = len(rows_data)
+            if len(rows_data) > 5:
+                payload["rows"] = rows_data[:5]
+
+        is_empty_or_null = is_empty_metric_result(rows_data, has_groups=has_groups) or all_metric_null
+        cache = ds.schema_cache if isinstance(ds.schema_cache, Mapping) else {}
+        tables_map = (cache.get("tables") or {}) if isinstance(cache, Mapping) else {}
+        if is_empty_or_null and isinstance(tables_map, Mapping) and row.table_name:
+            resolved_tbl = catalog.resolve_table_name(cache, row.table_name) or row.table_name
+            masked_set = {name_key(c) for c in masked_columns(ds.options)}
+            entries = await catalog.read_catalog(session, ds.id)
+            vis_by_tbl = {t: catalog.visible_notes(e.notes) for t, e in entries.items()}
+            v_notes = vis_by_tbl.get(resolved_tbl) or {}
+            v_filt = str((v_notes.get("valid_filter") or {}).get("value") or "").strip() if isinstance(v_notes.get("valid_filter"), Mapping) else ""
+            v_dedup = str((v_notes.get("dedup") or {}).get("value") or "").strip() if isinstance(v_notes.get("dedup"), Mapping) else ""
+            companions = find_companion_lookup_tables(
+                tables_map,
+                [resolved_tbl],
+                visible_by_table=vis_by_tbl,
+                masked_set=masked_set,
+            )
+            hint_bits: list[str] = []
+            if v_filt and v_filt.lower() not in (row.filter_sql or "").lower():
+                hint_bits.append(f"目录有效过滤 `{v_filt}`")
+            if v_dedup:
+                hint_bits.append(f"去重与分层提示「{v_dedup}」")
+            if companions:
+                comp_desc = "、".join(
+                    f"`{c['table_name']}`（关联列 `{', '.join(c['source_columns'])}`）"
+                    for c in companions[:2]
+                )
+                hint_bits.append(f"关联维表或配置表 {comp_desc}")
+            if hint_bits:
+                payload["diagnostic_hint"] = (
+                    f"本次指标结果为空或全为 NULL；底表 `{resolved_tbl}` 存在 {'；'.join(hint_bits)}，"
+                    "若需排查分类口径或维度映射，请在单轮内并行联查核实。"
+                )
+
+        if is_empty_or_null and row.date_column:
             latest_date = await probe_latest_metric_date(
                 ds,
                 table_name=row.table_name,

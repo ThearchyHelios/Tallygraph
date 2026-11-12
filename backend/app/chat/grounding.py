@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.data import catalog, catalog_profile_jobs, schema_view
 from app.data.entities import confirmed_bindings, list_entities, translate_entity_value
 from app.data.names import name_key
-from app.data.semantic_metrics import list_metrics
+from app.data.semantic_metrics import find_companion_lookup_tables, list_metrics
 from app.db.models import DataSource
 from app.memory.embeddings import _tokens
 
@@ -284,6 +284,20 @@ def _extract_table_guardrails(
             }
         )
 
+    dedup_note = visible_notes.get("dedup")
+    if isinstance(dedup_note, Mapping) and dedup_note.get("value"):
+        dedup_val = str(dedup_note["value"]).strip()
+        if dedup_val:
+            rule_str = f"去重与分层防混算：{dedup_val}"
+            out.append(
+                {
+                    "kind": "dedup",
+                    "table": display_tbl,
+                    "rule": rule_str,
+                    "note": rule_str,
+                }
+            )
+
     cols = visible_notes.get("columns")
     if isinstance(cols, Mapping):
         stock_cols: list[str] = []
@@ -421,6 +435,34 @@ async def ground_question(
                         picked_for_ds.append(resolved)
                         reasons_for_table[resolved] = f"实体「{me['label']}」绑定表"
 
+        masked = schema_view.masked_set(ds)
+        try:
+            rel_graph = schema_view.relation_graph(ds, raw_notes)
+        except Exception:  # noqa: BLE001
+            rel_graph = {}
+
+        def _include_companion_lookup(limit_cap: int) -> list[dict[str, Any]]:
+            if not picked_for_ds:
+                return []
+            comps = find_companion_lookup_tables(
+                tables_map,
+                picked_for_ds,
+                visible_by_table=visible_by_table,
+                rel_graph=rel_graph,
+                masked_set=masked,
+            )
+            for comp in comps:
+                if comp["col_count"] > 12:
+                    continue
+                ct_name = comp["table_name"]
+                if ct_name not in picked_for_ds and len(picked_for_ds) + len(matched_tables) < limit_cap:
+                    picked_for_ds.append(ct_name)
+                    reasons_for_table[ct_name] = "关联维表与字典"
+                    break
+            return comps
+
+        _include_companion_lookup(MAX_GROUNDED_TABLES)
+
         # (c) BM25 数据目录检索直选（0 LLM 调用）
         remaining_slots = MAX_GROUNDED_TABLES - len(matched_tables) - len(picked_for_ds)
         if remaining_slots > 0:
@@ -436,18 +478,17 @@ async def ground_question(
                 picked_for_ds.append(tname)
                 reasons_for_table[tname] = "指定数据源核心表"
 
+        companion_links = _include_companion_lookup(MAX_GROUNDED_TABLES + 1)
+
         if not picked_for_ds:
             continue
 
         # 补一跳连接中间表（若有）
         try:
-            rel_graph = schema_view.relation_graph(ds, raw_notes)
-            completed_tables, _ = schema_view.complete(picked_for_ds, rel_graph, room=1)
+            completed_tables, _ = schema_view.complete(picked_for_ds, rel_graph, room=1) if rel_graph else (picked_for_ds, [])
         except Exception:  # noqa: BLE001
-            rel_graph = {}
             completed_tables = picked_for_ds
 
-        masked = schema_view.masked_set(ds)
         ds_sections: list[str] = [f"### 数据源 `{ds.name}`（{ds.kind}）预命中表与目录"]
         for tname in completed_tables:
             if len(matched_tables) >= MAX_GROUNDED_TABLES + 1:
@@ -485,13 +526,24 @@ async def ground_question(
             else:
                 ds_sections.append(schema_view.table_brief(ds, tname))
 
-        # 若该源有多张表入选，附上已确认/推断的 JOIN 条件
-        if len(completed_tables) >= 2 and rel_graph:
+        # 若该源有多张表入选，附上已确认/推断的 JOIN 条件与共享键关联提示
+        if len(completed_tables) >= 2:
             qual = schema_view.qualifier(ds)
-            edges = schema_view._edges_within(rel_graph, completed_tables)
-            if edges:
-                join_lines = [f"  - {schema_view._edge_line(e, qual)}" for e in edges[:10]]
-                ds_sections.append("表间标准连接条件：\n" + "\n".join(join_lines))
+            join_lines: list[str] = []
+            if rel_graph:
+                edges = schema_view._edges_within(rel_graph, completed_tables)
+                join_lines.extend(f"  - {schema_view._edge_line(e, qual)}" for e in edges[:10])
+            completed_set = set(completed_tables)
+            for comp in companion_links:
+                if comp["linked_to"] in completed_set and comp["table_name"] in completed_set:
+                    cond = " AND ".join(
+                        f"{qual(comp['linked_to'])}.{sc} = {qual(comp['table_name'])}.{lc}"
+                        for sc, lc in zip(comp["source_columns"], comp["lookup_columns"])
+                    )
+                    if cond and not any(cond in jl for jl in join_lines):
+                        join_lines.append(f"  - {cond}（共享编码列关联）")
+            if join_lines:
+                ds_sections.append("表间标准连接条件：\n" + "\n".join(join_lines[:12]))
 
         table_blocks.append("\n".join(ds_sections))
         if len(matched_tables) >= MAX_GROUNDED_TABLES:
