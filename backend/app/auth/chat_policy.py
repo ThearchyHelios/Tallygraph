@@ -41,18 +41,19 @@ from typing import Any
 
 from app.analysis.contract import TOOL_NAMES
 from app.ledger.querycore import CALIBER_QUERY
+from app.tools.metrics import METRIC_QUERY
 from app.tools.ontology import ONTOLOGY_TOOLS
 
 #: 问数据运行里 user 角色能用的节点类型（engine/schema.py 的 NodeType 取值）
 CHAT_NODE_TYPES = frozenset({"input", "llm", "agent", "report", "output", "retrieve", "transform", "branch",
                              "metrics", "merge", "analysis", "tool"})
 #: Agent 能绑的只读内置工具（tools/builtin/）：分析工具也在内（contract.TOOL_NAMES，不查库），以及口径查询
-#: （querycore.CALIBER_QUERY，只读、按资产授权收窄——见文件开头）
+#: （querycore.CALIBER_QUERY，只读、按资产授权收窄——见文件开头）、独立语义指标查询（METRIC_QUERY，只读、经数据源遮罩）
 #: 和本体邻居/源健康探针（ONTOLOGY_TOOLS，只读、按授权与遮罩收窄）。工具名只从登记处取常量，不在这里另写一个字符串
 CHAT_BUILTIN_TOOLS = frozenset({"calculator", "current_time", "json_query", "kb_search", "memory_recall",
-                                CALIBER_QUERY, *ONTOLOGY_TOOLS, *TOOL_NAMES.values()})
+                                CALIBER_QUERY, METRIC_QUERY, *ONTOLOGY_TOOLS, *TOOL_NAMES.values()})
 #: 上面那几个内置工具给人看的说法（拒绝时的报错、提示词里都写它）
-CHAT_BUILTIN_LABEL = "计算、当前时间、JSON 取值、知识库检索、记忆读取、分析、口径查询、本体邻居、数据源健康"
+CHAT_BUILTIN_LABEL = "计算、当前时间、JSON 取值、知识库检索、记忆读取、分析、口径查询、指标查询、本体邻居、数据源健康"
 #: 运行时改记忆范围、知识库的配置键（engine/nodes 的 ctx.cfg("memory_scope") / ctx.cfg("collection")，图级 defaults 同样生效）
 SCOPE_KEYS = ("memory_scope", "collection")
 SCOPE_REFUSED = "没有权限：使用者在问数据中不能指定记忆范围和知识库，使用的是管理员设好的默认值"

@@ -493,6 +493,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # 增量重导入的持久对齐键（K11）：存量工作项回填空串——空串不参与按对齐键的匹配，
     # 不会被误当成「同一项」串上旧决定（宁可不匹配，也不按位置猜）
     ("caliber_import_items", "align_key", "VARCHAR(64) DEFAULT ''"),
+    # 独立语义指标库升级：支持多表 JOIN / CTE 参数化 SQL 模板口径，存量卡片默认保持单表聚合（expression）
+    ("semantic_metrics", "calc_mode", "VARCHAR(24) DEFAULT 'expression'"),
+    ("semantic_metrics", "sql_template", "TEXT DEFAULT ''"),
 ]
 
 #: 迁移补上的列要建的索引：(索引名, 表, 列或多列)。create_all 不碰已有的表，表上新列的索引也就不会建。

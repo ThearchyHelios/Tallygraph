@@ -42,6 +42,7 @@ import { blueprints, files, personal, templates } from './blueprints'
 // 问数据的一轮在服务端跑（编排完善第 1 波）：发起、看、停，实时流在 chatTurns.ts 的 streamChatTurn
 import { chatTurns } from './chatTurns'
 import { ontology } from './ontology'
+import { semanticMetrics } from './semanticMetrics'
 
 // 请求层搬到了 http.ts（见那边的说明）。原先从这里导出的照旧从这里导出，调用方不用改；
 // 请求函数也一并转出，给不在 api/ 下、又想直接发请求的地方用。api/ 下的命名空间文件请直接从 http.ts 导入
@@ -1009,6 +1010,8 @@ export const api = {
   chatTurns,
   // 业务本体：标准业务实体与跨口径指标拓扑
   ontology,
+  // 独立语义指标库（SemanticMetric）：即存即生效指标卡片、在线试算与智能提取
+  semanticMetrics,
 }
 
 /**

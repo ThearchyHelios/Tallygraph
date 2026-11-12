@@ -33,6 +33,8 @@ from app.api import chat_turns as chat_turns_api
 from app.api import caliber_import as caliber_import_api
 # 指标本体穿透（W1-a）：标准业务实体与跨口径指标关系网
 from app.api import ontology as ontology_api
+# 独立语义指标库（即存即用指标卡片与在线试算）
+from app.api import semantic_metrics as semantic_metrics_api
 from app.api.coded import CodedHTTPException, coded_handler
 from app.api.deps import chat_scope, evidence_scope, private_run_scope, require_role, role_by_method, run_scope
 from app.auth.keys import key_gate
@@ -143,7 +145,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     finally:
         # 先停调度，再停运行：停运行的途中不该再有新运行被发起。起草、剖析任务停下来标成中断，下次启动不会再续
         await scheduler.stop()
-        from app.data import catalog_jobs, catalog_profile_jobs, entity_discovery, introspect_jobs
+        from app.data import catalog_jobs, catalog_profile_jobs, entity_discovery, introspect_jobs, semantic_decompose
         from app.chat import job as chat_job
         from app.eval import runner as eval_runner, snapshots as eval_snapshots
 
@@ -155,6 +157,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await catalog_profile_jobs.manager.shutdown()
         await introspect_jobs.manager.shutdown()
         await entity_discovery.shutdown()
+        await semantic_decompose.shutdown()
         # 问数据的一轮停下不改那几行（下次启动、或者别的进程照「属主不在了」的规矩接手），也要在运行之前停
         await chat_job.shutdown()
         # 评测要在运行之前停：它停下时会取消自己发起的作答、算期望的运行，再标中断
@@ -249,7 +252,7 @@ def _register_reapers() -> None:
     from app.blueprints import publish_plan
     from app.chat import job as chat_job
     from app.cluster import reaper
-    from app.data import catalog_jobs, catalog_profile_jobs, entity_discovery, introspect_jobs
+    from app.data import catalog_jobs, catalog_profile_jobs, entity_discovery, introspect_jobs, semantic_decompose
     from app.eval import runner as eval_runner, snapshots as eval_snapshots
     from app.process import actions, tasks
     from app.ledger import jobs as draft_jobs, reimport as import_jobs
@@ -266,6 +269,7 @@ def _register_reapers() -> None:
         ("数据剖析任务", lambda live: catalog_profile_jobs.startup(live=live)),
         ("探查任务", lambda live: introspect_jobs.startup(live=live)),
         ("候选实体扫描任务", lambda live: entity_discovery.startup(live=live)),
+        ("口径拆解任务", lambda live: semantic_decompose.startup(live=live)),
         ("影子起草", lambda live: eval_snapshots.startup(live=live)),
         ("评测任务", lambda live: eval_runner.startup(live=live)),
         ("问数据的一轮", _chat_reaper(chat_job)),
@@ -436,6 +440,8 @@ for router, guard in (
     (caliber_import_api.router, _BUILDER),
     # 指标本体穿透（W1-a）：标准业务实体与指标本体图谱（搭建者及以上）
     (ontology_api.router, _BUILDER),
+    # 独立语义指标库（即存即用指标卡片）：同口径与本体工作台权限（搭建者及以上）
+    (semantic_metrics_api.router, _BUILDER),
     # 下一轮第 2 波：评测只给搭建者；访问密钥登录即可，接口里再按本人 / 管理员判
     (evals_api.router, _BUILDER),
     # 口径账本里按答案出具、对账的（第 3 波）：登录即可，接口里按运行和应用授权判

@@ -1432,3 +1432,6 @@ from app.db import models_cluster  # noqa: E402,F401
 # 指标本体穿透（W1-a）：标准业务实体与跨源映射
 from app.db import models_ontology  # noqa: E402,F401
 from app.db.models_ontology import CanonicalEntity  # noqa: E402,F401
+# 独立语义指标库（即存即用指标卡片）与文档拆解后台任务：与受管工作流口径并存
+from app.db import models_metrics  # noqa: E402,F401
+from app.db.models_metrics import SemanticDecomposeJob, SemanticMetric  # noqa: E402,F401
