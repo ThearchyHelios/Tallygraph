@@ -13,6 +13,7 @@
   },
   "engine_ver": "recipe/1",
   "ok": true,
+  "sqlite_writer_version": 3053004,
   "db_sha256": "986c9128e60b653852330cc496215e634cf37086947c6c9e709cc54737e7f313",
   "table_hashes": {
     "日客流": "36452a4d651d017f2d7865e63b1543f6afb939f43c2c61c3672a67df421a4b2b",

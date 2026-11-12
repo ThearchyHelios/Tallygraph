@@ -82,6 +82,8 @@ class Field:
 
 #: 能按字段改的路径。定义类的判定和 data/caliber_identity.SEMANTIC_FIELDS 对齐：语义字段算定义，其余（同义词）算展示。
 FIELDS: dict[str, Field] = {
+    "/semantic": Field("definition", "semantic", "问数语义"),
+    "/links": Field("definition", "links", "本体关系"),
     "/name": Field("definition", "text", "指标名称", nonempty=True),
     "/synonyms": Field("display", "texts", "同义词"),
     "/unit": Field("definition", "text", "单位"),
@@ -194,6 +196,21 @@ def _checked(index: int, path: str, field: Field, value: Any) -> Any:
 
     if value is None:
         refuse(f"{path} 不能设成 null：「清空」用 remove、「声明成空」用 ''（数组用 []），两种都不是就写具体值")
+    if field.value_type == "semantic":
+        from pydantic import ValidationError
+        from app.ledger.semantic import QuerySemantics
+
+        try:
+            return QuerySemantics.model_validate(value).model_dump(mode="json")
+        except ValidationError as error:
+            refuse(f"问数语义不完整：{error}")
+    if field.value_type == "links":
+        from app.ledger.ontology import OntologyInvalid, normalize_links
+
+        try:
+            return normalize_links(value)
+        except OntologyInvalid as error:
+            refuse(error.message)
     if field.value_type == "choice":
         if not isinstance(value, str):
             refuse(f"{field.label}（{path}）要是字符串")
@@ -294,6 +311,22 @@ def apply_operations(graph: Mapping[str, Any] | None, *, card_id: str,
                       definition_hash=(before_hash, before_hash),
                       binding=bindings.analyze(graph or {}, repo.card_id))
     new_graph = repo.replace_metrics(changed)
+    if any(op.get("path") == "/links" for op in report):
+        from app.ledger.ontology import OntologyCycleError, check_factor_dag, workflow_ontology_index
+
+        idx = workflow_ontology_index(workflow_id="", version=0, graph=new_graph)
+        factor_edges = [
+            (
+                f"{e['from']['workflow_id'] or 'self'}:{e['from']['card_id']}:{e['from']['metric_id']}",
+                f"{e['to']['workflow_id'] or 'self'}:{e['to']['card_id']}:{e['to']['metric_id']}",
+            )
+            for e in idx["edges"]
+            if e["kind"] == "factor" and e["status"] != "rejected"
+        ]
+        try:
+            check_factor_dag(factor_edges)
+        except OntologyCycleError as error:
+            raise ChangeRefused(error.message, code=OPERATION_VALUE, path="/links") from error
     final, binding_report, synced = _sync_bindings(new_graph, repo.card_id)
     after = GraphBackedCaliberRepository(final, card_id=repo.card_id)
     return Change(graph=final, card=repo.card_id, applied=True,

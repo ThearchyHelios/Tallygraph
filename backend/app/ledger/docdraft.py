@@ -320,6 +320,14 @@ def normalize_metrics(raw: Any, chunks: dict[str, dict]) -> tuple[list[dict], li
         questions = cleaned.get("open_questions")
         cleaned["open_questions"] = [q for q in questions if isinstance(q, str) and q.strip()] \
             if isinstance(questions, list) else []
+        if "links" in cleaned:
+            from app.ledger.ontology import attach_docdraft_links
+
+            proposed_links = attach_docdraft_links(cleaned, cleaned.get("links"), chunks)
+            if proposed_links:
+                cleaned["links"] = proposed_links
+            else:
+                cleaned.pop("links", None)
         good.append(cleaned)
     return good, dropped
 

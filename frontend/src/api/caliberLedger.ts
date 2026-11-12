@@ -87,6 +87,23 @@ export const caliberLedger = {
   extractDraft: (body: { documents: string[]; collection?: string; datasource_id?: string; guidance?: string;
     fixed_filters?: string }) =>
     post<{ draft_id: string; status: string }>('/ledger/drafts/extract', body),
+  importDefinitions: (body: { documents: string[]; datasource_id?: string; guidance?: string; fixed_filters?: string }) =>
+    post<{ draft_id: string; status: string }>('/ledger/drafts/definitions', body),
+  implementDefinitions: (draftId: string, body: { selected?: string[]; datasource_id: string }) =>
+    post<{ draft_id: string; status: string }>(`${draftAt(draftId)}/implement`, body),
+  continueDefinitions: (draftId: string, body: {
+    expected_revision: number; guidance: string; selected?: string[]; datasource_id?: string
+  }) =>
+    post<{ draft_id: string; status: string; original_draft_id: string; merge_required: boolean }>(`${draftAt(draftId)}/continue`, body),
+  mergeContinuation: (draftId: string, body: { expected_revision: number; candidate_revision: number }) =>
+    post<CaliberDraft & { merged_candidate_id: string }>(`${draftAt(draftId)}/merge`, body),
+  migration: (draftId: string) => get<{
+    revision: number; metrics_total: number; metrics_needing_work: number; can_rebuild: boolean; note: string
+    metrics: { card_id: string; metric_id: string; name: string; query_count: number; guidance: string
+      findings: { code: string; message: string }[] }[]
+  }>(`${draftAt(draftId)}/migration`),
+  prepareMigration: (draftId: string, expected_revision: number) =>
+    post<{ draft_id: string; status: string }>(`${draftAt(draftId)}/migration`, { expected_revision }),
   /**
    * 改标题、整体换掉指标、或把答清的问题消掉（resolved 是问题原文）。服务端据此重算状态：还有问题 → questions_open，
    * 否则 ready；已经接上或驳回的不改状态。

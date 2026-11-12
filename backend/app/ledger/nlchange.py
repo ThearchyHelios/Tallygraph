@@ -721,6 +721,7 @@ _AUTO_FILLERS_SORTED: tuple[str, ...] = tuple(sorted(_AUTO_FILLERS, key=len, rev
 #: 额外的分析意图词（增长率、占比、同比、环比、拆解、趋势、明细、排行……）：**刻意不算通用措辞**——它们留在剩余业务
 #: 语义里，使「和指标名一字不差」不成立，于是回旧路径。列在这里是为了让人一眼看到这条边界（测试也核对它俩不相交）。
 _AUTO_ANALYSIS_WORDS: tuple[str, ...] = (
+    "分析", "为什么", "为何", "原因", "归因", "预测", "建议",
     "增长率", "增速", "增幅", "降幅", "增长", "占比", "比重", "比例", "百分比", "同比", "环比", "趋势", "走势",
     "拆解", "分解", "下钻", "明细", "排行", "排名", "对比", "比较", "差异", "变化", "波动", "分布", "构成",
 )
@@ -755,6 +756,8 @@ async def _auto_cards(session: Any) -> list[dict[str, Any]]:
     from sqlalchemy import select
 
     from app.apps.versions import is_published
+    from app.apps.tree import node_map
+    from app.look.calibers import measured_inputs
     from app.db.models import Workflow, WorkflowVersion
 
     rows = (await session.execute(
@@ -765,6 +768,7 @@ async def _auto_cards(session: Any) -> list[dict[str, Any]]:
     for workflow, row in rows:
         if not is_published(row, current=workflow.published_version) or row.retired_at is not None:
             continue
+        graph_nodes = node_map(row.graph or {})
         for node in (row.graph or {}).get("nodes") or []:
             if not isinstance(node, Mapping) or node.get("type") != "metrics":
                 continue
@@ -775,10 +779,16 @@ async def _auto_cards(session: Any) -> list[dict[str, Any]]:
             metrics = [dict(m) for m in config.get("metrics") or [] if isinstance(m, Mapping) and m.get("id")]
             if not metrics:
                 continue
+            metric_sources = {}
+            for metric in metrics:
+                inputs, reason = measured_inputs(graph_nodes, [metric])
+                metric_sources[str(metric["id"])] = ({item["tool"] for item in inputs.values()}
+                                                     if reason is None else None)
             out.append({"workflow_id": workflow.id, "workflow_name": str(workflow.name or ""),
                         "version": int(row.version), "card_id": str(node.get("id") or ""),
                         "card_title": str(data.get("label") or node.get("id") or ""),
-                        "caliber": str(config.get("caliber") or ""), "metrics": metrics})
+                        "caliber": str(config.get("caliber") or ""), "metrics": metrics,
+                        "metric_source_tools": metric_sources})
     return out
 
 
@@ -823,10 +833,10 @@ def _auto_trim(text: str) -> str:
     return out
 
 
-def _auto_remainder(question: str, hints: Sequence[str]) -> str:
+def _auto_remainder(question: str, hints: Sequence[str], *, remove_dates: bool = True) -> str:
     """这句话剩下的**业务语义**（归一化后）：去掉明确完整的日期/单月、句子里点到的口径/工作流/卡名（`提示的`），
     再去掉两端的通用问法、查询、统计措辞。剩下的必须和某个指标 name / 唯一 synonym **一字不差**才谈得上高置信。"""
-    norm = _normalize(_auto_remove_dates(question))
+    norm = _normalize(_auto_remove_dates(question) if remove_dates else question)
     for hint in sorted({_normalize(item) for item in hints}, key=len, reverse=True):
         if len(hint) >= 2 and hint + "的" in norm:
             norm = norm.replace(hint + "的", "")
@@ -955,18 +965,22 @@ def _permitted(allowed: Any) -> set[tuple[str, int]] | None:
 
 
 async def auto_route(session: Any, *, question: str, purpose: str | None = None,
-                     allowed: Any = None) -> Route | None:
-    """普通问数的**保守默认路由**：高置信确定的请求交回一条可以直接交给固定执行的请求，否则 None。
+                     allowed: Any = None, source_tools: set[str] | None = None) -> Route | None:
+    """普通问数先匹配已发布的问数定义，再兼容没有语义元数据的旧口径。
+
+    声明了 semantic 的指标：按业务时区、支持周期与显式对象词典绑定参数，完整匹配才执行；已命中但含糊的请求
+    返回澄清，避免每次重新探索底表。未匹配或分析问题继续旧探索路径。下面是旧口径的兼容规则。
 
     只在下面每一件都说得清时才命中：按推荐发布版的指标 name / 唯一 synonym 规范化精确匹配**唯一**一个指标（跨卡同名或
     一句指到不止一个就不自动）；这句话没有含糊的业务条件、也没有和那次口径声明的算法对不上；派生出来的这次入口取值
-    拿得全、类型可证。任何一处不确定（含指不到、派生不出、版本没发布）都交回 None——调用方原样走旧的 Agent 路径，
-    不向用户多说什么、也不替它挑一份口径。**零模型**：只看库里的发布版与图，不问模型也不做模糊相似。
+    拿得全、类型可证。旧口径已匹配但日期或对象不明确时返回迁移澄清；未匹配、定义变更和分析请求继续探索。
+    **零模型**：只看库里的发布版与图，不问模型也不做模糊相似。
 
     `allowed` 是这个人能用的 `(workflow_id, version)` 集合（资产授权，见 `_permitted`）：匹配照旧按**全部发布口径**看，
     所以「没匹配到」和「命中了但没权」分得开——唯一命中却不在 allowed 里交回**终止型**的 `ROUTE_REFUSED` /
     `ROUTE_NOT_PERMITTED`，调用方照实说没有授权，**不回退旧的 Agent 路径**（那条路会去翻底表）。allowed 为 None 是调用方
-    已放行（搭建者及以上），不做这道闸。歧义、参数不全、没匹配到仍然交回 None，由调用方走旧路。"""
+    已放行（搭建者及以上），不做这道闸。澄清只列有权查看的候选，不借迁移建议暴露未授权定义。
+    source_tools 非空参数表示调用方明确限定的数据源工具集合，匹配及澄清前即收窄候选；None 保留全局匹配。"""
     from app.ledger import derive, querycore
 
     text = str(question or "").strip()
@@ -975,10 +989,25 @@ async def auto_route(session: Any, *, question: str, purpose: str | None = None,
     purpose = str(purpose or querycore.DEFAULT_PURPOSE)
     permitted = _permitted(allowed)
     cards = await _auto_cards(session)
+    if source_tools is not None:
+        # Scope applies before clarification as well as execution. Unrelated or removed
+        # databases must not hijack an otherwise exploratory question by metric name.
+        scoped = []
+        for card in cards:
+            dependencies = card.get("metric_source_tools", {})
+            metrics = [metric for metric in card["metrics"]
+                       if dependencies.get(str(metric["id"]))
+                       and dependencies[str(metric["id"])] <= source_tools]
+            if metrics:
+                scoped.append({**card, "metrics": metrics})
+        cards = scoped
+    semantic_route = await _semantic_route(session, cards, text, permitted, purpose)
+    if semantic_route is not None:
+        return semantic_route
     hints = [item for card in cards for item in (card["workflow_name"], card["caliber"], card["card_title"])]
     candidates = _auto_match(cards, _auto_remainder(text, hints), _normalize(text))
     if len(candidates) != 1:
-        return None
+        return _legacy_clarification(cards, text, permitted)
     chosen = candidates[0]
     # 授权闸在最前面：唯一命中但这个人的授权范围里没有这一版时，结果只能是「没授权」，不能落到下面任何一条会把这句话
     # 交给旧 Agent 路径（去翻底表）的分支上
@@ -999,12 +1028,121 @@ async def auto_route(session: Any, *, question: str, purpose: str | None = None,
         return None
     inputs = _auto_inputs(selected, text)
     if inputs is None:
-        return None
+        return _legacy_clarification(cards, text, permitted)
     return Route(ROUTE_EXECUTE, ROUTE_AUTO,
                  f"自动命中固定口径「{chosen['caliber'] or chosen['card_title']}」的指标，直接按固定口径执行，不重复解析/规划",
                  request={"workflow_id": chosen["workflow_id"], "card_id": chosen["card_id"],
                           "metric_ids": [chosen["metric_id"]], "inputs": inputs,
                           "version": chosen["version"], "purpose": purpose})
+
+
+def _legacy_clarification(cards: Sequence[Mapping[str, Any]], text: str, permitted: set | None) -> Route | None:
+    """A known legacy metric with object/date language needs migration, not another schema expedition.
+    Keep analytical and unrelated requests on the exploration path.
+    """
+    from app.ledger.metric_matching import score
+
+    if any(word in text for word in _AUTO_ANALYSIS_WORDS):
+        return None
+    if not re.search(r"昨天|昨日|今天|前天|上个月|本月|工厂|产线|(?<!\d)\d{3,}(?!\d)", text):
+        return None
+    hits = [(card, metric, score(text, str(metric.get("name") or ""), metric.get("synonyms") or []))
+            for card in cards for metric in card["metrics"] if not metric.get("semantic")]
+    hits = [(card, metric, weight) for card, metric, weight in hits if weight]
+    if not hits:
+        return None
+    # A request to change the business definition is not a fixed-metric lookup.
+    conditions, unclear = match_conditions(text, ignore=_metric_mentions([m for _, m, _ in hits]))
+    if unclear or conditions:
+        return None
+    allowed = [(card, metric, weight) for card, metric, weight in hits
+               if permitted is None or (card["workflow_id"], card["version"]) in permitted]
+    if not allowed:
+        return Route(ROUTE_REFUSED, ROUTE_NOT_PERMITTED, NOT_PERMITTED)
+    best = max(weight for _, _, weight in allowed)
+    names = list(dict.fromkeys(f"{m.get('name')}（{c['caliber'] or c['workflow_name']}）"
+                              for c, m, w in allowed if w == best))
+    return Route(ROUTE_CLARIFY, "legacy_semantics_required",
+                 "已找到相关旧口径：" + "、".join(names[:6]) +
+                 "。这些口径尚未确认对象映射、日期归属或汇总范围，请先在口径工作台完成迁移；本次不会重新找表猜算。")
+
+
+async def _semantic_route(session: Any, cards: Sequence[Mapping[str, Any]], text: str,
+                          permitted: set | None, purpose: str) -> Route | None:
+    """Semantic bindings precede the legacy exact-name path. A known but incomplete request
+    asks for clarification rather than re-discovering the database with an Agent.
+    Only explicitly authored bindings consume entity identifiers and relative dates.
+    """
+    from pydantic import ValidationError
+    from app.ledger import derive, params, semantic
+    from app.apps.forms import input_schema, validate_form
+
+    hits = []
+    for card in cards:
+        for metric in card["metrics"]:
+            raw = metric.get("semantic")
+            if not isinstance(raw, Mapping):
+                continue
+            terms = [*_auto_metric_terms(metric), *(raw.get("aliases") or [])]
+            if any(semantic.mention(text, term) for term in terms if isinstance(term, str)):
+                hits.append({**card, "metric": metric, "metric_id": metric["id"]})
+    if not hits:
+        return None
+    allowed = [h for h in hits if permitted is None or (h["workflow_id"], h["version"]) in permitted]
+    if not allowed:
+        return Route(ROUTE_REFUSED, ROUTE_NOT_PERMITTED, NOT_PERMITTED)
+    # Never reveal inaccessible candidates. An exact metric name narrows an ambiguous alias.
+    analysis_text = text
+    for hit in allowed:
+        terms = [*_auto_metric_terms(hit["metric"]), *(hit["metric"]["semantic"].get("aliases") or [])]
+        for term in sorted((t for t in terms if isinstance(t, str) and t), key=len, reverse=True):
+            analysis_text = re.sub(re.escape(term), " ", analysis_text, flags=re.I)
+    if any(word in analysis_text for word in _AUTO_ANALYSIS_WORDS):
+        return None
+    exact = [h for h in allowed if semantic.mention(text, str(h["metric"].get("name") or ""))]
+    if exact:
+        allowed = exact
+    hinted = [h for h in allowed if _auto_hinted(h, _normalize(text))]
+    if hinted:
+        allowed = hinted
+    if len(allowed) != 1:
+        names = list(dict.fromkeys(str(h["metric"].get("name") or "指标") for h in allowed))
+        return Route(ROUTE_CLARIFY, ROUTE_AMBIGUOUS, "有多种指标口径，请指定要查询的一种：" + "、".join(names[:8]))
+    chosen = allowed[0]
+    try:
+        model = semantic.QuerySemantics.model_validate(chosen["metric"]["semantic"])
+    except ValidationError:
+        return Route(ROUTE_CLARIFY, ROUTE_AMBIGUOUS, "这份指标的问数定义尚不完整，请先由维护者确认")
+    if not model.enabled:
+        return Route(ROUTE_CLARIFY, ROUTE_AMBIGUOUS, "已找到这份指标，但对象、时间和汇总规则尚未确认，暂不能自动取数")
+    values, remaining, problems = semantic.bind(text, model)
+    hints = [chosen["workflow_name"], chosen["caliber"], chosen["card_title"]]
+    remainder = _auto_remainder(remaining, hints, remove_dates=False)
+    terms = [*_auto_metric_terms(chosen["metric"]), *model.aliases]
+    if remainder not in {_normalize(term) for term in terms}:
+        # Analytical questions still use the established analysis tools. Extra filters may never
+        # be discarded just because the metric and identifier matched.
+        if any(word in remaining for word in _AUTO_ANALYSIS_WORDS):
+            return None
+        problems.append("还有未确认的查询条件，请明确对象、日期和指标口径")
+    if problems:
+        return Route(ROUTE_CLARIFY, ROUTE_AMBIGUOUS, "；".join(dict.fromkeys(problems)))
+    try:
+        pinned = await derive.read_pinned(session, chosen["workflow_id"], chosen["version"], chosen["card_id"])
+        selected = derive.select_pinned(pinned, metric_ids=[chosen["metric_id"]])
+    except derive.NotDerivable:
+        return Route(ROUTE_CLARIFY, ROUTE_AMBIGUOUS, "已找到指标，但它的取数依赖尚未就绪，请先修复该口径")
+    fields = list(selected.entry_fields)
+    declared = {f["name"] for f in fields}
+    if set(values) - declared:
+        return Route(ROUTE_CLARIFY, ROUTE_AMBIGUOUS, "指标的对象或日期映射没有接入取数参数，请先修复口径")
+    values = params.resolve(fields, values)
+    if params.check_nodes(selected.fetches, fields=fields, values=values) or validate_form(input_schema(fields), values):
+        return Route(ROUTE_CLARIFY, ROUTE_AMBIGUOUS, "这份指标还有必填参数未提供，请补齐后查询")
+    return Route(ROUTE_EXECUTE, ROUTE_AUTO, "已按确认的对象、时间和指标口径匹配，直接执行固定查询",
+                 request={"workflow_id": chosen["workflow_id"], "card_id": chosen["card_id"],
+                          "version": chosen["version"], "metric_ids": [chosen["metric_id"]],
+                          "inputs": values, "purpose": purpose})
 
 
 __all__ = ["KIND_AMBIGUOUS", "KIND_MISSING", "KIND_NO_MATCH", "NOT_PERMITTED", "PROPOSAL_AMBIGUOUS",

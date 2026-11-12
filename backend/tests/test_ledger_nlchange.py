@@ -729,17 +729,16 @@ async def test_a_single_month_and_a_single_day_map_to_the_half_open_window(clien
     assert second.input == {"start": "2026-09-02", "end": "2026-09-03"}
 
 
-async def test_a_name_shared_across_cards_is_ambiguous_and_falls_back(client, model_unconfigured):
-    """同名跨卡不自动：交回 None，answer_ops 照旧走旧路径（模型没配好时就照旧 400）。"""
+async def test_a_name_shared_across_cards_clarifies_without_model(client, model_unconfigured):
+    """同名跨卡不自动：已知口径需澄清，不重新规划取数。"""
     shared = "同名歧义甲"
     for _ in range(2):
         asset = await _auto_asset(metric_name=shared)
         await publish(client, asset)
     async with SessionLocal() as session:
-        assert await nlchange.auto_route(session, question=f"{shared} 2026年9月是多少") is None
-    with pytest.raises(HTTPException) as caught:
-        await _ops(f"{shared} 2026年9月是多少")
-    assert caught.value.status_code == 400
+        assert (await nlchange.auto_route(session, question=f"{shared} 2026年9月是多少")).mode == nlchange.ROUTE_CLARIFY
+    ops = await _ops(f"{shared} 2026年9月是多少")
+    assert len(ops) == 1 and ops[0]["op"] == "reply"
 
 
 async def test_a_missing_non_date_parameter_falls_back(client, model_unconfigured):
@@ -1004,7 +1003,7 @@ async def test_natural_questions_use_declared_defaults_when_no_date_is_given(cli
     assert first.input == {"start": "2026-09-01", "end": "2026-10-01"}, "没给日期就用声明的缺省值"
     # 相对说法（上个月）不是「销售额」：即使字段有缺省值也不直达
     async with SessionLocal() as session:
-        assert await nlchange.auto_route(session, question=f"上个月{AUTO_NAME}是多少") is None
+        assert (await nlchange.auto_route(session, question=f"上个月{AUTO_NAME}是多少")).mode == nlchange.ROUTE_CLARIFY
 
 
 async def test_a_hit_that_produces_nothing_is_reported_as_a_failure_for_a_user(client, engine_up, monkeypatch):

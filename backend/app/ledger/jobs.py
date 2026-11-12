@@ -7,7 +7,7 @@ from sqlalchemy import select, update
 
 from app.core import job_runtime as runtime
 from app.db.base import SessionLocal, current_owner, utcnow
-from app.db.models import CaliberDraft, CaliberDraftJob
+from app.db.models import CaliberDraft, CaliberDraftJob, DataSource
 
 executor: Callable[[str], Awaitable[None]] | None = None
 
@@ -78,10 +78,15 @@ async def startup(*, live: Any = None) -> int:
 
 
 async def retry(session: Any, draft: CaliberDraft) -> None:
-    if draft.status != "failed" or draft.workflow_id:
+    from app.ledger.authoring import require_authoring_source
+
+    require_authoring_source(await session.get(DataSource, draft.datasource_id) if draft.datasource_id else None)
+    recovering = bool((draft.payload or {}).get("finalization_pending"))
+    if draft.status != "failed" or (draft.workflow_id and not recovering):
         raise ValueError("只有尚未生成工作流的失败草稿可以重试")
     claimed = await session.execute(update(CaliberDraft).where(
-        CaliberDraft.id == draft.id, CaliberDraft.status == "failed", CaliberDraft.workflow_id.is_(None)
+        CaliberDraft.id == draft.id, CaliberDraft.status == "failed", CaliberDraft.workflow_id == draft.workflow_id,
+        CaliberDraft.updated_at == draft.updated_at
     ).values(status="drafting", error=None).execution_options(synchronize_session=False))
     if claimed.rowcount != 1:
         raise ValueError("草稿状态已经变化，请刷新后再重试")

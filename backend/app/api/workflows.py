@@ -602,7 +602,7 @@ async def publish_workflow(
     if not snapshot:
         raise HTTPException(404, f"不存在 v{version} 版本：画布上的修改还没有保存，请先保存再发布")
 
-    issues = await gate_issues(session, snapshot.graph, payload.level)
+    issues = await gate_issues(session, snapshot.graph, payload.level, workflow_id=workflow_id)
     if issues is None:
         return {"ok": False, "issues": [{"level": "error", "message": _unparsed(snapshot.graph)}]}
     if any(i["level"] == "error" for i in issues):

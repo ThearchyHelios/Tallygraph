@@ -39,10 +39,12 @@ from app.ledger import docdraft
 #: 一次发给模型的材料上限（按 chunk 边界截断；表目录先截到这个数以内）
 MAX_INPUT_CHARS = docdraft.MAX_INPUT_CHARS
 MAX_TABLES_CHARS = 24000
+MIN_DOC_CHARS = 8000
+MIN_TABLES_CHARS = 8000
 #: 取数 SQL 的长度上限（字符）。再长的查询不是草稿该承载的
 MAX_SQL_CHARS = 20000
 #: 这一版提示词的版本（改了 _SYSTEM 就 +1）。写进草稿的提示记录，历史结果才知道是按哪一版起草的。
-PROMPT_VERSION = 1
+PROMPT_VERSION = 2
 
 #: 入口字段能写的类型（apps/spec.FORM_TYPES 的子集；日期用 string + description 说清）
 ENTRY_TYPES = ("string", "number", "integer", "boolean")
@@ -68,7 +70,8 @@ _SYSTEM = """你是业务口径与取数模板的起草助手。读给定的业�
 硬性约束：
 1. 只输出一个 JSON 对象，不要写解释，不要写 Markdown 代码块之外的话。
 2. 每组的 sql 是取数模板，只能是**一条只读 SELECT**：不要多语句、不要 INSERT/UPDATE/DELETE/DDL，也不要在注释后面再藏一条。
-   表和列只能来自「数据目录」，表名、列名照抄，不许猜、不许编。
+   业务表和列只能来自「数据目录」，表名、列名照抄，不许猜、不许编。文档明确的常量或日期计算不需要扫业务表；
+   这种单行计算可以不用 FROM，Oracle 使用 DUAL。常量仍须引用原文依据。
 3. sql 里需要按入口筛选时写 '{{ input.字段名 }}'（字符串）或 {{ input.字段名 }}（数），并在该组的 entry_fields 里声明同名
    字段；不要把日期、门店之类的字面量写死。
 4. 每条指标都要有 expression，固定写成 cell(nodes.fetch, 0, '列名')，列名是这组 sql 最外层 SELECT 的输出列名。
@@ -78,18 +81,23 @@ _SYSTEM = """你是业务口径与取数模板的起草助手。读给定的业�
 7. **一次尽量多交几组。** 每组是能共用同一条 SQL 的指标，最多 6 条；不同粒度、不同表、不同时间字段的指标不要硬凑
    进同一组。文档里其余的指标不要硬凑，把名称写进 uncovered（字符串数组），下一轮再起草。human 里会列出「已经起草
    过的指标」：这些不要重复起草，剩下的未起草指标都写进 uncovered。
-8. **sql 要短。** 能用 GROUP BY 和聚合表达的，不要为每个属性枚举一长串 CASE WHEN 列；输出额度有限，SQL 写长了，
-   后面的指标就写不出来了。
+8. **单值的粒度必须对齐。** 每组最终查询必须恰好返回一行。可在子查询按班次聚合，但最外层按文档定义汇总；
+   不得直接返回明细或分组行后取第 0 行，也不得用 LIMIT/ROWNUM 隐藏多行。比率不能直接相加，加权规则不得自行更换。
 9. 写不下时宁可少写几组、把剩下的写进 uncovered，**也不要让 JSON 半截断掉**。
-10. **同一件事只做一个入口。** 工厂、产线这类维度全图只给一个字段，不要为不同的表各造一个
-    （factory_code / plant_code / workshop_code 说的是同一件事）；跨表的编码差异在 sql 里用 JOIN 或子查询映射，
+10. **同一实体只做一个入口。** 例如 factory_code / plant_code 都指工厂时共用参数；车间 workshop_code 是另一实体，不能混同。
+    同一实体跨表的编码差异在 sql 里用 JOIN 或子查询映射，
     不要让填参数的人重复填等价编码。
-11. **编码和主键不当必填入口。** object_id、line_code 这类字段只有业务上确实每次按它跑时才做入口，
-    而且必须是可选（留空不过滤）；人填不出来才能跑的入口，等于这份口径跑不了。
-12. **可选维度要写成「空值不过滤」**：`AND ('{{ input.line_code }}' = '' OR t.line_code = '{{ input.line_code }}')`。
-    不这么写，留空会把结果筛成空。
+11. **按对象定义的指标必须提供对象参数。** 产线/工厂不是同一实体，不得把工厂编号直接当产线主键。
+    不可跨对象汇总的指标，其对象参数必须必填，不能用空值扩大到全库。
+12. 只有文档明确允许跨对象汇总的维度才可选；缺少规则时列入未决问题，不自动取消过滤。
 13. **入口最多 4 个**，时间范围占两个。再多就把不常变的条件写死在 sql 里（见第 14 条）。
 14. **不常变的条件写进 sql，不做入口**：固定筛选段里给出的取值（工厂、产线、属性组、状态）直接写成常量。
+15. 每条指标补 semantic 草稿：{version:1, enabled:false, aliases:[], grain:"输出粒度",
+    aggregation:"原文的汇总与缺失规则", time:null, entities:[]}。只有材料给全时才补 time
+    {start:"入口开始字段",end:"入口结束字段",timezone:"业务时区",basis:"calendar_day 或 production_day",
+     periods:["day"],description:"归属规则"}；日指标 periods=["day"]，月指标=["month"]，两者算法一致且文档允许才同时填。
+    和 entities:[{field:"入口字段",label:"工厂或产线",members:[{value:"已验证编号",label:"名称",aliases:[]}]}]。
+    没有实体字典就 members 不填、entities 留空，列出待补项；不能编造编号，不得把 enabled 写为 true。
 
 输出格式：
 {
@@ -217,10 +225,37 @@ def fit_material(docs: list[dict], chunks: dict[str, dict], guidance: str,
     def size() -> int:
         return _chars(prompt(docs, kept, guidance, datasource, tables, covered, fixed))
 
+    def doc_chars() -> int:
+        return sum(len(str((c or {}).get("content") or "")) for c in kept.values())
+
     order = _order(kept)
+    while size() > MAX_INPUT_CHARS and len(order) > 1 and (len(tables) <= MIN_TABLES_CHARS or doc_chars() > MIN_DOC_CHARS):
+        kept.pop(order.pop())
+        doc_truncated = True
+    if size() > MAX_INPUT_CHARS and len(tables) > MIN_TABLES_CHARS:
+        excess = size() - MAX_INPUT_CHARS
+        target = max(MIN_TABLES_CHARS, len(tables) - excess)
+        if target < len(tables):
+            tables = tables[:target]
+            catalog_truncated = True
     while size() > MAX_INPUT_CHARS and len(order) > 1:
         kept.pop(order.pop())
         doc_truncated = True
+    if size() > MAX_INPUT_CHARS and order:
+        chunk_id = order[0]
+        chunk = dict(kept[chunk_id]) if isinstance(kept[chunk_id], Mapping) else {}
+        content = str(chunk.get("content") or "")
+        if len(content) > 512:
+            excess = size() - MAX_INPUT_CHARS
+            trimmed = max(512, len(content) - excess)
+            if trimmed < len(content):
+                chunk["content"] = content[:trimmed]
+                kept[chunk_id] = chunk
+                doc_truncated = True
+    if size() > MAX_INPUT_CHARS and tables:
+        excess = size() - MAX_INPUT_CHARS
+        tables = tables[:max(0, len(tables) - excess)]
+        catalog_truncated = True
     if size() > MAX_INPUT_CHARS and order:
         chunk_id = order[0]
         chunk = dict(kept[chunk_id]) if isinstance(kept[chunk_id], Mapping) else {}
@@ -229,10 +264,6 @@ def fit_material(docs: list[dict], chunks: dict[str, dict], guidance: str,
         chunk["content"] = content[:max(0, len(content) - excess)]
         kept[chunk_id] = chunk
         doc_truncated = True
-    if size() > MAX_INPUT_CHARS:
-        excess = size() - MAX_INPUT_CHARS
-        tables = tables[:max(0, len(tables) - excess)]
-        catalog_truncated = True
     return kept, tables, doc_truncated, catalog_truncated
 
 
@@ -529,6 +560,8 @@ def _sql_problem(sql: str, allowed_tables: set[str]) -> str | None:
         if not name or name.casefold() in cte_names or short.casefold() in cte_names:
             continue
         db = str(table.db or "")
+        if name.casefold() == "dual" and not db and not table.catalog:
+            continue  # Oracle 的单行计算源，不是需要探查目录的业务表。
         keys = {name.casefold(), short.casefold()}
         if db:
             keys.add(f"{db}.{name}".casefold())
@@ -536,9 +569,6 @@ def _sql_problem(sql: str, allowed_tables: set[str]) -> str | None:
             used.append(name)
     if used:
         return f"SQL 用了数据目录里没有的表：{'、'.join(dict.fromkeys(used))}"
-    if not any(True for table in tree.find_all(exp.Table)
-               if str(table.name or "").casefold() not in cte_names):
-        return "SQL 没有引用任何表：请对照数据目录写取数"
     return None
 
 
@@ -576,6 +606,14 @@ def _metric(item: Mapping, position: int, problems: list[dict]) -> dict | None:
     grain, time_field = _text(item.get("grain")), _text(item.get("time_field"))
     numerator, denominator = _text(item.get("numerator")), _text(item.get("denominator"))
     dimensions, filters = _texts(item.get("dimensions")), _texts(item.get("filters"))
+    semantic = None
+    if isinstance(item.get("semantic"), Mapping):
+        from app.ledger.semantic import QuerySemantics
+        from pydantic import ValidationError
+        try:
+            semantic = QuerySemantics.model_validate({**item["semantic"], "enabled": False}).model_dump(mode="json")
+        except ValidationError:
+            problems.append({"name": name, "reason": "问数语义不完整，需确认对象、时间与汇总规则"})
     return {
         "id": str(item.get("id") or "").strip(),
         "name": name,
@@ -585,6 +623,9 @@ def _metric(item: Mapping, position: int, problems: list[dict]) -> dict | None:
         "decimals": decimals,
         "expression": expression.strip(),
         "contract": {"shape": "scalar"},
+        **({"source_definition_id": _text(item.get("source_definition_id"))}
+           if _text(item.get("source_definition_id")) else {}),
+        **({"semantic": semantic} if semantic else {}),
         **({"grain": grain} if grain else {}),
         **({"time_field": time_field} if time_field else {}),
         **({"numerator": numerator} if numerator else {}),
@@ -606,7 +647,8 @@ def _metric(item: Mapping, position: int, problems: list[dict]) -> dict | None:
     }
 
 
-def normalize_plan(raw: Any, chunks: Mapping[str, dict], *, allowed_tables: set[str]) -> tuple[dict, list[dict]]:
+def normalize_plan(raw: Any, chunks: Mapping[str, dict], *, allowed_tables: set[str],
+                   strict_scalar: bool = False) -> tuple[dict, list[dict]]:
     """校验模型交回的草案。返回 (可落库的 plan, problems)。
 
     problems 的形状是 {"name": …, "reason": …}，name 能认出是哪一条就用名字，认不出按序号说。硬规则：SQL 单条只读、表都在
@@ -629,6 +671,9 @@ def normalize_plan(raw: Any, chunks: Mapping[str, dict], *, allowed_tables: set[
         problems.append({"name": "sql", "reason": "没有给出取数 SQL"})
     else:
         reason = _sql_problem(sql_text, allowed_tables)
+        if reason is None and strict_scalar:
+            from app.ledger.semantic_sql import scalar_problem
+            reason = scalar_problem(sql_text)
         if reason:
             problems.append({"name": "sql", "reason": reason})
             sql_text = ""

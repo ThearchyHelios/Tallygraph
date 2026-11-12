@@ -20,6 +20,8 @@ from typing import Any
 
 import pytest
 
+from tests.sqlite_baseline import baseline_file_hash
+
 from app.data import raw_store, recipe_engine, table_versions, xlsx_cells, xlsx_scan
 from app.data.names import canon
 from app.data.recipe_types import FIX_KINDS, Extraction, Recipe
@@ -88,7 +90,7 @@ def test_d00_build_is_byte_identical_to_phase_2(tmp_path):
     ex = run((raw, name), FLOW, str(db))
     table_versions.settle_journal(db)
     assert ex.ok and not ex.problems
-    assert raw_store.sha256_file(db) == BASELINE["db_sha256"]
+    assert baseline_file_hash(db, writer_version=BASELINE["sqlite_writer_version"]) == BASELINE["db_sha256"]
     assert ex.table_hashes == BASELINE["table_hashes"]
     assert {t.name: t.rows for t in ex.tables} == BASELINE["rows"]
     assert ex.rows_excluded == []
@@ -103,7 +105,7 @@ def test_rules_whose_anchors_do_not_appear_change_nothing(tmp_path):
     ex = run((raw, name), data, str(db))
     table_versions.settle_journal(db)
     assert ex.ok and not ex.problems
-    assert raw_store.sha256_file(db) == BASELINE["db_sha256"]
+    assert baseline_file_hash(db, writer_version=BASELINE["sqlite_writer_version"]) == BASELINE["db_sha256"]
     assert ex.table_hashes == BASELINE["table_hashes"]
     assert ex.rows_excluded == [] and ex.ignored_columns == {} and "ignored" not in ex.ledger[0].roles
 

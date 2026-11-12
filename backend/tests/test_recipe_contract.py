@@ -12,6 +12,8 @@ from dataclasses import MISSING, asdict
 from pathlib import Path
 
 import pytest
+
+from tests.sqlite_baseline import baseline_file_hash
 from pydantic import ValidationError
 
 from app.data import recipe_parsers as P
@@ -652,7 +654,7 @@ def test_p2_baseline_reproduces():
         ex = recipe_engine.execute(T.Recipe.model_validate(FLOW), raw, name, xlsx_scan.scan(raw), str(db))
         table_versions.settle_journal(db)
         assert ex.ok
-        assert raw_store.sha256_file(db) == P2_BASELINE["db_sha256"]
+        assert baseline_file_hash(db, writer_version=P2_BASELINE["sqlite_writer_version"]) == P2_BASELINE["db_sha256"]
     assert ex.table_hashes == P2_BASELINE["table_hashes"]
     assert {t.name: t.rows for t in ex.tables} == P2_BASELINE["rows"]
     ids = P2_BASELINE["ids"]

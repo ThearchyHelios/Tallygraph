@@ -75,7 +75,7 @@ from app.db.models_process import ActionRecord
 logger = logging.getLogger(__name__)
 
 from app.ledger.authoring import (
-    _can_repair, _columns_digest, _draft_payload, _entry_notes, _focus_tables, _fresh_metrics, _merge_questions, _merged_fields, _problems_text, _published_metrics, _question_count, _question_key, _schema_material, _source_tables, _status_for
+    require_authoring_source, _can_repair, _columns_digest, _draft_payload, _entry_notes, _focus_tables, _fresh_metrics, _merge_questions, _merged_fields, _problems_text, _published_metrics, _question_count, _question_key, _schema_material, _source_tables, _status_for
 )
 
 router = APIRouter(prefix="/api/ledger", tags=["ledger"])
@@ -1263,9 +1263,12 @@ def _draft_summary(draft: CaliberDraft, *, graph: dict[str, Any] | None = None) 
         card = node_map(graph).get(card_id or (cards[0]["id"] if cards else "")) or {}
         payload = {**payload, "metrics": (card.get("config") or {}).get("metrics") or []}
     metrics = payload.get("metrics")
+    definitions = payload.get("semantic_inventory")
     return {"id": draft.id, "title": draft.title, "status": draft.status,
             "stage": docdraft.stage_of(draft.status),
             "metric_count": len(metrics) if isinstance(metrics, list) else 0,
+            **({"definition_count": sum(item.get("kind") == "metric" for item in definitions.get("items", []))}
+               if isinstance(definitions, dict) else {}),
             "question_count": _question_count(payload), "workflow_id": draft.workflow_id,
             "created_at": draft.created_at.isoformat() if draft.created_at else None, "error": draft.error}
 
@@ -1340,7 +1343,7 @@ async def _draft_view(session: AsyncSession, draft: CaliberDraft, *, ensure_reco
     job = await session.get(CaliberDraftJob, draft.id)
     if job:
         view["job"] = {"status": job.status, "attempt": job.attempt, "error": job.error,
-                       "retryable": draft.status == "failed" and not draft.workflow_id
+                       "retryable": draft.status == "failed" and (not draft.workflow_id or payload.get("finalization_pending", False))
                                     and job.status not in ("queued", "running")}
     return view
 
@@ -1769,6 +1772,151 @@ class DraftExtractIn(BaseModel):
     fixed_filters: str = Field(default="", max_length=1000)
 
 
+@router.post("/drafts/definitions", status_code=201)
+async def import_definitions(payload: DraftExtractIn, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """Import source definitions first. No model calls, SQL execution, or publication."""
+    draft = await _definition_draft(payload, session)
+    session.add(draft)
+    await session.commit()
+    return {"draft_id": draft.id, "status": draft.status}
+
+
+async def _definition_draft(payload: DraftExtractIn, session: AsyncSession) -> CaliberDraft:
+    from app.api.deps import current_principal, ensure_role
+    from app.ledger.semantic_import import inventory
+    from app.core.artifact_store import put_json
+
+    ensure_role("builder")
+    docs = []
+    for doc_id in dict.fromkeys(payload.documents):
+        doc = await session.get(Document, doc_id)
+        if doc is None:
+            raise HTTPException(422, "文档不存在，可能已被删除")
+        docs.append(doc)
+    documents = [{"document_id": d.id, "title": d.title or d.source, "content": d.content or ""} for d in docs]
+    catalog = inventory(documents)
+    if not catalog["items"]:
+        raise HTTPException(422, "没有识别到指标定义表。请使用以「指标／量／符号」为首列的 Markdown 表格，或使用原有 AI 起草入口")
+    if payload.datasource_id and await session.get(DataSource, payload.datasource_id) is None:
+        raise HTTPException(422, "数据源不存在")
+    artifact = await put_json({"documents": documents, "inventory": catalog}, kind="semantic_definitions")
+    draft = CaliberDraft(title=_doc_title(docs), collection=payload.collection or docs[0].collection or "default",
+                         datasource_id=payload.datasource_id, status="path_pending",
+                         payload={"semantic_inventory": catalog, "definition_artifact": artifact,
+                                  "documents": [{"document_id": d.id, "title": d.title, "chunk_ids": []} for d in docs],
+                                  "metrics": [], "open_questions": [], "selected_definition_ids": []},
+                         origin={"documents": list(dict.fromkeys(payload.documents)), "guidance": payload.guidance,
+                                 "fixed_filters": payload.fixed_filters}, created_by=current_principal().username)
+    return draft
+
+
+@router.get("/drafts/{draft_id}/migration")
+async def migration_audit(draft_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    from app.api.deps import ensure_role
+    from app.ledger.migration import audit
+
+    ensure_role("builder")
+    draft = await _draft_or_404(session, draft_id)
+    workflow = await session.get(Workflow, draft.workflow_id) if draft.workflow_id else None
+    if workflow is None:
+        raise HTTPException(409, "这份草稿尚未绑定取数图，请先从定义清单实现指标")
+    available = {s.name for s in (await session.execute(select(DataSource))).scalars() if s.enabled and _source_tables(s)}
+    result = audit(workflow.graph or {}, workflow_id=workflow.id, version=workflow.version, sources=available)
+    result["can_rebuild"] = bool((draft.origin or {}).get("documents") or (draft.payload or {}).get("documents"))
+    return result
+
+
+class MigrationIn(BaseModel):
+    expected_revision: int = Field(ge=1)
+
+
+@router.post("/drafts/{draft_id}/migration", status_code=201)
+async def prepare_migration(draft_id: str, payload: MigrationIn,
+                            session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """Create an independent source-definition draft; no old graph/SQL/publication is changed."""
+    from app.api.deps import ensure_role
+
+    ensure_role("builder")
+    old = await _draft_or_404(session, draft_id)
+    workflow = await session.get(Workflow, old.workflow_id) if old.workflow_id else None
+    if workflow is None or workflow.version != payload.expected_revision:
+        raise HTTPException(409, "旧口径已变化，请重新检查后准备迁移")
+    for existing in (await session.execute(select(CaliberDraft).where(CaliberDraft.status != "rejected"))).scalars():
+        migration = (existing.origin or {}).get("migration_from", {})
+        if migration.get("draft_id") == old.id and migration.get("revision") == workflow.version:
+            return {"draft_id": existing.id, "status": existing.status}
+    origin = old.origin or {}
+    docs = origin.get("documents") or [d["document_id"] for d in (old.payload or {}).get("documents", [])]
+    if not docs:
+        raise HTTPException(409, "旧口径没有来源文档，请先导入定义文档，或在原草稿中逐项补齐问数设置")
+    source = await session.get(DataSource, old.datasource_id) if old.datasource_id else None
+    draft = await _definition_draft(DraftExtractIn(
+        documents=docs, datasource_id=source.id if source else None,
+        guidance=str(origin.get("guidance") or "")[:2000], fixed_filters=str(origin.get("fixed_filters") or "")[:1000]), session)
+    draft.title = f"{old.title} · 迁移定义"
+    draft.origin = {**draft.origin, "migration_from": {"draft_id": old.id, "workflow_id": workflow.id,
+                                                     "revision": workflow.version}}
+    # Preserve the exact old graph as review material, never as executable fallback or formula authority.
+    from app.core.artifact_store import put_json
+    draft.payload = {**draft.payload, "migration_baseline": await put_json(
+        {"graph": workflow.graph, "workflow_id": workflow.id, "revision": workflow.version}, kind="migration_baseline")}
+    session.add(draft)
+    await session.commit()
+    return {"draft_id": draft.id, "status": draft.status}
+
+
+class ImplementDefinitionsIn(BaseModel):
+    selected: list[str] | None = Field(default=None, min_length=1, max_length=2000)
+    datasource_id: str = Field(min_length=1, max_length=32)
+
+
+@router.post("/drafts/{draft_id}/implement", status_code=202)
+async def implement_definitions(draft_id: str, payload: ImplementDefinitionsIn, background: BackgroundTasks,
+                                session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    from app.api.deps import ensure_role
+    from app.db.models import CaliberDraftJob
+    from sqlalchemy import update
+
+    ensure_role("builder")
+    draft = await _draft_or_404(session, draft_id)
+    stored = dict(draft.payload or {})
+    catalog = stored.get("semantic_inventory") or {}
+    from app.ledger.semantic_import import source_matches
+
+    docs = [await session.get(Document, doc_id) for doc_id in catalog.get("document_hashes", {})]
+    if any(doc is None or doc.status != "ready" for doc in docs) or not source_matches(
+        catalog, [{"document_id": doc.id, "content": doc.content} for doc in docs if doc is not None]
+    ):
+        raise HTTPException(409, "原文已更新或尚未处理完成，请重新导入定义后再实现")
+    from app.ledger.semantic_import import implementation_scope
+
+    try:
+        selected, issues = implementation_scope(catalog, payload.selected)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from None
+    if not selected:
+        raise HTTPException(422, "没有可自动实现的指标，请先补充数据来源或确认同名口径")
+    source = await session.get(DataSource, payload.datasource_id)
+    try:
+        require_authoring_source(source)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    stored["selected_definition_ids"] = selected
+    stored["implementation_mode"] = "all" if payload.selected is None else "selected"
+    stored["definition_issues"] = issues
+    stored["implementation_progress"] = {"total": len(selected), "completed": 0, "pending": len(selected),
+                                         "blocked": 0, "active_names": []}
+    result = await session.execute(update(CaliberDraft).where(
+        CaliberDraft.id == draft_id, CaliberDraft.status == "path_pending", CaliberDraft.workflow_id.is_(None)
+    ).values(status="drafting", datasource_id=source.id, payload=stored))
+    if result.rowcount != 1:
+        raise HTTPException(409, "这份定义已开始生成，请刷新查看进度")
+    session.add(CaliberDraftJob(id=draft_id))
+    await session.commit()
+    background.add_task(draft_jobs.start, draft_id)
+    return {"draft_id": draft_id, "status": "drafting"}
+
+
 @router.post("/drafts/extract", status_code=201)
 async def draft_extract(payload: DraftExtractIn, background: BackgroundTasks,
                         session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
@@ -1791,10 +1939,10 @@ async def draft_extract(payload: DraftExtractIn, background: BackgroundTasks,
     if missing:
         raise HTTPException(422, f"文档不存在，可能已被删除：{'、'.join(missing)}")
     source = await session.get(DataSource, payload.datasource_id)
-    if source is None:
-        raise HTTPException(422, "数据源不存在，可能已被删除")
-    if not _source_tables(source):
-        raise HTTPException(422, "这个数据源还没有表结构：先探查表结构，再起草口径")
+    try:
+        require_authoring_source(source)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
     docs = [found[doc_id] for doc_id in doc_ids]
     draft = CaliberDraft(title=_doc_title(docs),
                          collection=payload.collection or (docs[0].collection or "default"),
@@ -2321,6 +2469,285 @@ def _with_change(view: dict[str, Any], change: Any, *, revision: int | None) -> 
     from app.ledger import changes
 
     return {**view, "change": changes.summary(change, applied=bool(change.applied), revision=revision)}
+
+
+class ContinueDefinitionsIn(BaseModel):
+    expected_revision: int = Field(ge=0)
+    guidance: str = Field(default="", max_length=2000)
+    selected: list[str] | None = Field(default=None, min_length=1, max_length=2000)
+    datasource_id: str | None = Field(default=None, min_length=1, max_length=32)
+
+
+@router.post("/drafts/{draft_id}/continue", status_code=202)
+async def continue_definitions(draft_id: str, payload: ContinueDefinitionsIn, background: BackgroundTasks,
+                               session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """Generate missing definitions as an independent candidate; never overwrite reviewed SQL."""
+    from app.api.deps import ensure_role, current_principal
+    from app.core.artifact_store import canonical_json, content_hash
+    from app.db.models import CaliberDraftJob
+    from sqlalchemy import update
+
+    ensure_role("builder")
+    draft = await _draft_or_404(session, draft_id)
+    if draft.status not in ("questions_open", "ready", "path_pending", "failed"):
+        raise HTTPException(409, "请等待当前任务完成后再继续生成")
+    workflow = await session.get(Workflow, draft.workflow_id) if draft.workflow_id else None
+    revision = workflow.version if workflow else 0
+    if revision != payload.expected_revision:
+        raise HTTPException(409, "口径已发生变化，请刷新后继续")
+    stored = dict(draft.payload or {})
+    inventory = stored.get("semantic_inventory")
+    if not inventory:
+        raise HTTPException(409, "这份草稿没有导入定义，请先导入定义文档")
+    requested_source_id = payload.datasource_id or draft.datasource_id
+    if payload.datasource_id and payload.datasource_id != draft.datasource_id and workflow is not None:
+        raise HTTPException(409, "已有取数图的草稿不能在续作时切换数据源，请另建迁移定义草稿")
+    source = await session.get(DataSource, requested_source_id) if requested_source_id else None
+    try:
+        require_authoring_source(source)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    from app.ledger.semantic_import import source_matches
+    docs = [await session.get(Document, key) for key in inventory.get("document_hashes", {})]
+    if any(d is None or d.status != "ready" for d in docs) or not source_matches(
+        inventory, [{"document_id": d.id, "content": d.content} for d in docs if d is not None]
+    ):
+        raise HTTPException(409, "来源文档已经变化，请重新导入定义")
+    view = await _draft_view(session, draft, ensure_records=False)
+    done = {m.get("source_definition_id") for m in view.get("metrics", [])}
+    missing = [key for key in stored.get("selected_definition_ids", []) if key not in done]
+    if not missing:
+        raise HTTPException(409, "所选指标已经全部生成，无需继续")
+    if payload.selected is not None:
+        wanted = list(dict.fromkeys(str(k) for k in payload.selected if str(k).strip()))
+        if not wanted or not set(wanted) <= set(missing):
+            raise HTTPException(422, "仅可选择当前尚未完成的指标继续生成")
+        target_missing = wanted
+    else:
+        target_missing = missing
+    key = content_hash(canonical_json({"revision": revision, "missing": target_missing,
+                                      "guidance": payload.guidance.strip(), "source": source.id,
+                                      "origin": draft.origin, "inventory": inventory}))
+    candidates = dict(stored.get("continuation_candidates") or {})
+    if key in candidates:
+        candidate = await session.get(CaliberDraft, candidates[key])
+        if candidate is not None:
+            return {"draft_id": candidate.id, "status": candidate.status,
+                    "original_draft_id": draft_id, "merge_required": True}
+    candidate = CaliberDraft(title=f"{draft.title[:185]} · 补充指标", collection=draft.collection,
+        datasource_id=source.id, status="drafting", created_by=current_principal().username,
+        origin={**(draft.origin or {}), "guidance": "\n".join(filter(None, [
+            str((draft.origin or {}).get("guidance") or ""), payload.guidance.strip()])),
+            "continuation_from": {"draft_id": draft.id, "workflow_id": draft.workflow_id,
+                                  "revision": revision, "merge_required": True}},
+        payload={"semantic_inventory": inventory, "selected_definition_ids": target_missing,
+                 "implementation_mode": "selected", "definition_issues": [],
+                 "definition_artifact": stored.get("definition_artifact")})
+    session.add(candidate)
+    await session.flush()
+    candidates[key] = candidate.id
+    update_values: dict[str, Any] = {"payload": {**stored, "continuation_candidates": candidates}}
+    if workflow is None and source.id != draft.datasource_id:
+        update_values["datasource_id"] = source.id
+    claimed = await session.execute(update(CaliberDraft).where(
+        CaliberDraft.id == draft.id, CaliberDraft.updated_at == draft.updated_at,
+        CaliberDraft.status == draft.status,
+        *([select(Workflow.id).where(Workflow.id == workflow.id, Workflow.version == revision).exists()]
+          if workflow else [CaliberDraft.workflow_id.is_(None)])
+    ).values(**update_values).execution_options(synchronize_session=False))
+    if claimed.rowcount != 1:
+        await session.rollback()
+        raise HTTPException(409, "草稿已变化或已有续作请求，请刷新后继续")
+    session.add(CaliberDraftJob(id=candidate.id))
+    await session.commit()
+    background.add_task(draft_jobs.start, candidate.id)
+    return {"draft_id": candidate.id, "status": "drafting", "original_draft_id": draft_id,
+            "merge_required": True}
+
+
+class MergeContinuationIn(BaseModel):
+    expected_revision: int = Field(ge=0)
+    candidate_revision: int = Field(ge=1)
+
+
+@router.post("/drafts/{draft_id}/merge")
+async def merge_continuation(draft_id: str, payload: MergeContinuationIn,
+                             session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    from app.api.deps import current_principal, ensure_role
+    from app.apps.versions import append_version
+    from app.ledger import fieldbaseline
+    from app.ledger.continuation import append_candidate
+    from sqlalchemy import update
+
+    ensure_role("builder")
+    # Serialize metadata updates with draft edits and competing merge requests.
+    await session.execute(update(CaliberDraft).where(CaliberDraft.id == draft_id)
+                          .values(updated_at=CaliberDraft.updated_at).execution_options(synchronize_session=False))
+    candidate = await _draft_or_404(session, draft_id)
+    origin = dict(candidate.origin or {})
+    continuation = dict(origin.get("continuation_from") or {})
+    if not continuation.get("draft_id"):
+        raise HTTPException(409, "这份草稿不是补充指标候选")
+    await session.execute(update(CaliberDraft).where(CaliberDraft.id == continuation["draft_id"])
+                          .values(updated_at=CaliberDraft.updated_at).execution_options(synchronize_session=False))
+    original = await _draft_or_404(session, continuation["draft_id"])
+    if continuation.get("merged_revision") is not None:
+        return {**await _draft_view(session, original, ensure_records=False), "merged_candidate_id": candidate.id,
+                "replayed": True}
+    if candidate.status not in ("ready", "questions_open") or original.status in ("drafting", "rejected", "attached"):
+        raise HTTPException(409, "请等待生成完成，并确认原稿仍可编辑")
+    incoming = await session.get(Workflow, candidate.workflow_id) if candidate.workflow_id else None
+    workflow = await session.get(Workflow, original.workflow_id) if original.workflow_id else None
+    if incoming is None or incoming.version != payload.candidate_revision:
+        raise HTTPException(409, "候选已变化，请刷新后重新核对")
+    if (workflow.version if workflow else 0) != payload.expected_revision:
+        raise HTTPException(409, "原稿已变化，请刷新后重新核对，不会覆盖现有编辑")
+    source = await session.get(DataSource, original.datasource_id) if original.datasource_id else None
+    try:
+        require_authoring_source(source)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    if candidate.datasource_id != original.datasource_id:
+        raise HTTPException(409, "候选与原稿数据源不一致，请重新核对")
+    # Lock the accepted candidate revision too; it must not change during the merge.
+    claimed = await session.execute(update(Workflow).where(
+        Workflow.id == incoming.id, Workflow.version == payload.candidate_revision
+    ).values(version=Workflow.version).execution_options(synchronize_session=False))
+    if claimed.rowcount != 1:
+        raise HTTPException(409, "候选已变化，请刷新后重新核对")
+    original_payload = dict(original.payload or {})
+    _, incoming_metrics = fieldbaseline.accepted_card(incoming.graph)
+    definition_ids = [m.get("source_definition_id") for m in incoming_metrics]
+    incoming_names = [m.get("name") for m in incoming_metrics]
+    if (not definition_ids or None in definition_ids
+            or not all(incoming_names) or len(set(incoming_names)) != len(incoming_names)
+            or not set(definition_ids) <= set(original_payload.get("selected_definition_ids") or [])):
+        raise HTTPException(409, "候选包含未请求的或重复的指标定义，请核对；候选已保留")
+    if ((candidate.payload or {}).get("semantic_inventory", {}).get("document_hashes")
+            != original_payload.get("semantic_inventory", {}).get("document_hashes")):
+        raise HTTPException(409, "候选与原稿的来源定义版本不同，请重新核对")
+    had_workflow = workflow is not None
+    prefix = f"supp_{candidate.id[:12]}"
+    try:
+        if had_workflow:
+            graph = append_candidate(workflow.graph, incoming.graph, prefix=prefix,
+                                     allowed_definitions=set(original_payload.get("selected_definition_ids") or []))
+            await append_version(session, workflow, graph, expected_revision=payload.expected_revision,
+                                 note=f"合并补充指标候选 {candidate.id}")
+        else:
+            # Keep the independent candidate independent even when the original had no graph.
+            from app.db.models import WorkflowVersion
+            from app.core.artifact_store import graph_hash
+            workflow = Workflow(name=original.title, graph=copy.deepcopy(incoming.graph), status="draft",
+                                tags=["doc_draft"], origin={"kind": "doc_draft", "draft_id": original.id,
+                                                         "datasource_id": original.datasource_id})
+            session.add(workflow)
+            await session.flush()
+            session.add(WorkflowVersion(workflow_id=workflow.id, version=1, graph=workflow.graph,
+                                        graph_hash=graph_hash(workflow.graph), note="接受补充指标候选"))
+            original.workflow_id = workflow.id
+        live = await _draft_graph_payload(session, workflow, workflow.version, draft=original, payload=original_payload)
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(409, str(exc)) from None
+    if live:
+        original_payload.update(live)
+    original_payload["workflow_id"] = workflow.id
+    if not had_workflow:
+        from app.core.artifact_store import graph_hash
+        if not original_payload.get("source_snapshot") and isinstance((candidate.payload or {}).get("source_snapshot"), dict):
+            original_payload["source_snapshot"] = copy.deepcopy(candidate.payload["source_snapshot"])
+        original_payload["accepted_graph_hash"] = graph_hash(workflow.graph)
+    workflow_id = workflow.id
+    workflow_version = workflow.version
+    workflow_graph = copy.deepcopy(workflow.graph)
+    original_id = original.id
+    original_created_by = original.created_by
+    candidate_id = candidate.id
+    candidate_snapshot = (
+        copy.deepcopy(candidate.payload["source_snapshot"])
+        if isinstance((candidate.payload or {}).get("source_snapshot"), dict) else None
+    )
+    completed = {m.get("source_definition_id") for m in original_payload.get("metrics", [])}
+    selected = set(original_payload.get("selected_definition_ids") or [])
+    completed_def_names = {
+        i["name"] for i in original_payload.get("semantic_inventory", {}).get("items", [])
+        if i["id"] in completed and i.get("name")
+    }
+    names = {m.get("name") for m in original_payload.get("metrics", []) if m.get("name")} | completed_def_names
+    remaining_count = len(selected - completed)
+    cleaned_questions: list[str] = []
+    for q in original_payload.get("open_questions", []):
+        if any(q.startswith(f"{name}：") for name in names):
+            continue
+        if q.startswith("另有 ") and "项指标尚未生成可用实现" in q:
+            if remaining_count > 0:
+                cleaned_questions.append(f"另有 {remaining_count} 项指标尚未生成可用实现，请按上方定义清单补充字段映射或确认口径")
+            continue
+        cleaned_questions.append(q)
+    original_payload["open_questions"] = cleaned_questions
+    if isinstance(original_payload.get("definition_diagnostics"), dict):
+        original_payload["definition_diagnostics"] = {
+            k: v for k, v in original_payload["definition_diagnostics"].items()
+            if k in selected - completed
+        }
+    original_payload["uncovered"] = [i["name"] for i in original_payload.get("semantic_inventory", {}).get("items", [])
+                                      if i["id"] in selected - completed]
+    original_payload["implementation_progress"] = {"total": len(selected), "completed": len(selected & completed),
+        "pending": 0, "blocked": len(selected - completed), "active_names": []}
+    original_payload["trial"] = {"status": "stale", "run_id": "", "error": "已合并补充指标，请重新试运行验证完整口径"}
+    original.error = None
+    original.payload, original.status = original_payload, _status_for(original_payload)
+    candidate.origin = {**origin, "continuation_from": {**continuation, "merge_required": False,
+                                                        "merged_revision": workflow_version}}
+    await session.commit()
+
+    # Commit the write transaction before put_json opens its own session (avoids SQLite write-lock deadlock).
+    ref: dict[str, Any] | None = None
+    card_id, card_metrics = fieldbaseline.accepted_card(workflow_graph)
+    if had_workflow:
+        new_metric_ids = {f"{prefix}_{m['id']}" for m in incoming_metrics if m.get("id")}
+        updates: dict[str, dict[str, Any]] = {}
+        for metric in card_metrics:
+            mid = str(metric.get("id") or "")
+            if mid in new_metric_ids:
+                fields = fieldbaseline.fields_of(metric)
+                updates[mid] = {
+                    "name": str(metric.get("name") or ""),
+                    "fields": {path: cell["value"] for path, cell in fields.items()},
+                    "expected_fields": sorted(fields),
+                }
+        if updates:
+            ref = await fieldbaseline.advance(
+                ref=fieldbaseline.ref_of(original_payload),
+                updates=updates,
+                card_id=card_id,
+                workflow_id=workflow_id,
+                accepted_revision=workflow_version,
+                draft_id=original_id,
+                source_snapshot=original_payload.get("source_snapshot") or candidate_snapshot,
+                accepted_by=current_principal().username,
+                card_metric_ids=[str(m.get("id") or "") for m in card_metrics if m.get("id")],
+            )
+    elif card_metrics:
+        ref = await fieldbaseline.put_metrics(
+            metrics=card_metrics,
+            card_id=card_id,
+            workflow_id=workflow_id,
+            accepted_revision=workflow_version,
+            source_snapshot=original_payload.get("source_snapshot") or candidate_snapshot,
+            draft_id=original_id,
+            accepted_by=original_created_by,
+        )
+    original = await _draft_or_404(session, original_id)
+    if ref is not None:
+        updated_payload = dict(original.payload or {})
+        updated_payload[fieldbaseline.REF_KEY] = ref
+        updated_payload[fieldbaseline.HISTORY_KEY] = [*fieldbaseline.history(updated_payload), ref]
+        original.payload = updated_payload
+        await session.commit()
+        original = await _draft_or_404(session, original_id)
+    return {**await _draft_view(session, original, ensure_records=False), "merged_candidate_id": candidate_id}
 
 
 @router.post("/drafts/{draft_id}/retry")

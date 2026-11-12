@@ -4,7 +4,7 @@
  * 主路径一次到位：选文档 → 模型读文档、对照数据目录产出定义 + 取数 + 入口字段 + 指标表达式 → 服务端校验后落成草稿图
  * → 后台自动只读试运行 → 这里展示「定义 + 数 + 原文引用」→ 人去画布审改并发布。发布才需要人签字。
  * - 发起：选知识库文档和**必选的数据源**（取数 SQL 只对照它的表和列写），可加一段起草要求；页面轮询详情直到状态离开
- *   drafting（最多十五分钟，指标多时服务端会分几轮续跑，进度写在 payload.progress）；
+ *   drafting（持续有进度时继续轮询，连续十五分钟无进展才暂停轮询；后台任务独立运行）；
  * - 试运行：草稿顶部显示这次自动试运行的状态和每个指标的值，running 时每两秒取一次，最多等一分钟；必填入口没有值时停在
  *   needs_input，在入口字段里填了再点「试运行」；失败照实写原因；
  * - 审读：指标默认收成一行（名字、单位、值和未决问题数），展开看单位、粒度、指标表达式、定义和逐字核对过的引用原文
@@ -49,6 +49,9 @@ import { formatDateTime, formatTime } from '../../lib/format'
 import { LEDGER_UI } from '../../lib/termsLedger'
 import { useAtLeast } from '../../store/auth'
 import { TrialResult, TrialValidation } from './TrialResult'
+import { ContinuationPanel, DefinitionInventory, QuerySemanticEditor } from './SemanticPanel'
+import { OntologyPanel } from './OntologyPanel'
+import { MigrationPanel } from './MigrationPanel'
 import type { DataSourceName, KbDocument, Run } from '../../types'
 import type {
   CaliberDraft, CaliberDraftStage, CaliberDraftStatus, CaliberDraftSummary, DraftAlignment, DraftBinding, DraftChangeReceipt,
@@ -517,6 +520,7 @@ export function CaliberDrafts() {
 
   /** 这次自动试运行的结果；running 时单独轮询，和草稿抽取的轮询互不相干 */
   const [trial, setTrial] = useState<DraftTrialOut | null>(null)
+  const trialRequestSeq = useRef(0)
   const [trialPollId, setTrialPollId] = useState<string | null>(null)
   const [trialTimedOut, setTrialTimedOut] = useState(false)
   const [trialError, setTrialError] = useState<unknown>(null)
@@ -602,6 +606,7 @@ export function CaliberDrafts() {
   const [expectSource, setExpectSource] = useState<DraftExpectationSource>('human_confirmed')
   /** 验证记录先摆最近几条，其余收起来 */
   const [recordsShown, setRecordsShown] = useState(RECORDS_SHOWN)
+  const [droppedExpanded, setDroppedExpanded] = useState(false)
   const canReview = useAtLeast('builder')
 
   const loadList = useCallback(() => {
@@ -706,6 +711,7 @@ export function CaliberDrafts() {
     setExpectValues({})
     setExpectSource('human_confirmed')
     setRecordsShown(RECORDS_SHOWN)
+    setDroppedExpanded(false)
     setImportRuns(null)
     setImportsError(null)
     setImportId(null)
@@ -768,28 +774,43 @@ export function CaliberDrafts() {
 
   useEffect(() => {
     if (!pollingId) return
-    const until = Date.now() + DRAFT_POLL_LIMIT_MS
+    let until = Date.now() + DRAFT_POLL_LIMIT_MS
+    let lastProgress = ''
     let alive = true
-    const timer = setInterval(() => {
+    let settled = false
+    const seq = openSeq.current
+    let timer: ReturnType<typeof setTimeout>
+    const poll = () => {
       api.caliberLedger.draft(pollingId).then((draft) => {
-        if (!alive) return
-        setDetail((cur) => (cur && cur.id === draft.id ? draft : cur))
+        if (!alive || seq !== openSeq.current) return
+        const currentProgress = JSON.stringify([draft.progress, draft.implementation_progress])
+        if (currentProgress !== lastProgress) {
+          lastProgress = currentProgress
+          until = Date.now() + DRAFT_POLL_LIMIT_MS
+        }
+        setDetail((cur) => (cur && cur.id === draft.id && (cur.revision ?? 0) <= (draft.revision ?? 0) ? draft : cur))
         if (draft.status !== 'drafting') {
+          settled = true
           setPollingId(null)
           setPollTimedOut(false)
           loadList()
         } else if (Date.now() > until) {
+          settled = true
           setPollingId(null)
           setPollTimedOut(true)
           loadList()
         }
       }, (e) => {
-        if (!alive) return
+        if (!alive || seq !== openSeq.current) return
+        settled = true
         setPollingId(null)
         setDetailError(e)
+      }).finally(() => {
+        if (alive && !settled && seq === openSeq.current) timer = setTimeout(poll, DRAFT_POLL_MS)
       })
-    }, DRAFT_POLL_MS)
-    return () => { alive = false; clearInterval(timer) }
+    }
+    timer = setTimeout(poll, DRAFT_POLL_MS)
+    return () => { alive = false; clearTimeout(timer) }
   }, [pollingId, loadList])
 
   /** 草稿有了试运行就取一次结果；还在 running 就交给下面的轮询 */
@@ -801,14 +822,15 @@ export function CaliberDrafts() {
     setTrial((cur) => (cur?.run_id === run && detail?.trial?.status !== 'stale' ? cur : {
       run_id: run, status: detail?.trial?.status ?? 'running', metrics: [], error: detail?.trial?.error ?? '',
     }))
+    const request = ++trialRequestSeq.current
     api.caliberLedger.draftTrial(id).then((out) => {
-      if (!alive) return
+      if (!alive || request !== trialRequestSeq.current) return
       setTrial(out)
       setTrialError(null)
       setTrialTimedOut(false)
       if (out.status === 'running') setTrialPollId(id)
     }, (e) => {
-      if (!alive) return
+      if (!alive || request !== trialRequestSeq.current) return
       setTrialError(e)
       setTrialPollId(null)
     })
@@ -820,35 +842,44 @@ export function CaliberDrafts() {
     if (!trialPollId) return
     const until = Date.now() + 60_000
     let alive = true
-    const timer = setInterval(() => {
+    let settled = false
+    const seq = openSeq.current
+    let timer: ReturnType<typeof setTimeout>
+    const poll = () => {
+      const request = ++trialRequestSeq.current
       api.caliberLedger.draftTrial(trialPollId).then((out) => {
-        if (!alive) return
+        if (!alive || seq !== openSeq.current || request !== trialRequestSeq.current) return
         setTrial(out)
         setTrialError(null)
         if (out.status === 'running') {
           if (Date.now() > until) {
+            settled = true
             setTrialPollId(null)
             setTrialTimedOut(true)
           }
           return
         }
+        settled = true
         setTrialPollId(null)
         setTrialTimedOut(false)
         loadList()
         // 试运行到终态时服务端会把这次跑完的验证记录补记一条：跟着取一次，结论按记录说
         loadValidations(trialPollId)
-        const seq = openSeq.current
         api.caliberLedger.draft(trialPollId).then((fresh) => {
           if (seq !== openSeq.current) return
-          setDetail((cur) => (cur && cur.id === fresh.id ? fresh : cur))
+          setDetail((cur) => (cur && cur.id === fresh.id && (cur.revision ?? 0) <= (fresh.revision ?? 0) ? fresh : cur))
         }, () => undefined)
       }, (e) => {
-        if (!alive) return
+        if (!alive || seq !== openSeq.current || request !== trialRequestSeq.current) return
+        settled = true
         setTrialPollId(null)
         setTrialError(e)
+      }).finally(() => {
+        if (alive && !settled && seq === openSeq.current) timer = setTimeout(poll, 2000)
       })
-    }, 2000)
-    return () => { alive = false; clearInterval(timer) }
+    }
+    timer = setTimeout(poll, 2000)
+    return () => { alive = false; clearTimeout(timer) }
   }, [trialPollId, loadList, loadValidations])
 
   /**
@@ -902,17 +933,17 @@ export function CaliberDrafts() {
     return at >= 0 ? at + 1 : null
   }
 
-  const submit = async () => {
+  const submit = async (definitions = true) => {
     if (!pickedDocs.length) { toast.warn(D.needDoc); return }
     setSubmitting(true)
     try {
-      const out = await api.caliberLedger.extractDraft({
+      const out = await (definitions ? api.caliberLedger.importDefinitions : api.caliberLedger.extractDraft)({
         documents: pickedDocs,
         ...(datasourceId ? { datasource_id: datasourceId } : {}),
         ...(guidance.trim() ? { guidance: guidance.trim() } : {}),
         ...(fixedFilters.trim() ? { fixed_filters: fixedFilters.trim() } : {}),
       })
-      toast.ok(D.started)
+      toast.ok(definitions ? '定义清单已导入，可自动处理全部可实现指标' : D.started)
       setPickedDocs([])
       setGuidance('')
       setFixedFilters('')
@@ -2668,14 +2699,38 @@ export function CaliberDrafts() {
   }
 
   const renderDetail = (draft: CaliberDraft) => {
+    const viewSeq = openSeq.current
     const stage = stageOf(draft)
     const drafting = draft.status === 'drafting'
     const terminal = stage === 'discarded'
-    const stageNote = stage === 'review' ? D.stageNote(draft.status) : ''
-    const questions = draft.open_questions ?? []
-    const dropped = draft.dropped ?? []
-    const uncovered = draft.uncovered ?? []
     const metrics = draft.metrics ?? []
+    const hasInventory = !!draft.semantic_inventory
+    const awaitingImplementation = hasInventory && !draft.workflow_id && metrics.length === 0
+    const stageNote = awaitingImplementation && draft.status !== 'path_pending' && !drafting
+      ? D.stageNoteNeedsGraph
+      : stage === 'review' ? D.stageNote(draft.status) : ''
+    const rawQuestions = draft.open_questions ?? []
+    const questions = hasInventory
+      ? rawQuestions.filter((q) =>
+        !q.includes('尚未生成可用实现，请补充字段映射或确认口径')
+        && !(q.startsWith('另有 ') && q.includes('项指标尚未生成可用实现')))
+      : rawQuestions
+    const rawDropped = draft.dropped ?? []
+    const hasSpecificDropped = rawDropped.some((item) => item.name !== 'metrics')
+    const droppedMap = new Map<string, { name: string; reason: string; count: number }>()
+    for (const item of rawDropped) {
+      if (hasSpecificDropped && item.name === 'metrics' && item.reason === '没有一条指标通过校验') continue
+      const key = `${item.name}\u0000${item.reason}`
+      const existing = droppedMap.get(key)
+      if (existing) existing.count += 1
+      else droppedMap.set(key, { name: item.name, reason: item.reason, count: 1 })
+    }
+    const dropped = Array.from(droppedMap.values())
+    const DROPPED_LIMIT = 8
+    const visibleDropped = droppedExpanded || dropped.length <= DROPPED_LIMIT
+      ? dropped
+      : dropped.slice(0, DROPPED_LIMIT)
+    const uncovered = draft.uncovered ?? []
     const values = new Map((draft.trial?.status === 'stale' ? [] : trial?.metrics ?? []).map((row) => [row.id, row]))
     // 第一轮还没落库时服务端写的是空对象：没有轮次就不画，别显示「第 undefined 轮」
     const progress = draft.progress && typeof draft.progress.round === 'number' ? draft.progress : null
@@ -2700,7 +2755,8 @@ export function CaliberDrafts() {
         {(drafting || draft.job?.retryable || (draft.status === 'failed' && !draft.workflow_id)) && (
           <div className="flex gap-2">
             {drafting && <button className="btn btn-sm" disabled={jobBusy === draft.id} onClick={() => void changeDraftJob(draft, 'stop')}>停止起草</button>}
-            {!drafting && <button className="btn btn-sm" disabled={jobBusy === draft.id} onClick={() => void changeDraftJob(draft, 'retry')}>重试起草</button>}
+            {!drafting && <button className="btn btn-sm" disabled={jobBusy === draft.id} onClick={() => void changeDraftJob(draft, 'retry')}>
+              {draft.implementation_progress ? '按原配置重试中断任务' : '重试起草'}</button>}
           </div>
         )}
         {jobError != null && <ErrorState error={jobError} compact />}
@@ -2713,18 +2769,19 @@ export function CaliberDrafts() {
         {drafting && pollingId === draft.id && (
           <Notice tone="info">
             <span className="inline-flex items-center gap-1.5"><Spinner size={12} /> {D.drafting}</span>
-            {progress && (
+            {progress && !draft.implementation_progress && (
               <span className="tnum mt-0.5 block" data-draft-progress="">
                 {D.progress(progress.round, progress.covered, progress.uncovered)}
               </span>
             )}
-            <span className="mt-0.5 block text-faint">{D.draftingHint}</span>
+            <span className="mt-0.5 block text-faint">{draft.implementation_progress
+              ? '系统会自动处理后续指标并保存进度，离开页面不影响执行。需补充的信息会单独列出。' : D.draftingHint}</span>
           </Notice>
         )}
         {drafting && pollTimedOut && (
           <Notice tone="warn">
             {D.draftingTimeout}
-            {progress && (
+            {progress && !draft.implementation_progress && (
               <span className="tnum mt-0.5 block" data-draft-progress="">
                 {D.progress(progress.round, progress.covered, progress.uncovered)}
               </span>
@@ -2736,12 +2793,31 @@ export function CaliberDrafts() {
         )}
         {draft.catalog_truncated && <Notice tone="warn">{D.catalogTruncated}</Notice>}
 
+        <DefinitionInventory key={`definitions:${draft.id}`} draft={draft} sources={sources}
+          onStarted={id => { loadList(); if (viewSeq === openSeq.current) void open(id) }} />
+        <ContinuationPanel key={`continuation:${draft.id}`} draft={draft} sources={sources}
+          onOpened={id => { loadList(); if (viewSeq === openSeq.current) void open(id) }} />
+        <MigrationPanel key={`migration:${draft.id}:${draft.revision}`} draft={draft}
+          onPrepared={id => { loadList(); if (viewSeq === openSeq.current) void open(id) }} />
         {renderTrial(draft)}
         {renderRules(draft)}
-        {renderValidation(draft)}
+        {!awaitingImplementation && renderValidation(draft)}
         {renderImports(draft)}
         {renderNl(draft)}
-        {renderEntryFields(draft)}
+        {!awaitingImplementation && renderEntryFields(draft)}
+        {metrics.map(metric => <QuerySemanticEditor key={`${draft.id}:${metric.id}`} draft={draft}
+          metric={metric} onSaved={fresh => {
+            loadList()
+            if (viewSeq !== openSeq.current) return
+            setDetail(cur => cur?.id === fresh.id && (cur.revision ?? 0) <= (fresh.revision ?? 0) ? fresh : cur)
+            loadValidations(draft.id)
+          }} />)}
+        <OntologyPanel key={`ontology:${draft.id}`} draft={draft} onSaved={fresh => {
+          loadList()
+          if (viewSeq !== openSeq.current) return
+          setDetail(cur => cur?.id === fresh.id && (cur.revision ?? 0) <= (fresh.revision ?? 0) ? fresh : cur)
+          loadValidations(draft.id)
+        }} />
         {renderSql(draft)}
 
         <div>
@@ -2759,6 +2835,10 @@ export function CaliberDrafts() {
           </div>
           {metrics.length ? (
             <ul className="space-y-2">{metrics.map((metric, index) => renderMetric(metric, index, values))}</ul>
+          ) : !drafting && draft.semantic_inventory ? (
+            <p className="text-xs text-faint">
+              {draft.status === 'path_pending' ? '定义已保留，请在上方选择指标并绑定数据。' : D.inventoryAwaitingHint}
+            </p>
           ) : !drafting ? (
             <EmptyState offline={false} icon={<ScrollText size={20} />} title={D.noMetrics} body={D.noMetricsBody} />
           ) : (
@@ -2769,6 +2849,9 @@ export function CaliberDrafts() {
         {questions.length > 0 && (
           <div data-draft-questions-all="">
             <h3 className="mb-1 text-2xs font-semibold text-dim">{D.questionsOther}</h3>
+            {hasInventory && (
+              <p className="mb-1 text-2xs leading-relaxed text-faint">{D.questionsContinuationHint}</p>
+            )}
             {questionList(questions, 'top')}
           </div>
         )}
@@ -2778,17 +2861,23 @@ export function CaliberDrafts() {
             <h3 className="text-2xs font-semibold text-dim">{D.dropped}</h3>
             <p className="mb-1 text-2xs leading-relaxed text-faint">{D.droppedHint}</p>
             <ul className="space-y-0.5 text-2xs leading-relaxed">
-              {dropped.map((item, i) => (
+              {visibleDropped.map((item, i) => (
                 <li key={`${item.name}:${i}`} className="text-dim">
                   <span className="font-medium">{item.name}</span>
-                  <span className="text-faint">：{item.reason}</span>
+                  <span className="text-faint">：{item.reason}{item.count > 1 ? `（重复 ${item.count} 次）` : ''}</span>
                 </li>
               ))}
             </ul>
+            {dropped.length > DROPPED_LIMIT && (
+              <button type="button" className="btn btn-xs btn-ghost mt-1"
+                onClick={() => setDroppedExpanded((cur) => !cur)}>
+                {droppedExpanded ? D.droppedLess : D.droppedMore(dropped.length - DROPPED_LIMIT)}
+              </button>
+            )}
           </div>
         )}
 
-        {uncovered.length > 0 && (
+        {!hasInventory && uncovered.length > 0 && (
           <div data-draft-uncovered="">
             <h3 className="text-2xs font-semibold text-dim">{D.uncovered(uncovered.length)}</h3>
             <p className="mb-1 text-2xs leading-relaxed text-faint">{D.uncoveredHint}</p>
@@ -2809,7 +2898,7 @@ export function CaliberDrafts() {
           </div>
         )}
 
-        {!drafting && stage === 'review' && draft.status !== 'attached' && (
+        {!awaitingImplementation && !drafting && stage === 'review' && draft.status !== 'attached' && (
           <details className="rounded-md border bg-elev px-3 py-2" data-draft-attach="">
             <summary className="cursor-pointer text-2xs font-semibold text-dim">{D.attach}</summary>
             <p className="mt-0.5 text-2xs leading-relaxed text-faint">{D.attachHint}</p>
@@ -2917,11 +3006,12 @@ export function CaliberDrafts() {
               <div className="space-y-2">
                 <label className="block text-2xs text-faint">
                   <span className="mb-0.5 block font-semibold text-dim">{D.datasource}</span>
-                  <select className="field w-full" value={datasourceId} required
+                  <select className="field w-full" value={datasourceId}
                           onChange={(e) => setDatasourceId(e.target.value)}>
+                    <option value="">导入定义时可暂不选数据源</option>
                     {sources.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
                   </select>
-                  <span className="mt-0.5 block">{D.datasourceHint}</span>
+                  <span className="mt-0.5 block">先保留文档定义，选择指标后再绑定已探查的数据源。</span>
                 </label>
                 <label className="block text-2xs text-faint">
                   <span className="mb-0.5 block font-semibold text-dim">{D.guidance}</span>
@@ -2935,10 +3025,12 @@ export function CaliberDrafts() {
                             onChange={(e) => setFixedFilters(e.target.value)} />
                   <span className="mt-0.5 block">{D.fixedFiltersHint}</span>
                 </label>
-                <button type="button" className="btn btn-primary btn-sm" disabled={submitting || !datasourceId}
+                <button type="button" className="btn btn-primary btn-sm" disabled={submitting || !pickedDocs.length}
                         onClick={() => void submit()} data-draft-submit="">
-                  {submitting ? <Spinner size={12} /> : <FileText size={12} aria-hidden />} {submitting ? D.submitting : D.submit}
+                  {submitting ? <Spinner size={12} /> : <FileText size={12} aria-hidden />} {submitting ? '正在导入…' : '导入指标定义表'}
                 </button>
+                <button type="button" className="btn btn-ghost btn-sm ml-2" disabled={submitting || !datasourceId || !pickedDocs.length}
+                        onClick={() => void submit(false)}>其他文档：AI 起草</button>
               </div>
             </div>
           </section>
@@ -2986,7 +3078,9 @@ export function CaliberDrafts() {
                         {draft.error && <span className="text-2xs text-[var(--err)]">{D.draftingFailed}</span>}
                       </div>
                       <div className="mt-0.5 text-2xs text-faint">
-                        {D.summary(draft.metric_count, draft.question_count)}
+                        {draft.definition_count != null
+                          ? `${draft.definition_count} 项定义 · ${draft.metric_count} 项已实现 · ${draft.question_count} 个待确认问题`
+                          : D.summary(draft.metric_count, draft.question_count)}
                         {draft.created_at ? ` · ${formatTime(draft.created_at)}` : ''}
                       </div>
                     </div>
