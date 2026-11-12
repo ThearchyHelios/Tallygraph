@@ -61,9 +61,33 @@ async def bind_caliber_tool(session: Any, graph: Any, actor: str | None) -> dict
     if not await restricted_actor(session, actor):
         return graph
     from app.apps.access import usable_calibers
+    from sqlalchemy import select
+    from app.db.models import Workflow, WorkflowVersion
+    from app.ledger.ontology import ACTIVE_LINK_STATUSES, workflow_ontology_index
+    from app.tools.ontology import ONTOLOGY_NEIGHBORS, SOURCE_HEALTH
 
-    if not await usable_calibers(session, actor):
+    usable = await usable_calibers(session, actor)
+    if not usable:
         return graph
+
+    has_ontology_edges = False
+    for wf_id, ver in usable:
+        snap = (
+            await session.execute(
+                select(WorkflowVersion.graph).where(
+                    WorkflowVersion.workflow_id == wf_id,
+                    WorkflowVersion.version == int(ver),
+                )
+            )
+        ).scalar_one_or_none()
+        if not isinstance(snap, dict):
+            wf = await session.get(Workflow, wf_id)
+            snap = wf.graph if wf is not None and isinstance(wf.graph, dict) else {}
+        idx = workflow_ontology_index(workflow_id=wf_id, version=int(ver), graph=snap)
+        if any(e.get("status") in ACTIVE_LINK_STATUSES for e in idx["edges"]):
+            has_ontology_edges = True
+            break
+
     nodes = copy.deepcopy(graph["nodes"])
     for node in nodes:
         if not isinstance(node, dict) or str(node.get("type")) != "agent":
@@ -74,10 +98,18 @@ async def bind_caliber_tool(session: Any, graph: Any, actor: str | None) -> dict
         config = here.setdefault("config", {})
         if not isinstance(config, dict):
             continue
-        tools = [str(t) for t in (node_setting(spec, spec.node_map()[str(node.get("id"))], "tools") or [])]
-        if CALIBER_QUERY in tools:
-            continue
-        config["tools"] = [*tools, CALIBER_QUERY]
+        spec_node = spec.node_map()[str(node.get("id"))]
+        tools = [str(t) for t in (node_setting(spec, spec_node, "tools") or [])]
+        additions = [CALIBER_QUERY]
+        if has_ontology_edges or bool(node_setting(spec, spec_node, "investigation")):
+            additions.extend([ONTOLOGY_NEIGHBORS, SOURCE_HEALTH])
+        changed = False
+        for extra_tool in additions:
+            if extra_tool not in tools:
+                tools.append(extra_tool)
+                changed = True
+        if changed:
+            config["tools"] = tools
     return {**graph, "nodes": nodes}
 
 

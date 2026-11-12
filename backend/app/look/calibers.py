@@ -51,6 +51,16 @@ DETAIL_EXPR_PROMPT = "    指标式：{expression}"
 DETAIL_DEFINITION_PROMPT = "    定义：{text}"
 #: 定义说明写进查看结果的上限：口述给人看的边界通常一两句，超出的部分在口径账本里看全文
 DEFINITION_MAX = 240
+#: 一跳已确认本体邻居摘要（无关联时不输出，不改变既有口径详情）
+DETAIL_ONTOLOGY_PROMPT = (
+    "    本体关联指标（已确认关系，异常穿透可调 ontology_neighbors / source_health / caliber_query）：{neighbors}"
+)
+ONTOLOGY_NEIGHBOR_LIMIT = 5
+_ONTOLOGY_KIND_LABELS = {
+    "factor": "构成因子",
+    "reconciles_with": "跨源对账",
+    "upstream_driver": "上游驱动",
+}
 DETAIL_REUSE_PROMPT = ("    复用写法（「看哪些数」这一项的 reuse 照抄，不要改）：{reuse}\n"
                        "    这张卡读：{inputs}。实例化时那个库的取数节点就叫这个名字、交出这几列，复用才算得出来")
 DETAIL_INPUT_PROMPT = "{node}（{tool}）的列 {columns}"
@@ -109,6 +119,7 @@ class CaliberView:
     reason: str | None
     #: 指标卡上的定义说明（说明、适用范围、不包含什么），压成一句；没有定义时为空串
     definition: str = ""
+    aliases: tuple[str, ...] = ()
 
     @property
     def label(self) -> str:
@@ -247,7 +258,9 @@ def metric_options(graph: Mapping[str, Any], card_id: str, *, workflow_id: str, 
         if reason is None:
             one = caliber_closure.build(graph, workflow_id, version, card_id, metric_ids=[metric_id])
             if not one.unresolved:
-                selectable.append({"metric_id": metric_id, "name": name, **one.summary()})
+                semantic = _query_semantic_brief(metric)
+                selectable.append({"metric_id": metric_id, "name": name, **one.summary(),
+                                   **({"query_semantics": semantic} if semantic else {})})
                 continue
             reason = problems_text(one.unresolved)
         unavailable.append({"metric_id": metric_id, "name": name, "reason": reason})
@@ -305,7 +318,9 @@ def views_of(workflow_id: str, workflow_name: str, version: Any) -> list[Caliber
                 level=str(getattr(version, "level", None) or ""), node_id=nid, card=node["title"], caliber=caliber,
                 metric_id=str(metric["id"]), name=str(metric.get("name") or metric["id"]),
                 unit=str(metric.get("unit") or ""), expression=str(metric.get("expression") or ""), inputs=packed,
-                reason=reason, definition=definition_text(metric.get("definition"))))
+                reason=reason, definition=definition_text(metric.get("definition")),
+                aliases=tuple(s for s in [*(metric.get("synonyms") or []),
+                                         *((metric.get("semantic") or {}).get("aliases") or [])] if isinstance(s, str))))
     return out
 
 
@@ -345,7 +360,8 @@ class CaliberKind:
     label = "口径"
 
     def __init__(self, items: list[CaliberView], *, picker: Picker | None = None,
-                 options: list[Any] | None = None, query: bool = False) -> None:
+                 options: list[Any] | None = None, query: bool = False,
+                 neighbors: Mapping[tuple[str, int, str, str], list[dict[str, Any]]] | None = None) -> None:
         self.items = items
         self.picker = picker
         #: 问数据里（compose / query 两档）：每张卡读好的那一份（入口字段、能算哪些指标、能不能组合），没读时为 None
@@ -353,10 +369,12 @@ class CaliberKind:
         #: 问数据里**普通使用者**那一档（K14）：不给 use_caliber（把口径的 SQL 拷进图），只给按口径查询工具取数的写法。
         #: use_caliber 能不能用看这个标记（api/copilot_context.composing）：options 两档都读，差别只在怎么用
         self.query = query
+        #: 已确认的一跳本体关联指标：{(workflow_id, version, node_id, metric_id): [neighbor_dict, ...]}
+        self.neighbors: dict[tuple[str, int, str, str], list[dict[str, Any]]] = dict(neighbors or {})
 
     @classmethod
     async def load(cls, session: Any, *, picker: Picker | None = None, compose: bool = False,
-                   actor: Any = None, query: bool = False) -> CaliberKind:
+                   actor: Any = None, query: bool = False, ontology: bool = True) -> CaliberKind:
         """读每个工作流**推荐发布版**（Workflow.published_version，K07）里的口径卡。用调用方的会话，开流之前读好。
         compose：问数据里（搭建者及以上），另把每张卡的那一版读好、判能不能组合（见模块说明）。
         query：问数据里（普通使用者），读同一份数据、但只给按口径查询工具取数的写法（use_caliber 不开）。
@@ -380,7 +398,13 @@ class CaliberKind:
             if resolved is not None and (permitted is None or (str(wf.id), int(resolved.version)) in permitted):
                 items += views_of(wf.id, wf.name, resolved.row)
         read = await _options(session, items) if (compose or query) else None
-        return cls(items, picker=picker, options=read, query=query)
+        neighbors = await _load_ontology_neighbors(
+            session,
+            items,
+            permitted=permitted,
+            restricted=bool(query or permitted is not None),
+        ) if ontology else {}
+        return cls(items, picker=picker, options=read, query=query, neighbors=neighbors)
 
     def option_of(self, item: CaliberView) -> Any | None:
         if self.options is None:
@@ -434,6 +458,16 @@ class CaliberKind:
 
     async def pick(self, need: str, sources: list[str] | None) -> tuple[list[tuple[CaliberView, str]], str | None]:
         pool = self._pool(sources)
+        from app.ledger.metric_matching import score
+
+        ranked = [(score(need, item.name, item.aliases), item) for item in pool]
+        hits = [(weight, item) for weight, item in ranked if weight]
+        if hits:
+            best = max(weight for weight, _ in hits)
+            matched = [item for weight, item in hits if weight == best]
+            if len(matched) <= PICK_LIMIT:
+                return [(item, "matched") for item in matched], None
+            return [], "同名口径过多，请指定完整指标名或所属口径"
         if len(pool) <= PICK_LIMIT:
             return [(i, "picked") for i in pool], None
         if self.picker is None:
@@ -473,6 +507,11 @@ class CaliberKind:
                      DETAIL_EXPR_PROMPT.format(expression=item.expression)]
             if item.definition:
                 block.append(DETAIL_DEFINITION_PROMPT.format(text=item.definition))
+            item_neighbors = self.neighbors.get((item.workflow_id, item.version, item.node_id, item.metric_id))
+            if item_neighbors:
+                block.append(DETAIL_ONTOLOGY_PROMPT.format(
+                    neighbors=_format_ontology_neighbors(item_neighbors, restricted=self.query)
+                ))
             option = self.option_of(item)
             if option is not None:
                 block += _query_lines(item, option, seen) if self.query else _compose_lines(item, option, seen)
@@ -623,7 +662,136 @@ def metric_briefs(entries: Iterable[Mapping[str, Any]]) -> str:
             out.append(f"{name}（{metric_id}，要 {'、'.join(need)}）" if need else f"{name}（{metric_id}，不用入口字段）")
         else:
             out.append(f"{name}（{metric_id}）：{m.get('reason')}")
+        if m.get("query_semantics"):
+            out[-1] += "；问数定义：" + str(m["query_semantics"])
     return "；".join(out) or "无"
+
+
+def _query_semantic_brief(metric: Mapping[str, Any]) -> str:
+    """Give the authorized Agent the same published meanings used by the direct router.
+
+    Bound the dictionary size in prompts; an omitted member is not permission to guess it.
+    The full model remains in the pinned metric definition, not in model-generated SQL.
+    """
+    from pydantic import ValidationError
+    from app.ledger.semantic import QuerySemantics
+
+    if not isinstance(metric.get("semantic"), Mapping):
+        return ""
+    try:
+        model = QuerySemantics.model_validate(metric["semantic"])
+    except ValidationError:
+        return "定义不完整，先向维护者确认"
+    if not model.enabled:
+        return "对象、时间和汇总规则待确认，不要自行推断后查询"
+    data = model.model_dump(mode="json")
+    for entity in data["entities"]:
+        entity["members_truncated"] = len(entity["members"]) > 20
+        entity["members"] = entity["members"][:20]
+    return json.dumps(data, ensure_ascii=False) + "；只按已声明的对象与周期取数；未列出的映射不可猜测"
+
+
+def _format_ontology_neighbors(entries: list[dict[str, Any]], *, restricted: bool = False) -> str:
+    parts: list[str] = []
+    for nb in entries[:ONTOLOGY_NEIGHBOR_LIMIT]:
+        kind_label = _ONTOLOGY_KIND_LABELS.get(str(nb.get("kind") or ""), str(nb.get("kind") or ""))
+        extra: list[str] = [kind_label]
+        if nb.get("role"):
+            extra.append(f"角色 {nb['role']}")
+        if nb.get("entity_key"):
+            extra.append(f"对齐实体 {nb['entity_key']}")
+        if not restricted and nb.get("sources"):
+            extra.append("数据源 " + "/".join(str(s) for s in nb["sources"]))
+        parts.append(
+            f"{nb['name']}（workflow={nb['workflow_id']}，card={nb['card_id']}，metric={nb['metric_id']}，"
+            f"{'，'.join(extra)}）"
+        )
+    if len(entries) > ONTOLOGY_NEIGHBOR_LIMIT:
+        parts.append(f"…另 {len(entries) - ONTOLOGY_NEIGHBOR_LIMIT} 项")
+    return "；".join(parts)
+
+
+async def _load_ontology_neighbors(
+    session: Any,
+    items: list[CaliberView],
+    *,
+    permitted: set[tuple[str, int]] | None,
+    restricted: bool,
+) -> dict[tuple[str, int, str, str], list[dict[str, Any]]]:
+    """加载可见口径指标的一跳已确认本体邻居（过滤 proposed / rejected，并按 permitted 收窄受限用户可见范围）。"""
+    if not items:
+        return {}
+    try:
+        from app.ledger.ontology import ACTIVE_LINK_STATUSES, build_published_ontology_graph, metric_node_key
+
+        graph = await build_published_ontology_graph(session, include_proposed=False, restricted=restricted)
+    except Exception:  # noqa: BLE001
+        return {}
+
+    nodes_by_key = {str(n["key"]): n for n in graph.get("nodes") or [] if isinstance(n, Mapping) and n.get("key")}
+    item_versions: dict[str, set[int]] = {}
+    for item in items:
+        item_versions.setdefault(metric_node_key(item.workflow_id, item.node_id, item.metric_id), set()).add(item.version)
+
+    out: dict[tuple[str, int, str, str], list[dict[str, Any]]] = {}
+
+    def _attach(focal_ref: Mapping[str, Any], peer_ref: Mapping[str, Any], edge: Mapping[str, Any]) -> None:
+        focal_key = metric_node_key(
+            str(focal_ref.get("workflow_id") or ""),
+            str(focal_ref.get("card_id") or ""),
+            str(focal_ref.get("metric_id") or ""),
+        )
+        versions = item_versions.get(focal_key)
+        if not versions:
+            return
+        peer_key = metric_node_key(
+            str(peer_ref.get("workflow_id") or ""),
+            str(peer_ref.get("card_id") or ""),
+            str(peer_ref.get("metric_id") or ""),
+        )
+        peer = nodes_by_key.get(peer_key)
+        if peer is None:
+            return
+        peer_wf = str(peer["workflow_id"])
+        peer_ver = int(peer["version"])
+        if permitted is not None and (peer_wf, peer_ver) not in permitted:
+            return
+        entry: dict[str, Any] = {
+            "kind": str(edge.get("kind") or ""),
+            "role": edge.get("role"),
+            "entity_key": edge.get("entity_key"),
+            "workflow_id": peer_wf,
+            "workflow_name": str(peer.get("workflow_name") or peer_wf),
+            "version": peer_ver,
+            "card_id": str(peer["card_id"]),
+            "metric_id": str(peer["metric_id"]),
+            "name": str(peer.get("name") or peer["metric_id"]),
+        }
+        if not restricted and peer.get("sources"):
+            entry["sources"] = list(peer["sources"])
+        for ver in versions:
+            slot_key = (str(focal_ref["workflow_id"]), ver, str(focal_ref["card_id"]), str(focal_ref["metric_id"]))
+            bucket = out.setdefault(slot_key, [])
+            if not any(
+                b["workflow_id"] == entry["workflow_id"]
+                and b["card_id"] == entry["card_id"]
+                and b["metric_id"] == entry["metric_id"]
+                and b["kind"] == entry["kind"]
+                for b in bucket
+            ):
+                bucket.append(entry)
+
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, Mapping) or edge.get("status") not in ACTIVE_LINK_STATUSES:
+            continue
+        src = edge.get("from")
+        dst = edge.get("to")
+        if not isinstance(src, Mapping) or not isinstance(dst, Mapping):
+            continue
+        _attach(src, dst, edge)
+        if edge.get("kind") == "reconciles_with":
+            _attach(dst, src, edge)
+    return out
 
 
 async def verify_reuse(session: Any, ref: dict[str, Any]) -> dict[str, Any]:

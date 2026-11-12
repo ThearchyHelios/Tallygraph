@@ -40,7 +40,7 @@ When motion is turned off at the system level (`prefers-reduced-motion`), the li
 
 ### Built-in templates
 
-There are 11 built-in templates, from Minimal Q&A to Anomaly Analysis (Traceable). They run as they are and also serve as executable documentation of how each kind of node is used. Templates 9, Traceable Weekly Report, and 11, Anomaly Analysis (Traceable), can be published at the governed level as they are: the first demonstrates caliber cards and issuance by citation; the second demonstrates the analysis card, which takes two queries, judges whether this week's change is within the usual fluctuation and which region it mainly came from, and leaves the report to cite only the verdict phrases (see [Analysis](analysis.md#analysis-cards)).
+There are 12 built-in templates, from Minimal Q&A to Cross-Source Metric Anomaly and Reconciliation Diagnosis. They run as they are and also serve as executable documentation of how each kind of node is used. Templates 9, Traceable Weekly Report, 11, Anomaly Analysis (Traceable), and 12, Cross-Source Metric Anomaly and Reconciliation Diagnosis, can be published at the governed level as they are: 9 demonstrates caliber cards and issuance by citation, 11 demonstrates the analysis card, and 12 demonstrates health-first source checks, cross-source reconciliation, slice localization, and confirmed ontology penetration (see [Analysis](analysis.md#analysis-cards)).
 
 ## Node types
 

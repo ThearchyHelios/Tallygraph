@@ -5,7 +5,7 @@ look → 建图 / 固定执行 → 收尾写库），不只测 helper：
 
 1. **授权 look**：使用者这一轮的 system 里列着他有授权的口径（入口字段 + 按口径查询工具取数的写法），没有授权的口径一个字
    都不出现；他这一轮也**没有** use_caliber 那段协议（把口径的取数 SQL 拷进图里那条路只给搭建者及以上）；
-2. **非精确问法**（「上个月<指标>是多少」）：模型按查看结果搭「入口 → agent（绑 caliber_query）→ 出口」，运行真的调这个
+2. **分析问法**（「分析<指标>在指定月份的数值」）：模型按查看结果搭「入口 → agent（绑 caliber_query）→ 出口」，运行真的调这个
    工具取到数、交回的值写进答案——不是只能查底表；
 3. **next 与运行归属**：命中固定执行（「<指标> 2026年9月是多少」）时 final.next = done（不是 ready），driver 把那次运行
    收进这一轮（turn.run_id / meta.runId / run 事件）、页面据此重载查看，答案用 final 那句白话，整轮零模型、不再整轮复核；
@@ -46,8 +46,8 @@ CARD = "card"
 NAME = "集成口径专用净额甲"
 #: 合成库的窗口：2026-09-01（含）≤ paid_at < 2026-10-01（不含）
 WINDOW_INPUTS = {"start": "2026-09-01", "end": "2026-10-01"}
-#: 非精确问法（remainder 拆出来是「上个月<NAME>」，和指标名不等：走模型那条路）
-QUESTION_FUZZY = f"上个月{NAME}是多少"
+#: 分析问法：继续由已授权的 Agent 选用口径；旧口径的相对日期问数另走迁移澄清。
+QUESTION_FUZZY = f"分析{NAME}在2026年9月的数值"
 #: 精确问法（拆出来正是指标名：走固定执行那条路）
 QUESTION_EXACT = f"{NAME} 2026年9月是多少"
 
@@ -290,8 +290,8 @@ async def world(tmp_path, monkeypatch):
 # ==========================================================================
 
 
-async def test_a_vague_question_uses_the_authorized_caliber_through_the_tool(world, monkeypatch):
-    """「上个月<指标>是多少」不精确：助手看得见**有授权的**口径与参数，按它搭 agent 调 caliber_query 取数。"""
+async def test_an_analysis_question_uses_the_authorized_caliber_through_the_tool(world, monkeypatch):
+    """分析问题：助手看得见**有授权的**口径与参数，按它搭 agent 调 caliber_query 取数。"""
     asset = world["asset"]
     # 另一份口径没授权给它：一个字都不该出现在这一轮里（清单按资产授权收窄）
     hidden = await _unauthorized_asset(world)

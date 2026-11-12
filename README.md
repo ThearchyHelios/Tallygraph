@@ -72,7 +72,7 @@ conda env create -f environment.yml   # first time: create the agentlab environm
 ./scripts/dev.sh                      # after that: one command starts the frontend and backend
 ```
 
-Open http://localhost:5273 . You can try everything without an API key: the built-in Mock provider runs the whole orchestration path end to end; to connect a real model, see [Model access](docs/en/configuration.md#model-access). The 11 built-in templates run as they are.
+Open http://localhost:5273 . You can try everything without an API key: the built-in Mock provider runs the whole orchestration path end to end; to connect a real model, see [Model access](docs/en/configuration.md#model-access). The 12 built-in templates run as they are.
 
 **Login is off by default**: anyone on the same network who can open the page can use every feature. Turn on login before multiple people use it; see [Login modes](docs/en/identity-and-security.md#login-modes). For more startup options, see [Development](docs/en/development.md#start).
 
@@ -88,15 +88,15 @@ See [Deployment](docs/en/deployment.md) and [deploy/README.md](deploy/README.md)
 | Document | What it covers |
 |---|---|
 | **Using and building** | |
-| [Ask Data and Copilot](docs/en/ask-data.md) | What happens after you ask, output review, record retention, how Copilot builds graphs and looks things up |
+| [Ask Data and Copilot](docs/en/ask-data.md) | What happens after you ask, cross-source ontology penetration and anomaly escalation, output review, record retention, how Copilot builds graphs and looks things up |
 | [Workflows](docs/en/workflows.md) | The canvas, node types, passing data, human nodes and rejection, agent guardrails, subworkflows, publishing and gates, runs and resuming |
 | [Evidence and Issuance](docs/en/evidence.md) | Caliber cards, issuance contracts and tiers, citation markers, claim sentences, no data in the queried range, sealing and verification, report exports and verifiable reports, the review suite |
-| [Analysis](docs/en/analysis.md) | The five analyses and their criteria, when an analysis can't be done, analysis tools for agents and analysis cards, how to cite, the analysis claim check, the analysis scope, settings and limits |
+| [Analysis](docs/en/analysis.md) | Single-source analyses, cross-source reconciliation and co-movement, source health probes, analysis tools and cards, citations, analysis claim checks, analysis scope, settings and limits |
 | [Data Sources and Spreadsheet Import](docs/en/data-sources.md) | Connecting databases, read-only guarantees, uploading spreadsheets and recipes, accumulating by period, cross-database merges, masked columns |
-| [Data Catalog](docs/en/data-catalog.md) | What the catalog records, drafting and review, export and import, data profiling, SQL checks, introspection scope for large databases, schema and value changes |
+| [Data Catalog](docs/en/data-catalog.md) | What the catalog records, drafting and review, export and import, data profiling, SQL checks, introspection scope for large databases, schema and value changes, canonical entity bridges |
 | [Tools, MCP, and the Capability Registry](docs/en/tools.md) | Kinds of tools, approval levels, capability governance, limits on write capabilities, registered endpoints, network rules |
 | [Apps](docs/en/apps.md) | Creating apps, views and stamps, processes and tasks, writing to external systems, form submissions, personal apps, external integration |
-| [Evaluation and the Caliber Ledger](docs/en/evaluation-and-ledger.md) | Test suites and evaluation results, caliber labels per number, issuance by caliber, reconciliation, distilling, recall |
+| [Evaluation and the Caliber Ledger](docs/en/evaluation-and-ledger.md) | Test suites and ontology penetration presets, evaluation results, caliber labels per number, issuance by caliber, reconciliation, distilling, recall, metric ontology topology |
 | [Schedules, Event Triggers, and Notifications](docs/en/schedules.md) | Schedules, event triggers, notification channels and email, subscribable events |
 | **Deployment and operations** | |
 | [Deployment](docs/en/deployment.md) | `prod.sh`, the Docker offline bundle, the data directory, backups, upgrades |
@@ -120,7 +120,7 @@ cd frontend && npx tsc -b
 node scripts/check-all.mjs   # frontend checks; start ./scripts/dev.sh first
 ```
 
-For tests on PostgreSQL, the 43 frontend checks, and the documentation checks, see [Development](docs/en/development.md).
+For tests on PostgreSQL, the 45 frontend checks, and the documentation checks, see [Development](docs/en/development.md).
 
 ## License
 

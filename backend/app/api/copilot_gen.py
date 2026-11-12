@@ -739,7 +739,7 @@ class GraphChecker:
                  baseline: list[dict[str, Any]] | None = None, level: str | None = None,
                  defaults: dict[str, Any] | None = None, checkers: dict[str, Any] | None = None,
                  known: set[Any] | None = None, chat_user: bool = False, question: str | None = None,
-                 analysis_tools: bool = True) -> None:
+                 analysis_tools: bool = True, ontology_tools: bool = True) -> None:
         from app.analysis.intent import analysis_intent
 
         self.applier = applier
@@ -759,6 +759,8 @@ class GraphChecker:
         self._coverage_given = False
         #: 这一轮给不给分析工具（评测「关掉分析工具」那一臂为假）
         self.analysis_tools = analysis_tools
+        #: 这一轮给不给本体穿透工具（评测「关掉本体穿透」那一臂为假）
+        self.ontology_tools = ontology_tools
         #: 关掉分析工具时，用了分析能力的子工作流节点（issues 每次先读好）
         self._off_subgraphs: set[str] = set()
         #: 用户问题的分析意图（问为什么、怎么变了、是否异常、趋势……），不是分析类问题、或者这一轮没有分析工具时为 None
@@ -772,7 +774,7 @@ class GraphChecker:
         return _blocking_issues(self.applier.nodes, self.applier.edges, self.scope, sources=self.sources,
                                 baseline=self.baseline, level=self.level, defaults=self.defaults,
                                 checkers=self.checkers, chat_user=self.chat_user, analysis_tools=self.analysis_tools,
-                                off_subgraphs=self._off_subgraphs)
+                                ontology_tools=self.ontology_tools, off_subgraphs=self._off_subgraphs)
 
     async def issues(self) -> list[dict[str, Any]]:
         if not self.analysis_tools:
@@ -890,8 +892,8 @@ def analysis_gaps_fix(*, asked: str = "问题问的是变化从哪来（「把�
 COVERAGE_BUDGET_S = 8.0
 #: 分析类问题、查库的 Agent 没绑分析工具（GraphChecker.analysis_gaps）那条问题的 code
 ANALYSIS_TOOLS_MISSING = "analysis_tools_missing"
-#: 自查让助手绑分析工具时列出的先后：先定现象（可比性、基线、趋势），再拆、再检验（同分析方法 tools/builtin/analysis.py）
-ANALYSIS_TOOL_ORDER = ("comparable", "baseline", "trend", "decompose", "differ")
+#: 自查让助手绑分析工具时列出的先后：先定现象（可比性、基线、趋势），再拆、再检验、跨源对账与伴随异动（同分析方法 tools/builtin/analysis.py）
+ANALYSIS_TOOL_ORDER = ("comparable", "baseline", "trend", "decompose", "differ", "reconcile", "cochange")
 
 
 async def _probe_source(row: Any) -> Any:

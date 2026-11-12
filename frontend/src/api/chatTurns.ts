@@ -13,7 +13,68 @@ import type { ConversationTurn } from '../types'
 import { ApiError, BASE, NETWORK_MESSAGE, actorHeader, failure, get, parseBody, post, report } from './http'
 
 /** 发起一轮的方式（服务端 app/chat/job.MODES） */
-export type ChatTurnMode = 'ask' | 'retry' | 'rerun' | 'max_steps' | 'run' | 'continue' | 'resume'
+export type ChatTurnMode = 'ask' | 'retry' | 'rerun' | 'max_steps' | 'run' | 'continue' | 'resume' | 'escalate'
+
+/** 问数模式：fast 为快速直查（语义预命中 + 单 Agent 直查），deep 为深度分析（搭工作流 + 报告 + 复核） */
+export type ChatDepth = 'fast' | 'deep'
+
+export interface GroundingMetricHit {
+  id: string
+  key: string
+  name: string
+  unit?: string
+  datasource_id?: string
+  datasource_name?: string
+  table_name?: string
+  sql_expression?: string
+  date_column?: string
+  aggregation_type?: string
+  match_reason?: string
+}
+
+export interface GroundingEntityHit {
+  entity_id: string
+  entity_key: string
+  label: string
+  entity_type?: string
+  matched_member?: {
+    member_id?: string
+    canonical_value?: string
+    canonical_label?: string
+    matched_term?: string
+    target_codes?: Record<string, string[]>
+  } | null
+  bound_columns?: { source_id: string; source_name: string; table_name: string; column_name: string }[]
+}
+
+export interface GroundingTableHit {
+  datasource_id: string
+  datasource_name: string
+  table_name: string
+  label?: string
+  grain?: string
+  business_date?: string
+  valid_filter?: string
+  reason?: string
+}
+
+export interface GroundingGuardrail {
+  kind: 'business_date' | 'valid_filter' | 'stock_columns' | string
+  table?: string
+  column?: string
+  columns?: string[]
+  filter?: string
+  note?: string
+}
+
+export interface GroundingSummary {
+  elapsed_ms: number
+  narrowed_sources?: { id: string; name: string }[]
+  metrics?: GroundingMetricHit[]
+  entities?: GroundingEntityHit[]
+  tables?: GroundingTableHit[]
+  guardrails?: GroundingGuardrail[]
+}
 
 export interface ChatTurnStart {
   conversation_id: string
@@ -23,6 +84,7 @@ export interface ChatTurnStart {
   retry_of?: string
   mode?: ChatTurnMode
   max_steps?: number
+  depth?: ChatDepth
 }
 
 /** 事件日志里的一条（服务端 app/chat/job.py 的模块说明列了各种 type） */

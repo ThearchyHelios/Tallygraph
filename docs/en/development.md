@@ -122,7 +122,7 @@ It can switch between "normal / time out after a successful write / 500 / 4xx", 
 ## Frontend checks
 
 ```bash
-# 43 items, 8 lanes in parallel by default. They connect to 5273 / 8000, so start ./scripts/dev.sh first
+# 45 items, 8 lanes in parallel by default. They connect to 5273 / 8000, so start ./scripts/dev.sh first
 node scripts/check-all.mjs
 # Start 2 extra "backend + vite" stacks used only by the checks, each with its own copy of the data, about 6.5 minutes; editing code while they run doesn't interrupt them
 CHECK_DATA_SRC=<data-dir> node scripts/check-all.mjs --stacks 2 --lanes 12
@@ -135,7 +135,7 @@ node scripts/check-all.mjs evidence publish
 - `scripts/e2e-check.mjs` really starts a run (Mock, costs nothing) and leaves records in the database, so it isn't part of check-all.
 - `scripts/check-auth.mjs` (login, navigation collapsed by role, 401 redirecting to login) has to run on its own against a separate service with local-account login turned on, so it isn't part of check-all either.
 
-The 43 `check-all` items, in the order of `ORDER` in `scripts/check-all.mjs`:
+The 45 `check-all` items, in the order of `ORDER` in `scripts/check-all.mjs`:
 
 | Category | Checks |
 |---|---|
@@ -144,7 +144,7 @@ The 43 `check-all` items, in the order of `ORDER` in `scripts/check-all.mjs`:
 | Shell, answer stream, and run states | `shell` `stream` `evidence` (clickable evidence) `run-states` (node cards) `canvas-fx` (canvas surface layer) |
 | Pages | `studio` `publish` (pre-publish check and autofix) `chat` `runs` `manage` `versions` (uploaded spreadsheet versions) `catalog` (data catalog) `catalog-loop` (Table Copilot, review queue, export and import) `catalog-profile` (per-table data profiling jobs) `catalog-changes` (changes, the changes section in table details, scheduled maintenance, the background job bar) `ui` (end to end, with real data) |
 | Review suite and exports | `schedules` (schedules) `compare` (run comparison) `verify` (double-blind recomputation, adversarial review) `inquiry` (approval inquiry) `challenge` (adversarial review) `bundle` (verifiable report) `whatif` (what-if sandbox) `report-export` (report export) |
-| Evaluation and caliber ledger | `evals` (test suites, adding questions, starting and progress, results, comparison and A/B, caliber hits and repetition) `ledger` (the Caliber step in evidence, turn summaries, issuance and reconciliation, distillable questions) |
+| Evaluation and caliber ledger | `evals` (test suites, adding questions, starting and progress, results, comparison and A/B, caliber hits and repetition) `ledger` (the Caliber step in evidence, turn summaries, issuance and reconciliation, distillable questions) `caliber-drafts` (caliber draft workbench, incremental re-import, and natural-language caliber change) `ontology` (canonical business entities, caliber ontology topology, source health evidence chain, anomaly escalation, and ontology penetration attribution) |
 | App platform | `apps` (app pages, stamps, clicking numbers to see provenance, entry validation, instance pages) `inbox` (joint sign-off progress, timeouts, the hash card for action confirmation, verification) `app-editor` (app editing, derivation, checks, choosing a disposition at publish time, Copilot) `capabilities` (capabilities, endpoints, identity, notifications, audit) `access-keys` (access keys) `share` (share links and the /s page) `blueprint` (creating apps, blueprint cards, trial runs, publish summaries) `personal` (personal apps) `records` (record list) `files` (file controls) |
 
 ### What the three verification layers cover

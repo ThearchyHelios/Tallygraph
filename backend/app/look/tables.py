@@ -66,6 +66,10 @@ INDEX_SCOPED_PROMPT = ("数据源「{source}」（共 {total} 张表，探查范
                        "按需加入）：")
 PICK_WHAT_PROMPT = "数据表"
 PICK_LINE_PROMPT = "每行一张表：表名｜中文名｜粒度"
+ENTITY_BRIDGE_HEAD_PROMPT = (
+    "  跨源标准实体桥（已确认绑定；跨源穿透优先走 caliber_query，搭建者对齐粒度后可辅以 1 跳 db_query__）："
+)
+ENTITY_BRIDGE_LIMIT = 6
 
 
 @dataclass
@@ -80,6 +84,8 @@ class SourcePlan:
     facts: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: 对象索引里探查范围外的对象（source_objects.outside_objects）：检索、点名时用，点到了按需加入
     outside: list[Any] = field(default_factory=list)
+    #: 桥接到其他数据源的已确认标准业务实体（仅非受限搭建者/管理员填充）
+    entity_bridges: list[dict[str, Any]] = field(default_factory=list)
     _graph: dict[str, list[JoinEdge]] | None = None
     _search: Any = None
     _outside_keys: dict[str, Any] | None = None
@@ -237,7 +243,7 @@ class TableKind:
     @classmethod
     async def load(cls, sources: list[Any], *, graph: Mapping[str, Any] | None = None,
                    picker: Picker | None = None, catalog_view: Any = None,
-                   trail: Mapping[str, Any] | None = None) -> TableKind:
+                   trail: Mapping[str, Any] | None = None, ontology: bool = True) -> TableKind:
         """读各源的数据目录、剖析事实、探查范围外的对象清单。graph 是现有工作流（改图时的原图、追问时上一轮的图），概览里
         列出它查过的表。trail 是按需加入的留痕（谁、哪一轮对话）：不给时谁取这次请求的身份。
 
@@ -249,12 +255,12 @@ class TableKind:
         seeds = graph_tables(graph, sources)
         plans = [SourcePlan(source=s, entries=await read(view, s) if introspect.table_names(s) else {},
                             seeds=seeds.get(s.name, [])) for s in sources]
-        await _load_extras(plans)
         trail = dict(trail or {})
         if "actor" not in trail:
             from app.api.deps import current_principal
 
             trail["actor"] = current_principal().username
+        await _load_extras(plans, actor=trail.get("actor"), ontology=ontology)
         return cls(plans, picker=picker, trail=trail)
 
     def begin(self, *, need: str, ref: str) -> None:
@@ -582,6 +588,7 @@ class TableKind:
                 lines += [f"    {x}" for x in block[1:]]
             lines += schema_view.join_lines(p.source, p.graph(), tables, indent="  ")
             lines += schema_view.route_lines(p.source, routes, indent="  ")
+            lines += _entity_bridge_lines(p, tables)
             if self._added.get(i):
                 lines.append("  " + ADDED_PROMPT.format(tables="、".join(p.qualified(t) for t in self._added[i])))
             if p.unexplored:
@@ -655,15 +662,51 @@ class TableKind:
         return out
 
 
-async def _load_extras(plans: list[SourcePlan]) -> None:
-    """各源的剖析事实、探查范围外的对象清单：一个短会话读完。读不到就当没有（少一节剖析事实、少几个可按需加入的名字），
-    不挡生成。上传表格、记录表没有对象索引；探查范围以内就是全部的源（没有范围外的对象）不读清单。"""
+def _entity_bridge_lines(p: SourcePlan, tables: list[str]) -> list[str]:
+    """当前源查看的几张表上，已确认的标准业务实体桥接到哪些其他数据源与物理表列（仅非受限角色可见）。"""
+    if not p.entity_bridges or not tables:
+        return []
+    table_keys = {name_key(t) for t in tables} | {name_key(t.rsplit(".", 1)[-1]) for t in tables}
+    matched_lines: list[str] = []
+    for bridge in p.entity_bridges:
+        local = [
+            b for b in bridge.get("local_bindings") or []
+            if name_key(str(b.get("table_name") or "")) in table_keys
+            or name_key(str(b.get("table_name") or "").rsplit(".", 1)[-1]) in table_keys
+        ]
+        peers = list(bridge.get("peer_bindings") or [])
+        if not local or not peers:
+            continue
+        local_desc = "、".join(f"{b['table_name']}.{b['column_name']}" for b in local[:3])
+        peer_desc = "、".join(
+            f"{b['source_name']}:{b['table_name']}.{b['column_name']}" for b in peers[:4]
+        )
+        matched_lines.append(
+            f"    · {bridge['label']}（{bridge['key']}）：本源 {local_desc} ↔ 关联源 {peer_desc}"
+        )
+        if len(matched_lines) >= ENTITY_BRIDGE_LIMIT:
+            break
+    return [ENTITY_BRIDGE_HEAD_PROMPT, *matched_lines] if matched_lines else []
+
+
+async def _load_extras(plans: list[SourcePlan], *, actor: Any = None, ontology: bool = True) -> None:
+    """各源的剖析事实、探查范围外的对象清单与跨源标准实体桥：一个短会话读完。读不到就当没有（少一节剖析事实、少几个可按需加入的名字），
+    不挡生成。上传表格、记录表没有对象索引；探查范围以内就是全部的源（没有范围外的对象）不读清单；普通受限使用者不加载物理表桥。"""
+    from app.auth.chat_policy import effective_actor, restricted_actor
     from app.data import catalog_profile_jobs, source_objects
+    from app.data.entities import entities_bridging_sources, list_entities
     from app.db.base import SessionLocal
 
     try:
         async with SessionLocal() as session:
+            is_restricted = await restricted_actor(session, effective_actor(actor))
+            entity_rows = [] if (is_restricted or not ontology) else await list_entities(session)
             for p in plans:
+                if entity_rows and p.tables:
+                    p.entity_bridges = [
+                        b for b in entities_bridging_sources(entity_rows, source_name=p.name)
+                        if b.get("peer_bindings")
+                    ]
                 source_id = getattr(p.source, "id", None)
                 if not source_id:
                     continue

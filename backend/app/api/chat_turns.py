@@ -15,7 +15,7 @@ conversations.turn_access / ensure_conversation_access）；访问密钥调不�
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -40,6 +40,8 @@ class TurnStartIn(BaseModel):
     mode: str | None = None
     #: 放宽到几步（mode=max_steps）
     max_steps: int | None = Field(default=None, ge=1, le=10_000)
+    #: 问数模式：fast 快速直查（毫秒级语义预命中 + 确定性直查图） | deep 深度分析（助手规划建工作流 + 报告 + 复核）
+    depth: Literal["fast", "deep"] | None = None
 
 
 def _refused(e: Any) -> HTTPException:
@@ -64,7 +66,7 @@ async def start_turn(payload: TurnStartIn, session: AsyncSession = Depends(get_s
     try:
         turn_id = await chat_job.start(session, conversation=conversation, question=payload.question,
                                        datasource_ids=payload.datasource_ids, actor=actor_of(x_actor), mode=payload.mode,
-                                       retry_of=retry_of, max_steps=payload.max_steps)
+                                       retry_of=retry_of, max_steps=payload.max_steps, depth=payload.depth)
     except chat_job.TurnRefused as e:
         raise _refused(e) from e
     from app.db.base import SessionLocal

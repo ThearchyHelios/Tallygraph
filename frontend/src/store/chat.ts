@@ -1,7 +1,9 @@
 import { create } from 'zustand'
 import { ANALYSIS_TEXT, analysisMethodLabel, analysisToolOp } from '../lib/termsAnalysis'
 import { ApiError, api, streamRun } from '../api/client'
-import { streamChatTurn, type ChatTurnEvent, type ChatTurnStart } from '../api/chatTurns'
+import {
+  streamChatTurn, type ChatDepth, type ChatTurnEvent, type ChatTurnStart, type GroundingSummary,
+} from '../api/chatTurns'
 import type { CopilotOp, FixKind, RunFinal } from '../run/decode'
 import { copilotContext, copilotLook, decodeRun } from '../run/decode'
 import { CHAT_BLUEPRINT_TEXT, CHAT_RETRY_TEXT, LEDGER_TEXT, LOOK_TEXT, REJECTED_TEXT } from '../lib/terms'
@@ -191,6 +193,10 @@ export interface TurnMeta {
   at?: number
   /** 这一轮的花费：助手建图、运行、复核各一份（next-round 细案 01 做法 3），见 TurnUsage */
   usage?: TurnUsage
+  /** 问数模式：fast 为快速直查，deep 为深度分析 */
+  depth?: ChatDepth
+  /** 语义预命中摘要（指标、业务实体、数据目录表、防错规则） */
+  grounding?: GroundingSummary
 }
 
 /**
@@ -304,6 +310,10 @@ export interface ChatTurn {
   asked?: string
   /** 这一轮在服务端的任务（从库里恢复时带来的）：进行中的从它的 attempt_seq 接着播 */
   job?: ChatTurnJob | null
+  /** 问数模式：fast 为快速直查，deep 为深度分析 */
+  depth?: ChatDepth
+  /** 语义预命中摘要 */
+  grounding?: GroundingSummary
 }
 
 export type LoadState = 'loading' | 'ready' | 'error'
@@ -326,6 +336,9 @@ interface ChatState {
    */
   scopes: Record<string, ScopeSource[]>
   setScope: (key: string, scope: ScopeSource[]) => void
+  /** 默认问数模式：快速直查（fast）或深度分析（deep） */
+  depth: ChatDepth
+  setDepth: (depth: ChatDepth) => void
 
   turnsOf: (conversationId: string | null) => ChatTurn[]
   /** force：已经取回来过也再取一次（重连后、点重试时） */
@@ -334,7 +347,7 @@ interface ChatState {
    * 发出去了返回 true。会话还在加载或加载失败、或者正忙时不发。
    * scope 不给就用这个会话眼下的范围
    */
-  ask: (conversationId: string, question: string, opts?: { scope?: ScopeSource[] }) => boolean
+  ask: (conversationId: string, question: string, opts?: { scope?: ScopeSource[]; depth?: ChatDepth }) => boolean
   /** 只停这个会话自己正在跑的那一轮（服务端那一轮连同它的运行一起停） */
   stop: (conversationId: string) => void
   /** 审批完成后重新接上运行的实时流 */
@@ -349,11 +362,12 @@ interface ChatState {
    * 用户主动重试这一轮：上一次由服务端折叠留档，新的一次接在同一轮里。
    * maxSteps：把图里 agent 的步数上限调到这个值，原图重跑（「放宽步数重跑」）；
    * rerun：原图原样重跑（取消了、中断了的那种，不需要改）；
-   * scope：换一个数据源范围重来（限定的库不在了），不给就沿用这一轮的
+   * scope：换一个数据源范围重来（限定的库不在了），不给就沿用这一轮的；
+   * depth：切换快速直查与深度分析重跑
    */
   retryTurn: (
     conversationId: string, turnId: string,
-    opts?: { maxSteps?: number; rerun?: boolean; scope?: ScopeSource[] },
+    opts?: { maxSteps?: number; rerun?: boolean; escalate?: boolean; scope?: ScopeSource[]; depth?: ChatDepth },
   ) => void
   /** 向后端核对一轮历史：真实状态、完整答案、档位；服务端还在跑的接着播。只做一次 */
   hydrate: (conversationId: string, turnId: string) => Promise<void>
@@ -383,6 +397,7 @@ const PHASE_TEXT: Record<Phase, string> = {
 
 /** 复核那一步的进度 */
 const REVIEWING = '正在核对结果…'
+const GROUNDING_TEXT = '正在匹配指标、业务实体与数据目录…'
 
 const EMPTY: ChatTurn[] = []
 
@@ -687,6 +702,7 @@ function rejectedOf(r: TurnMeta['rejected']): Rejected | null {
 /** 服务端还在跑的这一轮，它在哪一步 → 这一页的相位和进度 */
 function livePhase(job: ChatTurnJob): { phase: Phase; status: string } {
   if (job.stage === 'waiting') return { phase: 'waiting', status: PHASE_TEXT.waiting }
+  if (job.stage === 'ground') return { phase: 'planning', status: GROUNDING_TEXT }
   if (job.stage === 'run') return { phase: 'running', status: PHASE_TEXT.running }
   if (job.stage === 'review') return { phase: 'running', status: REVIEWING }
   return { phase: 'planning', status: PHASE_TEXT.planning }
@@ -777,6 +793,8 @@ function restoreTurn(t: ConversationTurn): ChatTurn {
     asked: meta?.asked && answer ? answer : undefined,
     usage: meta?.usage,
     job: t.job ?? null,
+    depth: meta?.depth,
+    grounding: meta?.grounding,
   }
 }
 
@@ -849,8 +867,10 @@ export const useChat = create<ChatState>((set, get) => ({
   loadState: {},
   loadError: {},
   scopes: {},
+  depth: 'fast',
 
   setScope: (key, scope) => set((s) => ({ scopes: { ...s.scopes, [key]: scope } })),
+  setDepth: (depth) => set({ depth }),
 
   turnsOf: (conversationId) =>
     (conversationId && get().byConversation[conversationId]) || EMPTY,
@@ -929,16 +949,19 @@ export const useChat = create<ChatState>((set, get) => ({
 
     const id = newId()
     const scope = opts?.scope ?? get().scopes[conversationId] ?? []
+    const depth = opts?.depth ?? get().depth
     set((s) => ({
       byConversation: {
         ...s.byConversation,
         [conversationId]: [
           ...(s.byConversation[conversationId] ?? []),
           {
-            id, serverId: null, question, phase: 'planning', status: PHASE_TEXT.planning,
+            id, serverId: null, question, phase: 'planning',
+            status: depth === 'fast' ? GROUNDING_TEXT : PHASE_TEXT.planning,
             thinking: '', ops: [], events: [], graph: null, explanation: '',
             run: null, output: null, error: '', startedAt: Date.now(),
             lastSeq: 0, cancel: null, attempt: 0, scope: scope.length ? scope : undefined,
+            depth,
           },
         ],
       },
@@ -947,7 +970,7 @@ export const useChat = create<ChatState>((set, get) => ({
     }))
     useConversations.getState().touch(conversationId, question)
     void launchTurn(flowOf(conversationId, id), {
-      conversation_id: conversationId, question,
+      conversation_id: conversationId, question, depth,
       ...(scope.length ? { datasource_ids: scope.map((d) => d.id) } : {}),
     })
     return true
@@ -1010,19 +1033,30 @@ export const useChat = create<ChatState>((set, get) => ({
     if (!turn || isBusy(turns) || inTrash(conversationId)) return
     turn.cancel?.()
     const flow = flowOf(conversationId, turnId)
-    const base = turn.graph && (turn.graph.nodes?.length ?? 0) > 0
-    const mode = base && opts?.maxSteps ? 'max_steps' as const : base && opts?.rerun ? 'rerun' as const : 'retry' as const
+    const base = !opts?.depth && turn.graph && (turn.graph.nodes?.length ?? 0) > 0
+    const mode = opts?.escalate ? 'escalate' as const
+      : base && opts?.maxSteps ? 'max_steps' as const
+      : base && opts?.rerun ? 'rerun' as const : 'retry' as const
     const scope = opts?.scope ?? turn.scope
+    const nextDepth = opts?.depth ?? turn.depth
+    const switchText = opts?.depth === 'deep'
+      ? '正在切换为深度分析并生成工作流…'
+      : opts?.depth === 'fast'
+        ? '正在切换为快速直查…'
+        : retryStatus(mode, opts?.maxSteps)
     // 先把相位摆出来；上一次怎么归档、这一次从哪开始，等服务端的 turn.attempt 来了照它重置
     flow.patch(() => ({
-      phase: mode === 'retry' ? 'planning' : 'running', status: retryStatus(mode, opts?.maxSteps),
+      phase: mode === 'retry' || mode === 'escalate' ? 'planning' : 'running', status: switchText,
       failure: null, error: '', pendingRun: false, hydrated: 'done', endedAt: undefined, cancel: null,
       startedAt: Date.now(), writing: null, scope: scope?.length ? scope : undefined,
+      ...(nextDepth ? { depth: nextDepth } : {}),
+      ...(opts?.depth ? { grounding: undefined } : {}),
     }))
     if (!turn.serverId) {
       // 发起那一下就没到服务端（这一轮在库里不存在）：原样再问一次
       void launchTurn(flow, {
         conversation_id: conversationId, question: turn.question,
+        ...(nextDepth ? { depth: nextDepth } : {}),
         ...(scope?.length ? { datasource_ids: scope.map((d) => d.id) } : {}),
       })
       return
@@ -1031,6 +1065,7 @@ export const useChat = create<ChatState>((set, get) => ({
       conversation_id: conversationId, retry_of: turn.serverId, mode,
       ...(mode === 'max_steps' ? { max_steps: opts!.maxSteps } : {}),
       ...(opts?.scope ? { datasource_ids: opts.scope.map((d) => d.id) } : {}),
+      ...(opts?.depth ? { depth: opts.depth } : turn.depth && mode === 'retry' ? { depth: turn.depth } : {}),
     })
   },
 
@@ -1152,8 +1187,9 @@ if (import.meta.env.DEV) {
 }
 
 /** 用户点重试时先摆出来的那一句（服务端的 turn.attempt 来了照它再说一遍） */
-function retryStatus(mode: 'retry' | 'rerun' | 'max_steps' | string, maxSteps?: number): string {
+function retryStatus(mode: 'retry' | 'rerun' | 'max_steps' | 'escalate' | string, maxSteps?: number): string {
   return mode === 'max_steps' ? `正在将步数上限放宽到 ${maxSteps} 并重新运行…`
+    : mode === 'escalate' ? '正在沿本体排查关联数据源…'
     : mode === 'rerun' ? '正在重新运行本轮…'
     : mode === 'retry' ? '正在按原问题重新生成…'
     : mode === 'run' || mode === 'continue' || mode === 'resume' ? PHASE_TEXT.running
@@ -1311,10 +1347,13 @@ function attemptReset(t: ChatTurn, d: Record<string, any>, ts: number): Partial<
       startedAt, endedAt: undefined, writing: null, noQuery: false, restored: false, steps: undefined,
     }
   }
+  const nextDepth: ChatDepth | undefined = d.depth === 'fast' || d.depth === 'deep' ? d.depth : t.depth
   return {
-    phase: mode === 'ask' || mode === 'retry' ? 'planning' : 'running',
-    status: mode === 'ask' ? PHASE_TEXT.planning : retryStatus(mode, Number(d.max_steps) || undefined),
+    phase: mode === 'ask' || mode === 'retry' || mode === 'escalate' ? 'planning' : 'running',
+    status: mode === 'ask' ? (nextDepth === 'fast' ? GROUNDING_TEXT : PHASE_TEXT.planning) : retryStatus(mode, Number(d.max_steps) || undefined),
     attempts, scope, usage,
+    ...(nextDepth ? { depth: nextDepth } : {}),
+    grounding: undefined,
     ops: [], events: [], run: null, output: null, review: null, reviewRaw: null,
     rawOutput: null, failure: null, error: '', lastSeq: 0, final: undefined, rejected: null,
     runStatus: undefined, clipped: undefined, pendingRun: false, steps: undefined,
@@ -1340,6 +1379,12 @@ function opPatch(t: ChatTurn, op: CopilotOp): Partial<ChatTurn> {
       // 查看进行中（looking）不是这一页的阶段：浮条直说「正在查看表结构…」
       return { ops, status: op.phase === 'looking' ? LOOK_TEXT.running
         : PHASE_TEXT[(op.phase as Phase) ?? 'planning'] ?? '正在处理…' }
+    case 'grounding':
+      return {
+        ops,
+        grounding: op.grounding && typeof op.grounding === 'object' ? (op.grounding as GroundingSummary) : t.grounding,
+        status: '已完成语义预命中，正在查询…',
+      }
     case 'look':
     case 'context': {
       // 查看结束：浮条换成查看了什么
@@ -1408,6 +1453,8 @@ function endPatch(t: ChatTurn, d: Record<string, any>): Partial<ChatTurn> {
     // 计时停在服务端记的那一刻（补交付的停在运行结束时）
     clipped: undefined, writing: null, endedAt: r.meta?.ms != null ? t.startedAt + r.meta.ms : Date.now(),
     job: row.job ?? null,
+    depth: r.depth ?? t.depth,
+    grounding: r.grounding ?? t.grounding,
   }
 }
 
@@ -1458,6 +1505,8 @@ function play(flow: Flow, serverId: string, after: number) {
           // 补交付（运行早就跑完了）停在「正在核对」，不按实时运行画
           if (t.phase === 'checking' && t.endedAt) return { turnSeq: e.seq, ...(stage === 'review' ? { runStatus: 'succeeded' } : {}) }
           switch (stage) {
+            case 'ground':
+              return { turnSeq: e.seq, phase: 'planning' as Phase, status: GROUNDING_TEXT }
             case 'build':
               return { turnSeq: e.seq, ...(t.phase === 'planning' || t.phase === 'building' ? {} : { phase: 'planning' as Phase }) }
             case 'run':
@@ -1654,7 +1703,10 @@ function watch(flow: Flow, runId: string, after = 0): () => void {
         const op = analysisToolOp(tool)
         patch((t) => (t.phase !== 'running' ? {} : {
           status: tool.startsWith('db_query') ? '正在查询数据…'
+            : tool === 'metric_query' ? '正在按指标口径查询…'
             : tool.startsWith('db_schema') ? '正在读取数据结构…'
+            : tool === 'ontology_neighbors' ? '正在查询指标本体邻域…'
+            : tool === 'source_health' ? '正在核查数据源健康…'
             : op ? ANALYSIS_TEXT.step.running(analysisMethodLabel(op, d.args?.mode))
             : tool ? `正在调用 ${tool}…` : '正在运行…',
         }))

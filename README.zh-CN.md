@@ -72,7 +72,7 @@ conda env create -f environment.yml   # 首次：创建 agentlab 环境并安装
 ./scripts/dev.sh                      # 之后：一条命令启动前后端
 ```
 
-打开 http://localhost:5273 。不配 API Key 也能完整体验：内置的 Mock 会把编排链路完整走一遍；接入真实模型见[模型接入](docs/zh-CN/configuration.md#模型接入)。内置 11 个模板可以直接运行。
+打开 http://localhost:5273 。不配 API Key 也能完整体验：内置的 Mock 会把编排链路完整走一遍；接入真实模型见[模型接入](docs/zh-CN/configuration.md#模型接入)。内置 12 个模板可以直接运行。
 
 **默认不开登录**：同一网络里打得开页面的人都能用全部功能。多人使用前先开登录，见[登录方式](docs/zh-CN/identity-and-security.md#登录方式)。更多启动选项见[开发](docs/zh-CN/development.md#启动)。
 
@@ -88,15 +88,15 @@ conda env create -f environment.yml   # 首次：创建 agentlab 环境并安装
 | 文档 | 讲什么 |
 |---|---|
 | **使用与搭建** | |
-| [问数据与助手](docs/zh-CN/ask-data.md) | 提问之后发生什么、产出复核、记录保留，助手怎么生成图、怎么按需查看 |
+| [问数据与助手](docs/zh-CN/ask-data.md) | 提问之后发生什么、跨源本体穿透与异常升级、产出复核、记录保留，助手怎么生成图、怎么按需查看 |
 | [工作流](docs/zh-CN/workflows.md) | 画布、节点类型、传数据、人工节点与驳回、agent 护栏、子工作流、发布与门禁、运行与断点续跑 |
 | [证据与出具](docs/zh-CN/evidence.md) | 口径卡、出具契约与三档、引用标记、结论句、查询区间里没有数据、封存与核对、报告导出与可验证报告、复核套件 |
-| [分析能力](docs/zh-CN/analysis.md) | 五种分析与判定标准、算不了的时候、Agent 的分析工具与分析卡、引用写法、分析说法核对、分析范围、设置与限制 |
+| [分析能力](docs/zh-CN/analysis.md) | 单源分析与跨源对账/伴随异动、数据源健康探针、Agent 分析工具与分析卡、引用写法、分析说法核对、分析范围、设置与限制 |
 | [数据源与表格导入](docs/zh-CN/data-sources.md) | 接入数据库、只读保证、上传表格与取数配方、按期累积、跨库合并、遮罩列 |
-| [数据目录](docs/zh-CN/data-catalog.md) | 目录记什么、起草与审阅、导出导入、数据剖析、SQL 检查、大库探查范围、结构与取值变化 |
+| [数据目录](docs/zh-CN/data-catalog.md) | 目录记什么、起草与审阅、导出导入、数据剖析、SQL 检查、大库探查范围、结构与取值变化、标准业务实体桥 |
 | [工具、MCP 与能力登记](docs/zh-CN/tools.md) | 工具种类、审批档位、能力治理、写入能力的限制、登记端点、网络规则 |
 | [应用](docs/zh-CN/apps.md) | 生成应用、视图与印章、流程与待办、写外部系统、填报登记、个人应用、对外集成 |
-| [回归评测与口径账本](docs/zh-CN/evaluation-and-ledger.md) | 题集与评测结果、逐个数标口径、按口径出具、对账、沉淀、召回 |
+| [回归评测与口径账本](docs/zh-CN/evaluation-and-ledger.md) | 题集与本体穿透对照、评测结果、逐个数标口径、按口径出具、对账、沉淀、召回、指标本体拓扑 |
 | [定时任务、事件触发与通知](docs/zh-CN/schedules.md) | 定时任务、事件触发、通知渠道与邮件、可订阅的事件 |
 | **部署运维** | |
 | [部署](docs/zh-CN/deployment.md) | `prod.sh`、Docker 离线包、数据目录、备份、升级 |
@@ -120,7 +120,7 @@ cd frontend && npx tsc -b
 node scripts/check-all.mjs   # 前端检查，先起 ./scripts/dev.sh
 ```
 
-PostgreSQL 上的测试、43 项前端检查和文档检查见[开发](docs/zh-CN/development.md)。
+PostgreSQL 上的测试、45 项前端检查和文档检查见[开发](docs/zh-CN/development.md)。
 
 ## License
 

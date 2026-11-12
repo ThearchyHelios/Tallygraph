@@ -110,7 +110,8 @@ SYSTEM_LOOK_UPGRADE_NEED = "要升级的工作流里，查库节点的 SQL 用�
 async def look_service(sources: list[Any], *, spec: ModelSpec | None, graph: Mapping[str, Any] | None = None,
                        kinds: tuple[str, ...] = ("table", "capability"), answer: bool = False,
                        catalog_view: Any = None, trail: Mapping[str, Any] | None = None,
-                       session: Any = None, actor: Any = None, caliber: str = CALIBER_LOOK) -> LookService:
+                       session: Any = None, actor: Any = None, caliber: str = CALIBER_LOOK,
+                       ontology: bool = True) -> LookService:
     """按入口组装这一轮的查看服务。读目录、读能力登记都用各自的短会话，开流前后都能调。
 
     spec 是助手的模型规格：挑选模型第一次要用时才按它拿（关思考、额度按 look/pick.PICK_MAX_TOKENS）。graph 是现有工作流，概览里列出它查过的表。
@@ -125,12 +126,13 @@ async def look_service(sources: list[Any], *, spec: ModelSpec | None, graph: Map
     picker = Picker(spec)
     made: list[Any] = []
     if "table" in kinds:
-        made.append(await TableKind.load(sources, graph=graph, picker=picker, catalog_view=catalog_view, trail=trail))
+        made.append(await TableKind.load(sources, graph=graph, picker=picker, catalog_view=catalog_view, trail=trail,
+                                         ontology=ontology))
     if "capability" in kinds:
         made.append(await CapabilityKind.load(picker=picker, read_only=answer))
     if "caliber" in kinds and session is not None:
         made.append(await CaliberKind.load(session, picker=picker, compose=caliber == CALIBER_COMPOSE, actor=actor,
-                                           query=caliber == CALIBER_QUERY))
+                                           query=caliber == CALIBER_QUERY, ontology=ontology))
     return LookService(made)
 
 

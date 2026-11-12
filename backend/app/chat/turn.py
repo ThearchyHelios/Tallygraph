@@ -63,6 +63,23 @@ EMPTY_FALLBACK = "这次请直接按输出格式给出操作（每行一个 JSON
 RETRY_USER_WITH_BASE = ("这个工作流上一次没有给出可用的结果：{reason}。\n\n"
                         "请针对这个原因改它（比如调大最大步数、改正工具参数、换个查询方式），"
                         "改完继续回答原来的问题：{question}")
+#: 简单查数命中硬异常信号时，界面提供的一键本体排查提示按钮文案与升级重跑指令（P1）
+ESCALATION_BUTTON_LABEL = "指标触发异常，沿本体排查关联数据源"
+ESCALATION_WITH_BASE = (
+    "上一次回答「{question}」时触发了指标或数据异常：{reason}。\n\n"
+    "请升级为跨源本体穿透排查工作流（input → agent → report → output）："
+    "给 agent 绑定 ontology_neighbors、source_health、caliber_query 及分析工具（analysis_comparable、"
+    "analysis_baseline、analysis_trend、analysis_decompose、analysis_differ、analysis_reconcile、analysis_cochange），"
+    "按「先调 ontology_neighbors 找已确认关联口径并调 source_health / analysis_reconcile 验数据源健康（发现断更、缺口、"
+    "量级断崖或单位错位即早停归因数据故障并引用 [[h:H1]] / [[a:A1]]）→ 若触发数值契约越界则核查 factor 构成因子与跨库主数据 → "
+    "若源健康通过则同源 decompose 锁定异常实体切片后沿标准实体桥调 caliber_query + analysis_cochange 检验上游驱动同步异动"
+    "（严禁把统计共变写成确定因果）」排查异常并给出可核验报告。"
+)
+ESCALATION_FROM_SCRATCH = (
+    "{question}\n\n（指标结果触发异常：{reason}。请沿业务本体排查关联口径与关联数据源健康：搭 input → agent → report → output，"
+    "绑定 ontology_neighbors、source_health、caliber_query 与分析工具，先验源健康与跨源对账，再查构成因子与跨源驱动，"
+    "报告引用 [[h:]] / [[a:]] 证据。）"
+)
 
 
 def _blockers(final: Mapping[str, Any]) -> list[str]:
@@ -187,13 +204,29 @@ def user_retry_instruction(question: str, reason: str, has_base: bool) -> str:
     return template.format(question=question, reason=reason)
 
 
+def escalation_instruction(question: str, reason: str, has_base: bool) -> str:
+    """指标触发硬异常信号后，沿业务本体排查关联数据源的诊断升级指令（P1）。"""
+    template = ESCALATION_WITH_BASE if has_base else ESCALATION_FROM_SCRATCH
+    return template.format(question=question, reason=reason)
+
+
+def escalate_after_review(review: Mapping[str, Any] | None, attempt: int) -> bool:
+    """异常自动升级模式（anomaly_escalation_mode == 'auto'）下最多自动升级 1 轮（attempt == 0）。"""
+    if not review or attempt != 0:
+        return False
+    esc = review.get("anomaly_escalation")
+    return isinstance(esc, Mapping) and bool(esc.get("available")) and bool(esc.get("auto_escalate"))
+
+
 def has_nodes(graph: Any) -> bool:
     """一张图有没有节点（有才交回去改）。"""
     return isinstance(graph, Mapping) and bool(graph.get("nodes"))
 
 
-__all__ = ["EMPTY_FALLBACK", "EMPTY_GENERATION", "MAX_ATTEMPTS", "NEXT_ASKED", "NEXT_DONE", "NEXT_FAIL", "NEXT_READY",
+__all__ = ["EMPTY_FALLBACK", "EMPTY_GENERATION", "ESCALATION_BUTTON_LABEL", "ESCALATION_FROM_SCRATCH",
+           "ESCALATION_WITH_BASE", "MAX_ATTEMPTS", "NEXT_ASKED", "NEXT_DONE", "NEXT_FAIL", "NEXT_READY",
            "NEXT_REPLY", "NEXT_RETRY", "NEXT_RUN", "NEXT_STEPS", "QUESTION_FIELD", "RETRY_EMPTY", "RETRY_ERRORS",
            "RETRY_FROM_SCRATCH", "RETRY_USER_WITH_BASE", "RETRY_WITH_BASE", "blocked_reason",
-           "empty_retry_instruction", "error_reason", "fill_input", "has_nodes", "next_step", "retry_after_review",
+           "empty_retry_instruction", "error_reason", "escalate_after_review", "escalation_instruction",
+           "fill_input", "has_nodes", "next_step", "retry_after_review",
            "retry_instruction", "review_reason", "user_retry_instruction"]

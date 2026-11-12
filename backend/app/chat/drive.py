@@ -126,7 +126,8 @@ class TurnDriver:
 
     def __init__(self, question: str, *, datasource_ids: list[str],
                  on_phase: Callable[[str], Awaitable[None]] | None = None,
-                 provider: str | None = None, model: str | None = None, analysis_tools: bool = True) -> None:
+                 provider: str | None = None, model: str | None = None,
+                 analysis_tools: bool = True, ontology_tools: bool = True) -> None:
         self.question = question
         self.datasource_ids = list(datasource_ids)
         self.on_phase = on_phase
@@ -136,6 +137,8 @@ class TurnDriver:
         #: 这一轮给不给助手分析工具：透传给 api/copilot.answer_ops 的 analysis_tools。只给评测的「分析工具开、关」对照用
         #: （eval/answer.Driver 按变体设），问数据页不暴露这个开关，一直是真
         self.analysis_tools = analysis_tools
+        #: 这一轮给不给助手本体穿透工具与邻居提示（评测「本体穿透开、关」对照用，问数据页一直是真）
+        self.ontology_tools = ontology_tools
         self.turn = Turn()
         self.terminal: dict[str, Any] | None = None
         self.refusal: Exception | None = None
@@ -210,7 +213,8 @@ class TurnDriver:
         payload = self.generate_in(instruction, base_graph)
         ops: list[dict[str, Any]] = []
         try:
-            async for op in answer_ops(payload, catalog_view=self.catalog_view(), analysis_tools=self.analysis_tools):
+            async for op in answer_ops(payload, catalog_view=self.catalog_view(),
+                                       analysis_tools=self.analysis_tools, ontology_tools=self.ontology_tools):
                 await self.on_op(op)
                 if op.get("op") in ("thinking", "heartbeat"):
                     continue
@@ -435,10 +439,18 @@ class TurnDriver:
                     t.usage["review"] = add_usage(t.usage.get("review"), review.get("usage"))
                     if retry and review.get("retry_instruction"):
                         t.attempts += 1
-                        t.retries.append(policy.review_reason(review) or "复核判答案不可用")
+                        is_escalation = bool(review.get("escalation"))
+                        t.retries.append(
+                            policy.review_reason(review)
+                            or ("指标触发异常，自动沿本体排查关联数据源" if is_escalation else "复核判答案不可用")
+                        )
                         instruction = str(review["retry_instruction"])
                         base_graph = row.graph if policy.has_nodes(row.graph) else None
-                        await self.on_retry(t.retries[-1], kind="review", base_graph=base_graph)
+                        await self.on_retry(
+                            t.retries[-1],
+                            kind="escalation" if is_escalation else "review",
+                            base_graph=base_graph,
+                        )
                         continue
                 t.path = "ran"
                 return t
