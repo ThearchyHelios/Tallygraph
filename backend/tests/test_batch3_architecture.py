@@ -9,7 +9,10 @@
 from __future__ import annotations
 
 import ast
+import os
+import re
 import sqlite3
+import subprocess
 import uuid
 from decimal import Decimal
 from pathlib import Path
@@ -386,3 +389,58 @@ def test_caliber_drafts_page_is_modularized():
     }
     actual_modules = {p.name for p in drafts_dir.glob("*.ts*")}
     assert expected_modules.issubset(actual_modules)
+
+
+def test_shell_scripts_brace_variables_before_utf8_and_retention_cleanup(tmp_path):
+    """macOS 自带 Bash 3.2 在 UTF-8 全角标点（如 0xEF 开头的「（」「，」「：」）紧跟未加花括号的 $VAR 时，
+    会把首字节 0xEF（Latin-1 字母 ï）吞入变量名，在 set -u 下触发 `VAR\\xef: unbound variable`。"""
+    repo_root = Path(__file__).resolve().parents[2]
+    unbraced_utf8_var = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)([^\x00-\x7f])")
+
+    offenders: list[str] = []
+    for sh_file in sorted(repo_root.rglob("*.sh")):
+        if ".git" in sh_file.parts or "node_modules" in sh_file.parts:
+            continue
+        for lineno, line in enumerate(sh_file.read_text(encoding="utf-8").splitlines(), 1):
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            for m in unbraced_utf8_var.finditer(line):
+                offenders.append(f"{sh_file.relative_to(repo_root)}:{lineno} ${m.group(1)}{m.group(2)}")
+    assert offenders == [], f"Shell 脚本存在未加花括号且紧邻非 ASCII 字符的变量展开：{offenders}"
+
+    # 提取 package-docker.sh 第 4 节清理逻辑，在真实 bash -euo pipefail 下验证含空格路径与保留份数
+    pkg_text = (repo_root / "scripts" / "package-docker.sh").read_text(encoding="utf-8")
+    start = pkg_text.index("# ---- 4. 清理旧离线包 ----")
+    end = pkg_text.index("size() {", start)
+    cleanup_snippet = pkg_text[start:end]
+
+    out_dir = tmp_path / "release with space"
+    out_dir.mkdir()
+    stems = [f"agentlab-v{i}-linux-arm64" for i in range(1, 6)]
+    for idx, stem in enumerate(stems, 1):
+        tar_file = out_dir / f"{stem}.tar"
+        tar_file.write_bytes(b"x")
+        ts = 1_700_000_000 + idx * 60
+        os.utime(tar_file, (ts, ts))
+
+    proc = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail", "-c", cleanup_snippet],
+        env={
+            **os.environ,
+            "KEEP_RELEASES": "3",
+            "NAME": stems[-1],
+            "OUT": str(out_dir),
+            "ARCH": "arm64",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    remaining = sorted(p.name for p in out_dir.glob("*.tar"))
+    assert remaining == [
+        "agentlab-v3-linux-arm64.tar",
+        "agentlab-v4-linux-arm64.tar",
+        "agentlab-v5-linux-arm64.tar",
+    ]

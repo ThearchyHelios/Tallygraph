@@ -27,7 +27,8 @@ CODE_SPAN = re.compile(r"(`+)(.+?)\1")
 def md_files():
     out = [os.path.join(ROOT, "README.md"), os.path.join(ROOT, "README.zh-CN.md"),
            os.path.join(ROOT, "deploy", "README.md")]
-    for base, _dirs, files in os.walk(os.path.join(ROOT, "docs")):
+    for base, dirs, files in os.walk(os.path.join(ROOT, "docs")):
+        dirs[:] = [d for d in dirs if d != "design"]
         out += [os.path.join(base, f) for f in sorted(files) if f.endswith(".md")]
     return [p for p in out if os.path.exists(p)]
 

@@ -192,25 +192,25 @@ fi
 
 # ---- 4. 清理旧离线包 ----
 if [ "$KEEP_RELEASES" -gt 0 ]; then
-  SEEN_STEMS=" $NAME "
+  SEEN_STEMS=" ${NAME} "
   KEPT_COUNT=1
-  for OLD_FILE in $(ls -1t "$OUT"/agentlab-*-linux-"$ARCH".tar "$OUT"/agentlab-*-linux-"$ARCH".tar.gz 2>/dev/null || true); do
-    [ -f "$OLD_FILE" ] || continue
-    BASE_NAME="$(basename "$OLD_FILE")"
+  while IFS= read -r OLD_FILE; do
+    [ -n "${OLD_FILE}" ] && [ -f "${OLD_FILE}" ] || continue
+    BASE_NAME="$(basename "${OLD_FILE}")"
     STEM="${BASE_NAME%.gz}"
     STEM="${STEM%.tar}"
-    case "$SEEN_STEMS" in
-      *" $STEM "*) ;;
+    case "${SEEN_STEMS}" in
+      *" ${STEM} "*) ;;
       *)
-        SEEN_STEMS="$SEEN_STEMS$STEM "
+        SEEN_STEMS="${SEEN_STEMS}${STEM} "
         KEPT_COUNT=$((KEPT_COUNT + 1))
         ;;
     esac
-    if [ "$KEPT_COUNT" -gt "$KEEP_RELEASES" ] && [ "$STEM" != "$NAME" ]; then
-      echo "==> 清理旧离线包 $OLD_FILE（保留最近 $KEEP_RELEASES 份）"
-      rm -f "$OLD_FILE"
+    if [ "${KEPT_COUNT}" -gt "${KEEP_RELEASES}" ] && [ "${STEM}" != "${NAME}" ]; then
+      echo "==> 清理旧离线包 ${OLD_FILE}（保留最近 ${KEEP_RELEASES} 份）"
+      rm -f "${OLD_FILE}"
     fi
-  done
+  done < <(ls -1t "${OUT}"/agentlab-*-linux-"${ARCH}".tar "${OUT}"/agentlab-*-linux-"${ARCH}".tar.gz 2>/dev/null || true)
 fi
 
 size() { du -h "$1" | awk '{print $1}'; }
