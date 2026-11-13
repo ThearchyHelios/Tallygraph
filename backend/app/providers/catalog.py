@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # --------------------------------------------------------------------------
@@ -187,18 +188,62 @@ def needs_interleaved_beta(model: str) -> bool:
     return name.startswith(_INTERLEAVED_BETA_PREFIXES)
 
 
+_OPENAI_REASONING_RE = re.compile(r"^o[134](?:$|[-_])")
+#: 用户在「设置 → 模型接入」里填了自定义价格或上下文窗口的模型（由 list_providers 同步）
+_CUSTOM_MODELS: dict[str, dict[str, Any]] = {}
+
+
+def sync_provider_models(providers: list[Any]) -> None:
+    """把当前启用的模型接入里带了自定义 pricing / context 的模型同步进内存表。"""
+    custom: dict[str, dict[str, Any]] = {}
+    for p in providers or ():
+        if not getattr(p, "enabled", True):
+            continue
+        for entry in getattr(p, "models", None) or ():
+            if not isinstance(entry, dict) or not entry.get("id"):
+                continue
+            key = _norm(str(entry["id"]))
+            if not key:
+                continue
+            info: dict[str, Any] = {}
+            pricing = entry.get("pricing")
+            if isinstance(pricing, dict) and ("input" in pricing or "output" in pricing):
+                info["pricing"] = {
+                    "input": float(pricing.get("input") or 0.0),
+                    "output": float(pricing.get("output") or 0.0),
+                    **({"cache_read": float(pricing["cache_read"])} if "cache_read" in pricing and pricing["cache_read"] is not None else {}),
+                    **({"cache_creation": float(pricing["cache_creation"])} if "cache_creation" in pricing and pricing["cache_creation"] is not None else {}),
+                }
+            ctx_val = entry.get("context")
+            if isinstance(ctx_val, (int, float)) and not isinstance(ctx_val, bool) and ctx_val > 0:
+                info["context"] = int(ctx_val)
+            if info:
+                custom[key] = info
+    _CUSTOM_MODELS.clear()
+    _CUSTOM_MODELS.update(custom)
+
+
 def _norm(model: str) -> str:
-    """去掉 openrouter 之类的前缀，只看模型名本身。"""
-    return (model or "").split("/")[-1].strip()
+    """去掉 openrouter 之类的前缀并统一小写，只看模型名本身。"""
+    return (model or "").split("/")[-1].strip().lower()
 
 
 def supports_sampling(model: str) -> bool:
     """这个模型还能不能传 temperature / top_p。"""
-    return not _norm(model).startswith(_NO_SAMPLING_PREFIXES)
+    name = _norm(model)
+    if name.startswith(_NO_SAMPLING_PREFIXES) or _OPENAI_REASONING_RE.match(name):
+        return False
+    return True
 
 
 def supports_adaptive_thinking(model: str) -> bool:
     return _norm(model).startswith(_ADAPTIVE_THINKING_PREFIXES)
+
+
+def requires_thinking(model: str) -> bool:
+    """该模型是否强制始终开启思考（如 catalog 中标注 thinking='always' 的模型，传 disabled 会被服务方拒绝）。"""
+    target = _norm(model)
+    return any(_norm(entry["id"]) == target and entry.get("thinking") == "always" for entry in ANTHROPIC_MODELS)
 
 
 def supports_effort(model: str) -> bool:
@@ -207,6 +252,8 @@ def supports_effort(model: str) -> bool:
 
 def find_pricing(model: str) -> dict[str, float] | None:
     target = _norm(model)
+    if target in _CUSTOM_MODELS and "pricing" in _CUSTOM_MODELS[target]:
+        return _CUSTOM_MODELS[target]["pricing"]
     pools = [ANTHROPIC_MODELS, OPENAI_MODELS, MOCK_MODELS]
     pools += [p["models"] for p in COMPATIBLE_PRESETS]
     for pool in pools:
@@ -219,6 +266,8 @@ def find_pricing(model: str) -> dict[str, float] | None:
 def find_context(model: str) -> int | None:
     """目录里登记的上下文窗口（token）。没登记的返回 None，由调用方取保守值。"""
     target = _norm(model)
+    if target in _CUSTOM_MODELS and "context" in _CUSTOM_MODELS[target]:
+        return _CUSTOM_MODELS[target]["context"]
     pools = [ANTHROPIC_MODELS, OPENAI_MODELS, MOCK_MODELS]
     pools += [p["models"] for p in COMPATIBLE_PRESETS]
     for pool in pools:
@@ -245,12 +294,30 @@ def unpriced_call(data: Any) -> bool:
         and find_pricing(model) is None
 
 
-def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """按目录价估算一次调用的花费（美元）。"""
+def estimate_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+) -> float:
+    """按目录价估算一次调用的花费（美元）。带缓存读写明细时按缓存单价折算（默认命中 0.1x、建缓存 1.25x）。"""
     pricing = find_pricing(model)
     if not pricing:
         return 0.0
+    inp_rate = pricing.get("input", 0.0)
+    out_rate = pricing.get("output", 0.0)
+    if cache_read_tokens <= 0 and cache_creation_tokens <= 0:
+        return input_tokens / 1_000_000 * inp_rate + output_tokens / 1_000_000 * out_rate
+    read_tokens = max(0, int(cache_read_tokens))
+    write_tokens = max(0, int(cache_creation_tokens))
+    uncached = max(0, int(input_tokens) - read_tokens - write_tokens)
+    read_rate = pricing.get("cache_read", inp_rate * 0.1)
+    write_rate = pricing.get("cache_creation", inp_rate * 1.25)
     return (
-        input_tokens / 1_000_000 * pricing.get("input", 0.0)
-        + output_tokens / 1_000_000 * pricing.get("output", 0.0)
-    )
+        uncached * inp_rate
+        + read_tokens * read_rate
+        + write_tokens * write_rate
+        + output_tokens * out_rate
+    ) / 1_000_000

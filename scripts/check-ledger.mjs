@@ -24,8 +24,8 @@
 import { readFileSync } from 'node:fs'
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
 import {
-  CELL_LABELS, CELL_WHOLE, ISSUE, QUEUE, RECONCILE, RECONCILE_VALUES, WHOLE, WHOLE_LABELS, copiedMetricDetail, ledgerOf,
-  metricDetail, reconciledOf,
+  CELL_LABELS, CELL_WHOLE, ISSUE, QUEUE, RECONCILE, RECONCILE_NO_ACCESS, RECONCILE_VALUES, WEEKLY, WHOLE, WHOLE_LABELS,
+  copiedMetricDetail, ledgerOf, metricDetail, noAccessReconcile, reconciledOf,
 } from './ledger-fixtures.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
@@ -178,6 +178,23 @@ await section('「口径」一步的三种情况：来自口径、相关口径�
   await openSeg(page, 's12')
   await page.locator('[data-evidence-panel] [data-ev-ledger="reasoning"]').waitFor({ timeout: 5000 })
   check('这次的推理：没有相关的已发布口径', (await panelPart(page).innerText()).includes('没有相关的已发布口径'))
+  check('没有运行时报错', errors.length === 0, errors.join(' | '))
+})
+
+// ---------------------------------------------------------------- 没权对账
+
+await section('没权对账：证据面板里只写说明，不摆「看差多少」按钮', async () => {
+  const { page, errors } = await open('/ui-harness.html?evidence=1', {
+    reply: evidenceReply(() => ledgerOf(RUN, { actions: [RECONCILE_NO_ACCESS] })) })
+  await page.waitForSelector('#evidence-wide [data-ev-caliber-of="s6"]', { timeout: 10000 })
+  await openSeg(page, 's8')
+  await page.locator('[data-evidence-panel] [data-ev-ledger="related"]').waitFor({ timeout: 5000 })
+  const related = await panelPart(page).innerText()
+  check('相关口径那一条照旧写清差在哪', related.includes('相关口径「订单口径」v1（已发布）')
+    && related.includes('口径只保留状态为已支付的行'), related)
+  check('没有授权：写清是哪份口径、当前身份发不了', related.includes('当前这个身份没有发起对账的授权'), related)
+  check('……不摆「看差多少」按钮', await page.locator('[data-evidence-panel] [data-ledger-reconcile-open]').count() === 0)
+  check('……也不出现 undefined 的身份', !related.includes('undefined') && !related.includes('vundefined'), related)
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
 })
 
@@ -460,10 +477,13 @@ await section('使用者看到的入口照服务端的动作：不能出具的�
   delete refused.auto_reason
   // 摘要只认四种标签（分析结论的数不和口径比对，服务端不给它们标签）：混进来认不出的种类，不计、不出 NaN
   const LED = ledgerOf(RUN_U, { labels: { ...WHOLE_LABELS, s40: { kind: 'analysis' }, s42: { reason: '没有种类' } },
-    whole: WHOLE, actions: [refused, RECONCILE],
+    whole: WHOLE, actions: [refused, RECONCILE,
+      // 没权对账的那一项：匿名（服务端抹掉身份），界面上只写说明——换一份口径，免得和上面那项撞在一起
+      noAccessReconcile(RECONCILE, { caliber: WEEKLY.caliber, query: 'q-gmv', workflow_name: '周报口径', level_text: '受管' })],
     // 出具过的是另一份口径（订单口径）：周报口径这一项还没出具过，照服务端的原因写为什么不能出具
     issued: [{ run_id: 'run-iss-u', status: 'succeeded', workflow_id: 'wf-orders', version: 1, tier: 'degraded', tier_text: '降档出具', auto: true }] })
-  const reply = (method, p) => {
+  const writes = []
+  const reply = (method, p, body) => {
     if (method === 'GET' && p === '/conversations') return { json: [conv] }
     if (method === 'GET' && p === `/conversations/${conv.id}`) return { json: { ...conv, turns: [turn] } }
     if (p.startsWith('/conversations')) return { json: {} }
@@ -473,6 +493,10 @@ await section('使用者看到的入口照服务端的动作：不能出具的�
     if (method === 'GET' && p === `/runs/${RUN_U}/evidence`) return { json: EV.graph }
     if (method === 'GET' && p.startsWith('/artifacts/')) return { json: { id: EV.doc_artifact, content: { ...EV.doc, run_id: RUN_U } } }
     if (method === 'GET' && p.startsWith('/approvals')) return { json: [] }
+    if (method === 'POST' && p === `/ledger/answers/${RUN_U}/reconcile`) {
+      writes.push({ key: `POST ${p}`, body })
+      return { status: 409, json: { detail: '检查脚本：不真的发起对账', code: 'ledger_reconcile_refused' } }
+    }
     return null
   }
   const { page, errors } = await open(`/chat/${conv.id}`, { me: USER, reply })
@@ -484,11 +508,27 @@ await section('使用者看到的入口照服务端的动作：不能出具的�
   check('不能出具：照服务端的原因写「请搭建者出具」，不摆出具按钮', text.includes('请搭建者出具')
     && await page.locator('[data-ledger-issue-button]').count() === 0, text)
   check('能对账：照样摆对账按钮', await page.locator('[data-ledger-turn-reconcile]').count() === 1)
+  // 服务端没给身份的那一项（这个身份没有使用授权）：只写说明，不摆按钮。身份被抹掉了，所以写法里也没有版本号
+  check('没权对账的那一项：只写是哪份口径、没有发起按钮',
+    await page.locator('[data-ledger-turn-reconcile]').count() === 1
+    && await page.locator('[data-ledger-turn-reconcile-refused]').count() === 1
+    && text.includes('对账：「周报口径」（受管）（当前这个身份没有发起对账的授权）'), text)
+  check('……没权的那一项不出现 undefined 的身份', !text.includes('undefined') && !text.includes('vundefined'), text)
+  check('……也没替它发过对账请求', writes.length === 0, JSON.stringify(writes))
   const issued = page.locator('[data-ledger-issued="run-iss-u"]')
   const issuedText = (await issued.innerText().catch(() => '')).replace(/\s+/g, ' ')
   check('自动出具过的正式运行：写「按口径自动出具」、哪份口径和档位', issuedText.includes('按口径自动出具')
     && issuedText.includes('「订单口径」v1（已发布）') && issuedText.includes('降档出具'), issuedText)
   check('……使用者不给打开运行的链接，写由搭建者查看', await issued.locator('a').count() === 0 && issuedText.includes('由搭建者在记录页查看'), issuedText)
+  LED.actions = [RECONCILE, { ...RECONCILE }, { ...RECONCILE, query: 'q-another' }]
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  const group = page.locator('[data-ledger-reconcile-group]')
+  await group.waitFor({ state: 'visible' })
+  check('同一口径归组显示，完全重复的入口去重', await group.count() === 1 && (await group.innerText()).includes('2 份取数'))
+  check('多份取数默认收起，不刷屏', !(await group.locator('[data-ledger-turn-reconcile]').first().isVisible()))
+  await group.locator('summary').click()
+  check('展开后仍可分别核对两份取数', await group.locator('[data-ledger-turn-reconcile]').count() === 2
+    && await group.locator('[data-ledger-turn-reconcile]').last().isVisible())
   check('没有运行时报错', errors.length === 0, errors.join(' | '))
 })
 

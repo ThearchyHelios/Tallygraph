@@ -23,7 +23,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from app.cluster import guard, identity, leader, reaper, requests, state, workers
+from app.cluster import guard, identity, leader, reaper, requests, slots, state, workers
 from app.cluster.signal import signals
 from app.core.config import settings
 
@@ -84,6 +84,7 @@ class _Service:
         await signals.start()
         signals.on("q", self._on_request)
         signals.on("gone", self._on_gone)
+        signals.on("slot", self._on_slot)
         if not self.single:
             await signals.ready(timeout=5.0)
         self.wake = asyncio.Event()
@@ -114,6 +115,9 @@ class _Service:
         self.reap_now = True
         if self.wake is not None:
             self.wake.set()
+
+    def _on_slot(self, _parts: list[str]) -> None:
+        slots.wake_local()
 
     # ---------------- 续租约：单独的任务、单独的连接 ----------------
 

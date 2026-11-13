@@ -724,11 +724,13 @@ def _half_ulp_ratio(raw: Any, value: Fraction) -> Fraction:
 def lmdi(base: Sequence[float], target: Sequence[float], m_base: float, m_target: float) -> list[float]:
     """LMDI-I：contrib_k = L(M', M) · ln(F_k' / F_k)，L(a, b) = (a − b) / (ln a − ln b)，L(a, a) = a。因子按书写精度取过整、
     乘积和乘积列差一点时，各因子按同一比例缩放到乘积恰好等于乘积列（每个因子的对数比各补上 (1/K)·差的对数），Σcontrib 在
-    浮点误差内等于 M' − M。"""
+    浮点误差内等于 M' − M。全程在对数域求和，避免多因子连乘 float64 上溢或下溢归零。"""
     k = len(base)
-    fix = (math.log(m_target / math.prod(target)) - math.log(m_base / math.prod(base))) / k
-    weight = m_base if m_base == m_target else (m_target - m_base) / (math.log(m_target) - math.log(m_base))
-    return [weight * (math.log(t / b) + fix) for b, t in zip(base, target)]
+    log_m_base = math.log(m_base)
+    log_m_target = math.log(m_target)
+    fix = ((log_m_target - sum(math.log(t) for t in target)) - (log_m_base - sum(math.log(b) for b in base))) / k
+    weight = m_base if m_base == m_target else (m_target - m_base) / (log_m_target - log_m_base)
+    return [weight * (math.log(t) - math.log(b) + fix) for b, t in zip(base, target)]
 
 
 def factor(raw: Mapping[str, Any], env: Env) -> Any:

@@ -5,7 +5,8 @@
   哈希，参数是绑定 + 缺省值，按 graph_hash 钉住；GET 账本的 actions 写能自动、issued 列出它；再点一次交回同一次；
 - 已发布级别、助手选用的、不是问数据的（画布试运行等）：不自动，只给一键（写明为什么），一键照常发起；设置关了自动出具
   也不自动；
-- 拒绝写明原因：整题不等价、点名别的口径、版本退役、图里有人工节点、缺入口字段、超过每日上限、使用者没有应用授权；
+- 拒绝写明原因：整题不等价、点名别的口径、版本退役、图里有人工节点、缺入口字段、绑定出来的参数这次没有值或缺声明、
+  取数模板认不出参数写在哪（参数完整性，ledger/params）、超过每日上限、使用者没有应用授权；
   使用者有授权（应用固定着这一版）就能出具，origin 记靠的是哪个应用；
 - 设置 ledger 一组：缺省值、写坏了拒收。
 数据是虚构店铺库。
@@ -21,7 +22,7 @@ from sqlalchemy import select
 
 from app.api.deps import Principal
 from app.db.base import SessionLocal
-from app.db.models import Run, Setting, WorkflowVersion
+from app.db.models import AuditEvent, Run, Setting, WorkflowVersion
 from app.engine.runner import run_manager
 from app.ledger import issue as ledger_issue
 from app.ledger import match as ledger_match
@@ -47,6 +48,22 @@ async def engine_up(tmp_path):
 async def client():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c
+
+
+@pytest.fixture
+def executed(monkeypatch) -> list[str]:
+    """这一次测试里真正发给数据库的语句（内联渲染之后的那一条），按先后：缺参数的那条路一条都不该有。"""
+    from app.tools import datasource
+
+    seen: list[str] = []
+    real = datasource.run_query
+
+    async def spy(source, sql, **kw):
+        seen.append(sql)
+        return await real(source, sql, **kw)
+
+    monkeypatch.setattr(datasource, "run_query", spy)
+    return seen
 
 
 async def reset_ledger(**values) -> None:
@@ -130,6 +147,13 @@ async def test_an_independent_equivalent_answer_to_a_governed_caliber_is_issued_
     origin = formal.origin
     assert origin["source_run"] == row.id and origin["caliber"] == f"{wf}@1" and origin["how"] == "independent"
     assert origin["auto"] is True and origin["binding_hash"] and origin["match"]
+    async with SessionLocal() as session:
+        rows = (await session.execute(select(AuditEvent).where(
+            AuditEvent.action == "caliber.use", AuditEvent.subject_id == f"{wf}@1"))).scalars().all()
+    [use] = [r for r in rows if r.data.get("run_id") == row.id]
+    assert use.data["how"] == "issued" and use.data["auto"] is True
+    assert use.data["param_fields"] == ["end", "start", "store"] and use.data["params_hash"]
+    assert "2026-09-01" not in str(use.data)
 
     body = (await client.get(f"/api/runs/{row.id}/ledger")).json()
     [action] = [a for a in body["actions"] if a["kind"] == "issue"]
@@ -379,9 +403,9 @@ async def test_auto_issue_goes_by_the_askers_permissions_when_login_is_on(monkey
     assert launched == formal.id and formal.started_by == f"erin_{row.id[:6]}" and formal.origin["auto"] is True
 
 
-async def test_binding_values_that_would_break_the_sql_are_not_filled_in(client, monkeypatch):
+async def test_binding_values_that_would_break_the_sql_are_not_filled_in(client, monkeypatch, executed):
     """绑定出来的值要渲染进口径的 SQL 模板：写在引号里的值带着引号（这次的 SQL 里写的是转义过的 ''，绑定照原样取出）就不代填
-    出具——和组合时校验助手给的参数是同一个判断，宁可少出具。"""
+    出具——和组合时校验助手给的参数是同一个判断，宁可少出具。没有发起的正式运行，也就没有多出来的查询。"""
     template = "SELECT SUM(amount) AS gmv FROM orders WHERE status = '{{ input.status }}'"
     graph = S.caliber_graph(template)
     graph["nodes"][0]["data"]["config"]["fields"] = [{"name": "status", "required": True}]
@@ -393,5 +417,109 @@ async def test_binding_values_that_would_break_the_sql_are_not_filled_in(client,
     await ledger_match.drain()
     whole = (await ledger_match.store.latest(row.id)).content["whole"]
     assert whole["equivalent"] is True and whole["binding"] == {"status": "pa''id"}
+    sent = len(executed)
     res = await client.post(f"/api/ledger/answers/{row.id}/issue", json={"workflow_id": wf, "version": 1})
     assert res.status_code == 409 and "不能有引号" in res.json()["detail"] and "不代填出具" in res.json()["detail"]
+    assert await issued(row.id) == [] and executed[sent:] == []
+
+
+async def test_entry_fields_this_binding_leaves_empty_are_not_filled_in(client, monkeypatch, executed):
+    """绑定出来的参数是空串（这次的 SQL 里写的就是 region = ''）、这一版的入口又没声明缺省值：空串不是值，是省略，按参数
+    完整性（ledger/params，trial、组合式问数、派生各入口同一套）不代填出具——以前只查承载方式那一层，这里会按空串渲染，
+    发起一次少了 region 这个条件的正式运行（缺参、未声明、零 SQL：一条都不发）。"""
+    template = ("SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' AND region = '{{ input.region }}' "
+                "AND paid_at >= '{{ input.start }}' AND paid_at < '{{ input.end }}'")
+    graph = S.caliber_graph(template)
+    graph["nodes"][0]["data"]["config"]["fields"] = [
+        {"name": "start", "required": True}, {"name": "end", "required": True}, {"name": "region"}]
+    wf = await S.publish(graph=graph, level="published")
+    two_writers(monkeypatch, "本周销售额 [[v:Q1.r0.销售额]]。")
+    run = await run_manager.start(graph=S.explore_graph(
+        "select sum(o.amount) as 销售额 from orders o where o.paid_at >= '2026-09-01' and o.status = 'paid' "
+        "and o.region = '' and o.paid_at < '2026-09-08'"), input_payload={}, origin_kind="canvas")
+    row = await S.wait(run.id)
+    await ledger_match.drain()
+    whole = (await ledger_match.store.latest(row.id)).content["whole"]
+    assert whole["equivalent"] is True and whole["binding"]["region"] == ""
+    sent = len(executed)
+    [action] = [a for a in (await client.get(f"/api/runs/{row.id}/ledger")).json()["actions"] if a["kind"] == "issue"]
+    assert action["available"] is False and "region" in action["reason"]
+    assert "missing_parameter" in action["reason"], action["reason"]
+    res = await client.post(f"/api/ledger/answers/{row.id}/issue", json={"workflow_id": wf, "version": 1})
+    assert res.status_code == 409 and res.json()["code"] == ledger_issue.REFUSED
+    assert "missing_parameter" in res.json()["detail"] and "不代填出具" in res.json()["detail"]
+    assert await issued(row.id) == [] and executed[sent:] == []
+
+
+async def test_a_template_referencing_a_field_the_version_never_declared_is_not_filled_in(client, monkeypatch, executed):
+    """取数模板引用了入口没声明的参数：绑定出来的值没有对应的入口字段，按参数完整性（ledger/params）不代填出具——这种
+    模板渲染出来是空串，正式运行会照发。"""
+    template = ("SELECT SUM(amount) AS gmv FROM orders WHERE status = 'paid' AND region = '{{ input.region }}' "
+                "AND paid_at >= '{{ input.start }}' AND paid_at < '{{ input.end }}'")
+    graph = S.caliber_graph(template)
+    graph["nodes"][0]["data"]["config"]["fields"] = [{"name": "start", "required": True},
+                                                     {"name": "end", "required": True}]
+    wf = await S.publish(graph=graph, level="published")
+    two_writers(monkeypatch, "本周销售额 [[v:Q1.r0.销售额]]。")
+    run = await run_manager.start(graph=S.explore_graph(
+        "select sum(o.amount) as 销售额 from orders o where o.paid_at >= '2026-09-01' and o.status = 'paid' "
+        "and o.region = 'east' and o.paid_at < '2026-09-08'"), input_payload={}, origin_kind="canvas")
+    row = await S.wait(run.id)
+    await ledger_match.drain()
+    whole = (await ledger_match.store.latest(row.id)).content["whole"]
+    assert whole["equivalent"] is True and whole["binding"]["region"] == "east"
+    sent = len(executed)
+    res = await client.post(f"/api/ledger/answers/{row.id}/issue", json={"workflow_id": wf, "version": 1})
+    assert res.status_code == 409 and res.json()["code"] == ledger_issue.REFUSED
+    assert "undeclared_parameter" in res.json()["detail"] and "不代填出具" in res.json()["detail"]
+    assert await issued(row.id) == [] and executed[sent:] == []
+
+
+#: 认不出参数写在哪的两种写法：入口字段和运行时变量混在一句里、参数写在表名（列名）里
+UNREADABLE_TEMPLATES = [
+    "SELECT COUNT(*) AS n FROM orders WHERE region = '{{ input.store }}' AND note = '{{ vars.q }}'",
+    'SELECT COUNT(*) AS n FROM "{{ input.store }}"',
+]
+
+
+@pytest.mark.parametrize("sql", UNREADABLE_TEMPLATES)
+async def test_a_version_with_a_template_the_input_cannot_be_found_in_is_not_issued(client, monkeypatch, executed, sql):
+    """这一版里别的取数节点上的模板认不出参数写在哪：发起前就按参数完整性拒，不再当成「不归出具管」放过去——和 trial、
+    组合式问数、派生是同一个判断（口径那一张卡自己的取数模板这样写，在派生那一步就拒了）。
+
+    这一版固定下来渲染不出确定的语句：{{ vars.q }} 会在正式运行里换成运行时的值、参数写进表名，出具的就不再是这一版口径
+    的取数了。以前跳过 unsupported_parameter 这一条，计划说能出具、真发起了才看出来。"""
+    graph = S.caliber_graph()
+    graph["nodes"].insert(2, S.node("extra", "tool", tool=S.tool(), args={"sql": sql}))
+    graph["edges"] = [{"source": a["id"], "target": b["id"]} for a, b in zip(graph["nodes"], graph["nodes"][1:])]
+    wf = await S.publish(graph=graph, level="published")
+    row = await equivalent_run(monkeypatch, origin="canvas")
+    sent = len(executed)
+    [action] = [a for a in (await client.get(f"/api/runs/{row.id}/ledger")).json()["actions"] if a["kind"] == "issue"]
+    assert action["available"] is False and "认不出参数写在哪" in action["reason"]
+    res = await client.post(f"/api/ledger/answers/{row.id}/issue", json={"workflow_id": wf, "version": 1})
+    assert res.status_code == 409 and res.json()["code"] == ledger_issue.REFUSED
+    assert "认不出参数写在哪" in res.json()["detail"] and "不代填出具" in res.json()["detail"]
+    assert await issued(row.id) == [] and await settle(row.id) == [] and executed[sent:] == []
+
+
+@pytest.mark.parametrize("sql", UNREADABLE_TEMPLATES)
+async def test_a_measured_template_the_input_cannot_be_found_in_is_not_filled_in(client, monkeypatch, executed, sql):
+    """口径自己的那张取数模板认不出参数写在哪时同样不代填出具（ledger/issue.check_target 这一个判法，出具和召回待办的
+    「按新版重新出具」共用）。
+
+    这么写的模板比不出等价（比对也认不出参数写在哪），所以到不了「先有一次等价答案」那一路：直接按已经比对好的那份打算问
+    能不能发起，照实说原因；来源运行仍是真实跑出来的那一次，一条 SQL、一个正式运行都不该多出来。"""
+    graph = S.caliber_graph()
+    graph["nodes"][1]["data"]["config"]["args"]["sql"] = sql
+    wf = await S.publish(graph=graph, level="published")
+    row = await equivalent_run(monkeypatch, origin="canvas")
+    sent = len(executed)
+    content = {"whole": {"equivalent": True, "workflow_id": wf, "version": 1, "how": "independent",
+                         "level": "published", "binding": {"start": "2026-09-01", "end": "2026-09-08"}}}
+    async with SessionLocal() as session:
+        plan = await ledger_issue.plan_issue(session, await session.get(Run, row.id), content, wf, 1,
+                                            principal=ADMIN)
+    assert plan.available is False and plan.status == 409 and plan.code == ledger_issue.REFUSED
+    assert "认不出参数写在哪" in plan.reason and "不代填出具" in plan.reason
+    assert await issued(row.id) == [] and executed[sent:] == []

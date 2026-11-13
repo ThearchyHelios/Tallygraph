@@ -1370,6 +1370,37 @@ function toolStep(seq: number, tool: string, args: Record<string, any>): Step {
     return { ...base, kind: 'schema', title: clip(`查看 ${tables.length} 张表的字段：${head}…`),
              detail: tables.join('\n') }
   }
+  if (tool === 'metric_query') {
+    const key = typeof args?.metric_key === 'string' && args.metric_key.trim() ? args.metric_key.trim() : ''
+    const argText = Object.keys(args ?? {}).length ? JSON.stringify(args, null, 2) : ''
+    return {
+      ...base, kind: 'query', code: 'metric_query',
+      title: clip(key ? `查询标准指标 · ${key}` : '查询标准指标'),
+      detail: argText || undefined,
+    }
+  }
+  if (tool === 'ontology_neighbors') {
+    const metricId = typeof args?.metric_id === 'string' && args.metric_id.trim() ? args.metric_id.trim() : ''
+    const argText = Object.keys(args ?? {}).length ? JSON.stringify(args, null, 2) : ''
+    return {
+      ...base, kind: 'tool', code: 'ontology_neighbors',
+      title: clip(metricId ? `查询指标本体邻域 · ${metricId}` : '查询指标本体邻域'),
+      detail: argText || undefined,
+    }
+  }
+  if (tool === 'source_health') {
+    const sources = Array.isArray(args?.sources)
+      ? args.sources.map((s) => String(s ?? '').trim()).filter(Boolean)
+      : typeof args?.source === 'string' && args.source.trim() ? [args.source.trim()] : []
+    const argText = Object.keys(args ?? {}).length ? JSON.stringify(args, null, 2) : ''
+    return {
+      ...base, kind: 'tool', code: 'source_health',
+      title: sources.length
+        ? clip(`核查数据源健康 · ${sources.slice(0, 3).join('、')}${sources.length > 3 ? '…' : ''}`)
+        : '核查数据源健康',
+      detail: argText || undefined,
+    }
+  }
   const op = analysisToolOp(tool)
   if (op) {
     // Agent 的分析工具：标题写算子的叫法（契约的叫法），不写 analysis_decompose；参数里没填的不列。判定语、编号等 tool.end
@@ -2329,6 +2360,18 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
               settleAnalysis(step, d)
               analysisSteps.set(key, step)
             }
+            step.meta = dur(step.ms)
+          } else if (step.code === 'source_health' && !failed) {
+            const sh = d.source_health && typeof d.source_health === 'object' ? d.source_health as Record<string, any> : null
+            if (sh) {
+              const alias = typeof sh.alias === 'string' && sh.alias ? sh.alias : ''
+              const phrase = typeof sh.phrase === 'string' && sh.phrase ? sh.phrase : ''
+              const verdict = typeof sh.verdict === 'string' ? sh.verdict : ''
+              if (alias) step.title = clip(`${step.title} · 本节点 ${alias}`)
+              if (phrase) step.sub = step.sub ? `${phrase} · ${step.sub}` : phrase
+              if (verdict && verdict !== 'healthy' && verdict !== 'ok') step.level = 'warn'
+            }
+            if (typeof d.health_artifact === 'string' && d.health_artifact) step.artifact = d.health_artifact
             step.meta = dur(step.ms)
           } else if (step.kind === 'query' || step.kind === 'schema' || failed) {
             // 查询保留 SQL 作为 detail，结果另挂；失败时结果就是错误原因
@@ -3529,7 +3572,7 @@ export function lookEventOf(op: CopilotOp): LookEvent | null {
     op: 'look', id: String(op.id ?? ''), by: op.by === 'system' ? 'system' : 'model',
     need: String(op.need ?? ''), status,
     ...(typeof op.reason === 'string' && op.reason ? { reason: op.reason } : {}),
-    elapsed_ms: num(op.elapsed_ms) ?? 0, objects,
+    elapsed_ms: num(op.elapsed_ms) ?? 0, objects, kinds: names(op.kinds),
   }
 }
 
@@ -3594,7 +3637,11 @@ export function copilotLook(op: CopilotOp):
   const ms = look.elapsed_ms >= 10 ? look.elapsed_ms : undefined
   if (look.status === 'failed') return { title: LOOK_TEXT.failed, level: 'warn', detail, ms }
   if (look.status === 'index') {
-    return { title: look.reason ? LOOK_TEXT.index : LOOK_TEXT.indexEmpty, level: 'warn', detail, ms,
+    const kinds = look.kinds?.length ? look.kinds : [...new Set(look.objects.map(o => o.kind))]
+    const title = kinds.length === 1 && kinds[0] === 'caliber' ? '未匹配到明确口径，已提供口径目录'
+      : kinds.length && !kinds.includes('table') ? '未匹配到明确对象，已提供对应目录'
+      : look.reason ? LOOK_TEXT.index : LOOK_TEXT.indexEmpty
+    return { title, level: 'warn', detail, ms,
              ...(tableObjs.length ? { sub: [...new Set(tableObjs.map((o) => o.source))].join('、') } : {}) }
   }
   const title = !what ? LOOK_TEXT.nothing
@@ -3787,6 +3834,38 @@ export function decodeCopilot(ops: CopilotOp[], opts?: {
         }
         add({ id: `hb-${i}`, seq: i, kind: 'lifecycle', status: 'running', title: label,
               ...(elapsed ? { ms: elapsed, meta: formatDuration(elapsed) } : {}) })
+        break
+      }
+      case 'grounding': {
+        const g = op.grounding && typeof op.grounding === 'object' ? op.grounding : null
+        if (!g) break
+        const mCount = Array.isArray(g.metrics) ? g.metrics.length : 0
+        const eCount = Array.isArray(g.entities) ? g.entities.length : 0
+        const tCount = Array.isArray(g.tables) ? g.tables.length : 0
+        const rCount = Array.isArray(g.guardrails) ? g.guardrails.length : 0
+        const parts: string[] = []
+        if (mCount) parts.push(`指标 ${mCount} 个`)
+        if (eCount) parts.push(`业务实体 ${eCount} 个`)
+        if (tCount) parts.push(`目录表 ${tCount} 张`)
+        if (rCount) parts.push(`防错规则 ${rCount} 条`)
+        const elapsed = num(g.elapsed_ms)
+        const lines: string[] = []
+        if (Array.isArray(g.metrics) && g.metrics.length) {
+          lines.push(`指标：${g.metrics.map((m: any) => `${m.name}（${m.key}）`).join('、')}`)
+        }
+        if (Array.isArray(g.entities) && g.entities.length) {
+          lines.push(`业务实体：${g.entities.map((e: any) => e.matched_member?.canonical_label
+            ? `${e.label} → ${e.matched_member.canonical_label}` : e.label).join('、')}`)
+        }
+        if (Array.isArray(g.tables) && g.tables.length) {
+          lines.push(`目录表：${g.tables.map((t: any) => `${t.datasource_name}.${t.table_name}`).join('、')}`)
+        }
+        add({
+          id: `gr-${i}`, seq: i, kind: 'schema', status: 'done', code: 'semantic_grounding',
+          title: parts.length ? `语义预命中 · ${parts.join('、')}` : '语义预命中 · 已连接数据源目录',
+          ...(lines.length ? { detail: lines.join('\n') } : {}),
+          ...(elapsed != null ? { ms: elapsed, meta: formatDuration(elapsed) } : {}),
+        })
         break
       }
       case 'look':

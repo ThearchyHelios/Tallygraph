@@ -648,6 +648,8 @@ class JobManager:
 
     def start(self, job_id: str) -> None:
         """开始在后台执行这个（排队中的）任务：先进这个源的队，轮到了才开始。"""
+        if self._alive(job_id) is not None:
+            return
         run = self._factory(job_id)
         run.task = asyncio.get_running_loop().create_task(run.run(), name=f"{self.name}-{job_id}")
         self._runs[job_id] = run

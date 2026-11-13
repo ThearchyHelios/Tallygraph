@@ -36,6 +36,8 @@ VERSION_RETIRED = "run_version_retired"
 VERSION_HASH_MISMATCH = "run_version_hash_mismatch"
 #: 发布之后这一版用到的能力的治理版本变了：只提醒、不拦（同数据目录漂移）
 CAPABILITY_DRIFT = "capability_drift"
+#: 正式运行固定了哪一份发布依据（K07）：这条日志写在发起时的事件流里，运行记录上回看得到
+PUBLICATION_CODE = "publication.pinned"
 #: 正式运行里子工作流节点固定的版本没有发布过、已经退役（D-q）的机器码，和发布门禁、应用检查同一套：见 apps/versions.py
 #: 的 SUBGRAPH_UNPUBLISHED / SUBGRAPH_RETIRED 和 subgraph_pin_problems
 
@@ -98,6 +100,8 @@ async def launch_run(
     formal = run_class == "formal"
     # 发布时记下的能力版本（正式运行才比，见 _with_capability_snapshot）
     published_capabilities: dict[str, Any] | None = None
+    # 这次正式运行固定的发布依据（K07）：哪一版、哪份清单、什么身份。写进运行来源和事件流（探索运行为 None）
+    publication_info: dict[str, Any] | None = None
 
     if formal:
         # 正式运行的全部语义就这一条规则：必须引用一个不可变的已发布版本。
@@ -163,6 +167,25 @@ async def launch_run(
             raise LaunchRefused(409, "；".join(errors))
         # 处置声明了，固定的那一版本身还得在用（D-q）：两条都拦，先说升版是沿用以前的提示顺序
         await _refuse_unpublished_subgraphs(session, spec)
+        # 发布依据（K07）：每次有发布事件的正式运行都要过这一套——先复验清单工件本身（read 复验 + 编译器约定，
+        # 和 K09 的固定执行同一份核对）、再核清单覆盖这一版（错图/缺卡）、逐张卡认清单里引用的记录与审阅，最后按同一
+        # 用途递归判转抄卡固定引用的上游那张卡。老资产（这一版没有清单）保持原行为，只是身份记 formal_legacy；
+        # 不需要证明的记 formal_unproven。**这是正式身份的唯一入口**：别的入口（画布、应用、定时任务、钩子、按口径
+        # 出具）都要经过这里，绕不过去。
+        # explicit 按调用方有没有点名版本记：默认发起只解析一次推荐版（run_version 就在上面定下来了，之后不再读指针，
+        # 并发下指针漂移只影响下一次发起），运行来源里照实写「不是点名的那一版」
+        from app.apps import publications as caliber_publications
+
+        judged = await caliber_publications.judge(session, workflow, version=run_version,
+                                                  purpose=caliber_publications.PURPOSE_FORMAL, snapshot=snapshot,
+                                                  explicit=version is not None)
+        if judged is not None:
+            refusal = judged.refusal
+            if refusal is not None:
+                raise LaunchRefused(
+                    409, f"「{workflow.name}」v{run_version} 的发布依据还不够，不能作为正式运行发起：{refusal[1]}",
+                    refusal[0])
+            publication_info = judged.as_dict()
         # 数据目录和口径卡不同：目录是给人和助手看的说明，不是运行的输入。发布之后变了只提醒、不拦——
         # 拦下来等于让一次文字修订卡住正式出具
         catalog_changes = await catalog_drift(session, snapshot.catalog_versions)
@@ -198,8 +221,12 @@ async def launch_run(
         # 按不按受管出具在发起这一刻定下来：status 反映的是当前画布，中途改图、审批停下再恢复时再去读它，
         # 报告节点和出口复核可能各读到不同的值
         notes.append(("log", None, governance_note(governed=governed, workflow_name=name, version=run_version)))
-    if catalog_changes:
-        # 之后回看这次正式出具，能知道当时的目录和发布时不一样、差在哪几张表。每张表带 impact：direct 写死的
+    if publication_info is not None:
+        # K07：这次正式运行固定的是哪一份发布依据、什么身份（formal_proven / formal_unproven / formal_legacy）。
+        # 清单里写着定义、绑定、参数契约和验证/审阅引用，回看这次运行能对上是哪一份
+        notes.append(("log", None, {**publication_info, "level": "info", "code": PUBLICATION_CODE,
+                                    "message": _publication_message(name, run_version, publication_info)}))
+    if catalog_changes:        # 之后回看这次正式出具，能知道当时的目录和发布时不一样、差在哪几张表。每张表带 impact：direct 写死的
         # SQL 用到的，possible Agent 可能查询的（界面分开说）
         notes.append((EventType.CATALOG_DRIFT, None,
                       {"version": run_version, "count": len(catalog_changes), "tables": catalog_changes}))
@@ -219,6 +246,10 @@ async def launch_run(
         payload_ev = dict(ev)
         node = payload_ev.pop("node_id", None)
         notes.append(("caliber.upgrade", node, payload_ev))
+    if publication_info is not None:
+        # K07：这次正式运行固定了哪一份发布依据记进运行来源（运行行上的 origin 和 run.origin 事件是同一份）：
+        # 「这次跑的是哪一版、哪份清单、什么身份」读运行的人一处就能看全。调用方给的来源键一个不动。
+        origin = {**(origin or {}), "publication": publication_info}
     if origin_kind:
         from app.engine.origin import origin_note
 
@@ -248,6 +279,17 @@ async def launch_run(
     except ValueError as e:
         raise LaunchRefused(400, str(e)) from e
     return run
+
+
+def _publication_message(name: str, version: int | None, info: Any) -> str:
+    """正式运行固定的发布依据写给人的一句话（`publication.pinned` 那条日志）。"""
+    identity = str((info or {}).get("identity") or "")
+    why = {"formal_proven": "发布依据齐全（覆盖这一版定义、绑定和取数语义，验证 matched 并经认证审阅确认全部指标）",
+           "formal_unproven": "这一版没有要求发布依据（资产不在证明范围内）",
+           "formal_legacy": "这一版是发布清单这一机制之前的资产，按原样发起"}.get(identity, identity)
+    manifest = str((info or {}).get("manifest") or "")
+    where = f"，发布清单 {manifest[:12]}…" if manifest else ""
+    return f"本次正式运行固定「{name}」v{version}：{why}{where}"
 
 
 def graph_tool_names(graph: dict[str, Any]) -> list[str]:

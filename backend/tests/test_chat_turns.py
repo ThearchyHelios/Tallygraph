@@ -283,7 +283,8 @@ async def test_stop_while_building(client, monkeypatch, source):
     gate = asyncio.Event()
     es.use_copilot(monkeypatch, Gated(source["name"], gate))
     conversation_id = await _conversation(client)
-    turn_id = await _ask(client, conversation_id)
+    # This exercises the exploratory builder, not globally published semantic definitions.
+    turn_id = await _ask(client, conversation_id, datasource_ids=[source["id"]])
     await _stage(turn_id, "build")
     r = await client.post(f"/api/chat/turns/{turn_id}/cancel")
     assert r.status_code == 200, r.text

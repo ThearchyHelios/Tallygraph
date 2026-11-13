@@ -659,11 +659,12 @@ class RelatedCheckPlan:
 
 @dataclass
 class CompileFacts:
-    """R15 的第二道核对（EXPLAIN 编译、不执行）：授权回调读到的表、字节码里 ResultRow 和 Yield 的个数。"""
+    """R15 的第二道核对：授权回调读到的表、SELECT 次数和字节码的输出指令数。"""
 
     tables: set[str]
     result_rows: int
     yields: int
+    selects: int = 1
 
 
 # ==========================================================================

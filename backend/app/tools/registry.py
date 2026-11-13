@@ -52,7 +52,37 @@ class ToolContext:
     #: 读哪一份数据目录（data/catalog_view.CatalogView）：运行里由节点从 Run.options 取来（catalog_view.of_run），db_schema
     #: 给模型看的、查询冻结进表结构快照的、查询时的 SQL 检查都按它。None 是当前目录（缺省，行为同以前）
     catalog_view: Any = None
+    #: 这次运行的类别（formal / exploratory，engine/runner.py 从 Run.run_class 放进 RunContext.extra）。K10 的
+    #: caliber_query 按它选用途：正式父 Run 走 formal judge，别的（交互、画布）走 compose、拿不到正式身份。None 按
+    #: exploratory 算——宁可保守，也不把一次探索说成正式的
+    run_class: str | None = None
+    #: 这次运行的发起人（服务端身份，同上）。caliber_query 拿它当执行的认证主体，不从工具参数里读
+    started_by: str | None = None
+    #: 这次运行发起时定下的选项快照（Run.options，RunContext.extra 里那一份）：caliber_query 照原样带进派生的子运行
+    #: （遮罩、只读、数据目录视图……），不从工具参数里读
+    run_options: dict[str, Any] = field(default_factory=dict)
+    #: 这次运行的来源（Run.origin，同上）：caliber_query 把它当 trace 带下去，父子关系一眼看得全
+    origin: dict[str, Any] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+#: RunContext.extra 里的键（engine/runner.py 放、构造 ToolContext 的节点取）：这次运行的类别、发起人与来源。
+#: 用途/主体/父 Run 关系由发起时定下，工具参数改不了（K10）
+RUN_CLASS_KEY = "run_class"
+RUN_STARTED_BY_KEY = "started_by"
+RUN_ORIGIN_KEY = "origin"
+
+
+def execution_id_of(node_id: str, *, attempt: int | None = None, call_id: str | None = None,
+                    run_id: str | None = None) -> str:
+    """一次**实际执行**的执行身份（K10）：`<运行>:<节点>#<调用 id 或执行序号>`。
+
+    同一次运行里同一条 SQL 执行两次（agent 的两步、失败后接着跑）必须拿到不同的 execution_id——按调用 id（agent 的那
+    一步）或这个节点的执行序号（调用工具节点的第几次）区分。带上运行 id：口径查询派生的子运行每次调用都是一次新运行，
+    同一个子节点在自己的运行里都是第 1 次——两次调用交回的工件来自两个子运行，执行身份也必须不同。
+    query_id 是逻辑查询身份（K08 闭包那一条），execution_id 是这一次执行，两者不能互相当。"""
+    slot = str(call_id) if call_id else f"e{int(attempt or 1)}"
+    return f"{run_id}:{node_id}#{slot}" if run_id else f"{node_id}#{slot}"
 
 
 @dataclass(frozen=True)
@@ -125,6 +155,9 @@ def register(
 
 def all_specs() -> dict[str, ToolSpec]:
     import app.tools.builtin  # noqa: F401  触发内置工具注册
+    import app.ledger.querycore  # noqa: F401  触发 caliber_query（K10 的父 Run 工具入口）注册
+    import app.tools.ontology  # noqa: F401  触发 ontology_neighbors / source_health 注册
+    import app.tools.metrics  # noqa: F401  触发 metric_query（独立语义指标查询）注册
 
     return dict(_REGISTRY)
 

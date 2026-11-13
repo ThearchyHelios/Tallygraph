@@ -59,6 +59,16 @@ export function VersionUsageLine({ usage }: { usage: VersionUsage }) {
           ))}
         </>
       )}
+      {!!usage.workflows?.length && (
+        <span> · 依赖工作流：{usage.workflows.map((w, i) => (
+          <span key={`${w.workflow_id}:${w.version}:${w.node_id}:${i}`}>
+            {i > 0 && '、'}<Link className="hover:underline" to={`/studio/${w.workflow_id}`}>{w.name} v{w.version}</Link>
+            {w.depth > 1 ? '（间接）' : ''}
+          </span>
+        ))}</span>
+      )}
+      {!!usage.indirect_apps?.length && <span> · 间接影响应用：{usage.indirect_apps.map((a) => a.name).join('、')}</span>}
+      {!!usage.unreadable_workflows?.length && <span> · 部分版本无法解析，影响范围尚未核对完整</span>}
       <span className="text-faint"> · {T.effects(usage.effects)} · {T.formalRuns(usage.formal_runs)}</span>
       {extra.length > 0 && <span className="text-faint" data-version-usage-ledger=""> · {extra.join(' · ')}</span>}
     </span>
@@ -82,7 +92,12 @@ export async function retireVersion(workflowId: string, version: number, usage: 
   const ok = await confirmDialog({
     title: T.retireTitle(version),
     body: T.retireBody,
-    consequences: usage?.apps.length ? [T.retireAffected(usage.apps.map((a) => `${a.name} v${a.app_version}`))] : undefined,
+    consequences: [
+      ...(usage?.apps.length ? [T.retireAffected(usage.apps.map((a) => `${a.name} v${a.app_version}`))] : []),
+      ...(usage?.workflows?.length ? [`依赖此版本的工作流将无法继续正式运行：${usage.workflows.map((w) => `${w.name} v${w.version}`).join('、')}`] : []),
+      ...(usage?.indirect_apps?.length ? [`间接影响应用：${usage.indirect_apps.map((a) => a.name).join('、')}`] : []),
+      ...(usage?.unreadable_workflows?.length ? ['部分版本无法解析，当前影响范围可能不完整'] : []),
+    ],
     confirmLabel: T.retire,
     danger: true,
   })

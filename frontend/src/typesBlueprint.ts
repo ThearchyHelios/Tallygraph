@@ -243,7 +243,9 @@ export interface PlanStep {
 /**
  * 发布单（服务端 blueprints/publish_plan.plan_out）。ok：没有挡路的问题（error 级）、也没停下，能确认执行。actor 是出单的人。
  * options 是出单时定下的：first_run（发布后立即跑一次，不给时看板类为真、流程类为假）、dispositions（钉住项升版的处置）、
- * spec_hash（出单那一刻卡片内容的指纹，执行时重算，对不上回 409 plan.graph_changed；服务端自己用，界面不读）
+ * spec_hash（出单那一刻卡片内容的指纹，执行时重算，对不上回 409 plan.graph_changed；服务端自己用，界面不读）、
+ * workflow_revision（出单时工作流是第几版，K02：执行到「保存版本」时对不上就停下重新出单，不盖掉画布上后来的修改；
+ * 界面不读）
  */
 export interface PublishPlanRow {
   id: string
@@ -255,7 +257,8 @@ export interface PublishPlanRow {
   /** 白话摘要：每一步一句 */
   summary: { step: PlanStepKind; text: string }[]
   problems: PlainIssue[]
-  options: { first_run?: boolean; dispositions?: Record<string, Disposition>; spec_hash?: string }
+  options: { first_run?: boolean; dispositions?: Record<string, Disposition>; spec_hash?: string;
+    workflow_revision?: number | null }
   ok: boolean
   actor: string | null
   created_at: string | null

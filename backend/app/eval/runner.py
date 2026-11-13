@@ -100,7 +100,7 @@ def leader_of(run: Any) -> str:
 def prompt_fingerprint() -> str:
     """助手提示词的指纹：节点手册、输出协议、问数据的请求包法、重来的两种措辞、复核的规则；平台的分析方法（分析工具的
     guide：id 带版本，连同全文）、写作者的分析规则（写作目录里分析结论那一段、判断词的写法、重写时补的那句）和说法表的
-    版本；自查判问题意图的词表（版本，改词表要升）和「分析类问题、查库的 Agent 没绑分析工具」时交回模型的那一句。
+    版本；自查判问题意图的词表、默认调查策略及其版本，和「分析类问题、查库的 Agent 没绑分析工具」时交回模型的那一句。
     改了任何一段，和上一次比时就标「提示词变了」。"""
     from app.analysis.intent import INTENT_VERSION
     from app.api import copilot
@@ -108,16 +108,19 @@ def prompt_fingerprint() -> str:
     from app.chat import turn
     from app.core.artifact_store import canonical_json, content_hash
     from app.engine import analysis_claims, evidence, review
+    from app.engine.investigation import INVESTIGATION_VERSION, InvestigationPolicy
     from app.tools.builtin.analysis import METHOD_GUIDE
+    from app.tools.ontology import ONTOLOGY_GUIDE
 
     parts = [copilot.NODE_REFERENCE, copilot._STREAM_PROTOCOL,
              copilot._user_message(copilot.GenerateIn(instruction="{question}", intent="answer"), patch=False),
              turn.RETRY_WITH_BASE, turn.RETRY_FROM_SCRATCH,
              str(getattr(review, "REVIEW_SYSTEM", "") or getattr(review, "SYSTEM_PROMPT", "")),
-             METHOD_GUIDE.id, METHOD_GUIDE.text, evidence.ANALYSIS_PROMPT, evidence.ANALYSIS_SEE_ONLY_PROMPT,
+             METHOD_GUIDE.id, METHOD_GUIDE.text, ONTOLOGY_GUIDE.id, ONTOLOGY_GUIDE.text,
+             evidence.ANALYSIS_PROMPT, evidence.ANALYSIS_SEE_ONLY_PROMPT,
              analysis_claims.ANALYSIS_RULES_PROMPT, analysis_claims.ANALYSIS_NONE_PROMPT,
              analysis_claims.ANALYSIS_REPAIR_PROMPT, analysis_claims.LEXICON_VERSION,
-             INTENT_VERSION, analysis_gaps_fix()]
+             INTENT_VERSION, analysis_gaps_fix(), INVESTIGATION_VERSION, InvestigationPolicy().model_dump()]
     return content_hash(canonical_json(parts))[:16]
 
 
@@ -244,6 +247,7 @@ async def start(session: AsyncSession, suite: EvalSuite, variants: Sequence[Mapp
                                    "assistant_model": models.get("assistant"), "writer_model": models.get("writer"),
                                    "catalog_mode": (variant.get("catalog") or {}).get("mode"),
                                    "analysis_tools": variant_rules.analysis_tools(variant),
+                                   "ontology_tools": variant_rules.ontology_tools(variant),
                                    "snapshot_artifact": snapshot, "cron": cron},
                       counts={"total": len(cases) * repeats, "done": 0})
         session.add(run)
@@ -553,7 +557,8 @@ class EvalExecution(runtime.JobRun):
                           arm=arm.name, repeat=unit.repeat,
                           assistant=arm.variant.get("assistant") or {}, writer=arm.variant.get("writer") or {},
                           view=arm.view, analysis=self.analysis,
-                          analysis_tools=variant_rules.analysis_tools(arm.variant) == "on")
+                          analysis_tools=variant_rules.analysis_tools(arm.variant) == "on",
+                          ontology_tools=variant_rules.ontology_tools(arm.variant) == "on")
         driver = Driver(question, datasource_ids=list(case.get("datasource_ids") or []), ctx=ctx, on_phase=on_phase)
         try:
             if case.get("kind") == "workflow":

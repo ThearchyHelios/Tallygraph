@@ -582,7 +582,10 @@ await section('入口：使用者选人只出候选池里的人，不在池里�
   await field.waitFor({ timeout: 15000 })
   const input = field.locator('input.field')
   await input.fill('费')
-  await page.waitForFunction(() => !!document.querySelector('[data-field="approver"] datalist option'), null, { timeout: 5000 })
+  await page.waitForFunction(() => {
+    const options = [...document.querySelectorAll('[data-field="approver"] datalist option')]
+    return options.length === 1 && options[0].getAttribute('value') === 'fay'
+  }, null, { timeout: 5000 })
     .catch(() => {})
   const options = await field.locator('datalist option').evaluateAll((els) => els.map((e) => `${e.getAttribute('value')}|${e.textContent}`))
   check('边输入边按开头取候选：列表里是候选池给的人，显示名作说明', options.join(',') === 'fay|费伊', options.join(','))
@@ -673,6 +676,41 @@ await section('实例页：状态、进度、待办卡、动作状态', async ()
     && /不会自动重发/.test(await page.locator('[data-action="unknown"] [data-action-note]').innerText()))
   check('关登录（等同管理员）时接运行流', (await page.locator('[data-instance-follow]').getAttribute('data-instance-follow')) === 'stream')
   check('没有未捕获的运行时错误', page.errors.length === 0, page.errors[0] ?? '')
+})
+
+await section('实例页：慢轮询不叠加、离开后不再轮询', async () => {
+  const { page } = await open({ state: { writes: [] } })
+  await page.route('**/api/auth/me', (route) => route.fulfill({ json: {
+    mode: 'local', username: 'tester', display_name: '测试使用者', role: 'user', groups: [], verified: true,
+  } }))
+  await page.route('**/api/health', (route) => route.fulfill({ json: { status: 'ok', service: 'agentlab' } }))
+  let hits = 0
+  let active = 0
+  let maxActive = 0
+  let slow = false
+  await page.route('**/api/apps/app_claim/instances/run_claim_1', async (route) => {
+    hits++
+    active++
+    maxActive = Math.max(maxActive, active)
+    if (slow) await new Promise((resolve) => setTimeout(resolve, 5200))
+    active--
+    await route.fulfill({ json: { ...INSTANCE, status: 'running' } }).catch(() => {})
+  })
+  await page.goto(`${WEB}/apps/app_claim/i/run_claim_1`)
+  await page.locator('[data-instance-follow="poll"]').waitFor({ timeout: 15000 })
+  const initialHits = hits
+  maxActive = 0
+  slow = true
+  // 等一轮耗时超过轮询间隔的请求完成。旧实现会在 8 秒处再发一条，持续作废较早的结果。
+  await page.waitForTimeout(10000)
+  check('慢于轮询周期的请求最多一条在途', maxActive === 1, `最大并发 ${maxActive}，共 ${hits} 次`)
+  check('请求结束后才安排下一轮', hits === initialHits + 1, `初次 ${initialHits}，总共 ${hits} 次`)
+  await page.locator('nav a[href="/apps"]').first().click()
+  await page.waitForURL(/\/apps$/)
+  const stoppedAt = hits
+  await page.waitForTimeout(4500)
+  check('离开实例页后停止轮询', hits === stoppedAt, `${stoppedAt} → ${hits}`)
+  check('没有未捕获错误', page.errors.length === 0, page.errors[0] ?? '')
 })
 
 // ---------------------------------------------------------------- 页面上直接改（N6）

@@ -92,6 +92,7 @@ async function open({ theme = 'dark', state }) {
     // 主题以本地为准，别让沙箱库里存的偏好把这次检查的主题改掉
     if (url.pathname === '/api/settings') return route.fulfill({ json: { ui: { theme } } })
     if (url.pathname === '/api/approvals') return route.fulfill({ json: state.approvals })
+    if (url.pathname === '/api/workflows' && state.workflows) return route.fulfill({ json: state.workflows })
     // 导航上的两个徽标按来源分开数：「记录」数不属于应用的（other），「应用」数应用里的（apps）。这里的待审批都不属于应用。
     // latest 同服务端：派给我的待处理待办里最新一条的开出时间（数不变、却换了一条时，新待办通知看它）
     if (url.pathname === '/api/tasks/count') {
@@ -147,11 +148,11 @@ await section('导航', '=== 导航 ===', async () => {
   const labels = await nav(page).locator('li > a[aria-keyshortcuts] > span:not([aria-hidden])').allInnerTexts()
   // 定时任务是后加的，排在设置前面；设置留在最底下，快捷键还是 ⌥7（定时任务用 ⌥8）。应用（⌥9）排在编排后面。
   // 评测（next-round 评测-D8，搭建者以上）也排在设置前面，用最后一个空着的 ⌥0
-  check('导航十项：问数据、编排、应用、记录、数据、工具、知识、定时任务、评测、设置',
-    labels.join(',') === '问数据,编排,应用,记录,数据,工具,知识,定时任务,评测,设置', labels.join(','))
+  check('导航十一项：问数据、编排、应用、记录、数据、工具、知识、定时任务、评测、口径、设置',
+    labels.join(',') === '问数据,编排,应用,记录,数据,工具,知识,定时任务,评测,口径,设置', labels.join(','))
   const keys = await nav(page).locator('li > a[aria-keyshortcuts]').evaluateAll((els) => els.map((el) => el.getAttribute('aria-keyshortcuts')))
-  check('原有快捷键都没动：问数据 ⌥1、编排 ⌥2、记录 ⌥3 … 设置 ⌥7、定时任务 ⌥8；应用是 ⌥9、评测是 ⌥0',
-    keys.join(',') === 'Alt+1,Alt+2,Alt+9,Alt+3,Alt+4,Alt+5,Alt+6,Alt+8,Alt+0,Alt+7', keys.join(','))
+  check('原有快捷键都没动：问数据 ⌥1、编排 ⌥2、记录 ⌥3 … 设置 ⌥7、定时任务 ⌥8；应用是 ⌥9、评测是 ⌥0；口径是 ⌥L',
+    keys.join(',') === 'Alt+1,Alt+2,Alt+9,Alt+3,Alt+4,Alt+5,Alt+6,Alt+8,Alt+0,Alt+L,Alt+7', keys.join(','))
   const fontSize = await nav(page).locator('li > a[aria-keyshortcuts] > span:not([aria-hidden])').first()
     .evaluate((el) => getComputedStyle(el).fontSize)
   check('导航标签 11px', fontSize === '11px', fontSize)
@@ -194,13 +195,13 @@ await section('导航', '=== 导航 ===', async () => {
   for (const end = Date.now() + 3000; !(await lit()).startsWith('数据') && Date.now() < end;) await page.waitForTimeout(100)
   check('数据页点亮「数据」', (await lit()).startsWith('数据'), await lit())
 
-  // 矮窗口：导航按高度收紧，最底下的遥测点和署名不能被切掉（十个导航项：600、520、480 三种高度各量一遍）
+  // 矮窗口：导航按高度收紧，最底下的遥测点和署名不能被切掉（十一个导航项：700、600、520、480 四种高度各量一遍）
   const bottomFits = () => page.evaluate(() => {
     const n = document.querySelector('nav[aria-label="主导航"]')
     const t = document.querySelector('[data-telemetry]').getBoundingClientRect()
     return { ok: n.scrollHeight <= innerHeight && t.bottom <= innerHeight, tel: Math.round(t.bottom), vh: innerHeight }
   })
-  for (const h of [600, 520, 480]) {
+  for (const h of [700, 600, 520, 480]) {
     await page.setViewportSize({ width: 1280, height: h })
     await page.waitForTimeout(150)
     const fit = await bottomFits()
@@ -404,7 +405,12 @@ await section('标签页标题', '\n=== 标签页标题、favicon、后台提醒
 
 // ---------------------------------------------------------------------------
 await section('⌘K 命令面板', '\n=== ⌘K 命令面板 ===', async () => {
-  const state = { approvals: PENDING, offline: false, writes: [] }
+  // 搜索“设置”时保留第二个匹配结果，才能检出旧选中索引误执行工作流的问题。
+  const realWorkflows = await (await fetch(`${WEB}/api/workflows`)).json().catch(() => [])
+  const state = { approvals: PENDING, offline: false, writes: [], workflows: [
+    ...realWorkflows,
+    { id: 'shell-settings-workflow', name: '设置流程说明', description: '设置相关流程', updated_at: ago(1000) },
+  ] }
   const { ctx, page } = await open({ state })
   await page.goto(`${WEB}/runs`)
   await waitNav(page)
@@ -428,7 +434,7 @@ await section('⌘K 命令面板', '\n=== ⌘K 命令面板 ===', async () => {
 
   await input.fill('设置')
   const first = dialog.locator('[role="option"][aria-selected="true"]')
-  check('搜「设置」第一项就是设置页', (await first.innerText()).startsWith('设置'), (await first.innerText()).split('\n')[0])
+  check('搜「设置」立即选中设置页，不能沿用旧结果索引', await first.getAttribute('data-command') === 'page:/settings', (await first.innerText()).split('\n')[0])
   await page.keyboard.press('Enter')
   check('回车跳过去、面板关掉', await page.waitForURL(/\/settings/, { timeout: 5000 }).then(() => true, () => false)
     && !(await dialog.isVisible()), page.url())

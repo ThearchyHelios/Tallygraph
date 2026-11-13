@@ -191,7 +191,9 @@ async def test_tool_node_writes_tool_and_query_entries(engine_up, shop):
     assert tool_entry == {"kind": "tool", "node_id": "fetch", "exec": 1, "artifact": end.data["artifact"], "tool": TOOL}
     assert query_entry == {"kind": "query", "node_id": "fetch", "exec": 1, "artifact": payload["artifact"],
                            "via": end.data["artifact"], "tool": TOOL, "source": "shop",
-                           "columns": ["gmv", "gmv_prev", "orders"], "rows": 1, "truncated": False}
+                           "columns": ["gmv", "gmv_prev", "orders"], "rows": 1, "truncated": False,
+                           # 实际执行的执行身份（K10）：逻辑查询是本节点，这一次按运行 + 节点 + 执行序号
+                           "query_id": "fetch", "execution_id": f"{row.id}:fetch#e1", "attempt": 1}
     assert await ledger(row.id) == [tool_entry, query_entry]
     snap = artifact_store.load(payload["artifact"])
     assert snap["rows"] == [[600.5, 300.0, 3]]

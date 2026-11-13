@@ -341,12 +341,33 @@ def _inversion_counts(n: int) -> list[int]:
     return counts
 
 
+_MAX_SCALE_BITS = 1024
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except OverflowError:
+        return math.inf if value > 0 else -math.inf
+
+
+def _safe_ratio_float(num: int, den: int) -> float:
+    try:
+        return num / den
+    except OverflowError:
+        return math.inf if (num > 0) == (den > 0) else -math.inf
+
+
 def _scaled(values: Sequence[Any]) -> tuple[list[int], int] | None:
-    """一组精确的数（整数、Fraction）乘上公分母换成整数：(整数, 公分母)。有浮点的为 None。两两相减、比大小在整数上做，
-    比 Fraction 快得多，结果一样。"""
+    """一组精确的数（整数、Fraction）乘上公分母换成整数：(整数, 公分母)。有浮点或公分母位宽过大的为 None。两两相减、比大小
+    在整数上做，比 Fraction 快得多，结果一样。"""
     if not all(isinstance(v, (int, Fraction)) and not isinstance(v, bool) for v in values):
         return None
-    scale = math.lcm(*(Fraction(v).denominator for v in values)) if values else 1
+    scale = 1
+    for v in values:
+        scale = math.lcm(scale, Fraction(v).denominator)
+        if scale.bit_length() > _MAX_SCALE_BITS:
+            return None
     return [int(Fraction(v) * scale) for v in values], scale
 
 
@@ -392,7 +413,7 @@ def theil_sen(xs: Sequence[Any], ys: Sequence[Any]) -> Any:
                 pairs.append((num, den) if den > 0 else (-num, -den))
     if not pairs:
         return None
-    keys = [num / den for num, den in pairs]
+    keys = [_safe_ratio_float(num, den) for num, den in pairs]
     order = sorted(range(len(pairs)), key=keys.__getitem__)
 
     def kth(k: int) -> Fraction:
@@ -421,7 +442,7 @@ _FAST_MEDIAN = 512
 def _kth(values: Sequence[Any], k: int) -> Any:
     """从小到大第 k 个（从 0 数），精确：Fraction 换成浮点是正确舍入的、单调的——浮点小的精确值一定小，排错的只可能是浮点
     相等的那几个，所以先按浮点排，再只把和第 k 个浮点相等的那一段按精确值排。"""
-    keyed = sorted((float(v), i) for i, v in enumerate(values))
+    keyed = sorted((_safe_float(v), i) for i, v in enumerate(values))
     pivot = keyed[k][0]
     lo, hi = k, k + 1
     while lo > 0 and keyed[lo - 1][0] == pivot:

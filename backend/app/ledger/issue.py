@@ -16,7 +16,9 @@
 - 那一版已发布、未退役；
 - 图里没有人工节点、不会写外部系统（apps/backfill.graph_side_effect，和按新口径补算同一个判断）：替人重跑一次的正式
   运行不该替人去审批、往外部系统写；
-- 补了缺省值之后表单校验通过（缺入口字段的照实说缺哪个）；
+- 补了缺省值之后表单校验通过（缺入口字段的照实说缺哪个）；这次的输入按参数完整性（ledger/params，各入口同一套）过一遍
+  取数模板：缺参数（含绑定出来的是空串——空串不是值）、未声明参数、值承载不了、认不出参数写在哪（混进了运行时变量、
+  参数写在表名或列名里）都不代填出具，明确不发那一条 SQL；
 - 权限（拍板 L5）：搭建者及以上（关登录时同）都可以；使用者只能按他有权使用的应用固定着的这一版出具（复用应用授权，
   apps/access），别的写「请搭建者出具」；都要读得到这次运行；
 - 当天没超上限（设置 ledger.issue_daily_limit，自动的、一键的合计）。
@@ -113,6 +115,8 @@ class Plan:
     granted_by_app: str | None = None
     #: 已经发起过的同一次（没失败的）
     existing: str | None = None
+    #: K07：这一版的发布依据（哪一版、哪份清单、什么身份）；读不出来时是 None
+    publication: dict[str, Any] | None = None
 
     @property
     def available(self) -> bool:
@@ -131,6 +135,9 @@ class Plan:
                                "caliber": self.caliber, "workflow_name": self.workflow_name, "how": self.how,
                                "level": self.level, "level_text": LEVEL_TEXT.get(str(self.level or ""), ""),
                                "available": self.available, "auto": self.available and self.auto_reason is None}
+        if self.publication is not None:
+            # K07：这一次出具会固定哪一份发布依据（清单、哪一版、什么身份）
+            out["publication"] = dict(self.publication)
         if self.reason:
             out["reason"] = self.reason
         elif self.auto_reason:
@@ -191,16 +198,11 @@ async def _starter(session: Any, run: Run) -> Any:
 
 
 async def _granting_app(session: Any, principal: Any, workflow_id: str, version: int) -> str | None:
-    """使用者能按这一版出具，靠的是哪个应用的授权：固定着这一版、他至少能使用的应用（apps/access）。没有为 None。"""
-    from app.apps.access import app_role, at_least
-    from app.apps.versions import pinning_apps
-    from app.db.models_apps import App
+    """使用者能按这一版出具，靠的是哪个应用的授权：固定着这一版、他至少能使用的应用（apps/access 的口径资产授权，和
+    组合式问数「我能用哪些口径」同一份判定）。没有为 None。"""
+    from app.apps.access import caliber_granting_app
 
-    for item in await pinning_apps(session, workflow_id, version):
-        app = await session.get(App, item["app_id"])
-        if app is not None and at_least(await app_role(session, principal, app), "use"):
-            return app.id
-    return None
+    return await caliber_granting_app(session, principal, workflow_id, version)
 
 
 async def plan_issue(session: Any, run: Run | None, content: dict[str, Any] | None, workflow_id: str, version: int, *,
@@ -208,9 +210,9 @@ async def plan_issue(session: Any, run: Run | None, content: dict[str, Any] | No
     """按 workflow_id@version 出具这次运行的打算（见模块说明）。content 是这次运行最新的比对工件内容（读不出为 None），
     hide 判一个绑定值是不是这次运行查到过的遮罩值。只读，不发起。"""
     from app.api.deps import can_read_run
-    from app.api.settings import ledger_settings
     from app.ledger import match as ledger_match
     from app.ledger.labels import caliber_key
+    from app.ledger.settings import ledger_settings
 
     plan = Plan(run_id=run.id if run else "", workflow_id=workflow_id, version=int(version),
                 caliber=caliber_key(workflow_id, int(version)), match_artifact=artifact)
@@ -251,15 +253,16 @@ async def plan_issue(session: Any, run: Run | None, content: dict[str, Any] | No
 
 async def check_target(session: Any, plan: Plan, workflow: Any, *, principal: Any, source_run: str) -> Plan | None:
     """按口径出具的那一版能不能发起（plan_issue 和召回待办的「按新版重新出具」共用，ledger/recall.reissue）：那一版已发布、
-    未退役；图里没有人工节点、不会写外部系统；入口字段的缺省值加上 plan.binding 过表单校验、能渲染进取数模板；使用者只能按
+    未退役；图里没有人工节点、不会写外部系统；入口字段的缺省值加上 plan.binding 过表单校验、再按参数完整性过一遍取数模板
+    （ledger/params：缺参数、未声明参数、承载不了的值、认不出参数写在哪的模板都拒）；使用者只能按
     他有权使用的应用固定着的这一版（拍板 L5）；同一个来源（source_run）、同一版、同一组参数发起过的交回那一次；当天没超
     上限。填好 plan 的 level、expect_hash、inputs、granted_by_app、existing；不能出具的写进 plan.refuse，交回 None。"""
-    from app.api.settings import ledger_settings
     from app.apps import versions as app_versions
     from app.apps.backfill import graph_side_effect
     from app.apps.forms import input_schema, validate_form
     from app.apps.resolve import input_key
     from app.ledger.derive import entry_fields
+    from app.ledger.settings import ledger_settings
 
     workflow_id, version = plan.workflow_id, plan.version
     if workflow is None:
@@ -277,6 +280,18 @@ async def check_target(session: Any, plan: Plan, workflow: Any, *, principal: An
         return None
     plan.level = row.level or plan.level
     plan.expect_hash = row.graph_hash
+    # 发布依据（K07）：按口径出具也是正式身份，和正式运行同一套判定——已接管到工作流上、且这一版走过新发布入口的
+    # 资产，必须有一份覆盖这一版定义/绑定/取数语义、matched、认证确认盖住全部指标的发布依据。**这里没有另一条给
+    # 正式身份的路**：真发起的还是 engine/launch.launch_run，那道门禁照样过一遍。
+    from app.apps import publications as caliber_publications
+
+    judged = await caliber_publications.judge(session, workflow, version=int(version),
+                                              purpose=caliber_publications.PURPOSE_ISSUE, snapshot=row)
+    if judged is not None:
+        plan.publication = judged.as_dict()
+        if (refusal := judged.refusal) is not None:
+            plan.refuse(f"这一版的发布依据还不够，不能按口径出具：{refusal[1]}", 409, refusal[0])
+            return None
     if reason := await graph_side_effect(session, row.graph, level=row.level):
         plan.refuse(SIDE_EFFECT.format(name=workflow.name, version=version, reason=reason))
         return None
@@ -287,13 +302,18 @@ async def check_target(session: Any, plan: Plan, workflow: Any, *, principal: An
     if errors := validate_form(input_schema(fields), values):
         plan.refuse(INPUTS.format(problems="；".join(e["message"] for e in errors)))
         return None
-    # 参数运行时要渲染进口径的 SQL 模板：写在引号里的不能带引号、裸写的只能是数（ledger/compose 同一个判断）
-    from app.ledger.compose import slot_contexts, value_problem
+    # 这次的输入要渲染进口径的 SQL 模板，按参数完整性过一遍（ledger/params，trial、组合式问数、派生各入口同一套）：
+    # 模板引用了入口没声明的字段、这次没有值（含绑定出来的是空串——空串不是值，是省略）、值承载不了（引号里带引号、
+    # 裸写的不是数）、认不出参数写在哪（入口字段和运行时变量混在一句里、参数写在表名或列名里）都不代填出具。最后那一种
+    # 在画布上写得出，但这一版固定下来渲染不出确定的语句，和 trial、组合式问数是同一个判断（口径那张卡自己的取数模板
+    # 这样写，在派生那一步就已经拒了，derive.load_pinned）。以前只查承载方式那一层、还把认不出写法的整条放过：缺参数会
+    # 按空串渲染，掺杂运行时变量的模板会照发——发起一次「少了条件」或语句已变的正式运行。
+    from app.ledger import params
 
-    contexts = slot_contexts([n for n in (row.graph or {}).get("nodes") or [] if n.get("type") == "tool"],
-                             strict=False)
-    if problem := next((p for k, v in values.items() if (p := value_problem(k, v, contexts.get(k, set())))), None):
-        plan.refuse(f"{problem}，不代填出具")
+    fetches = [n for n in (row.graph or {}).get("nodes") or [] if n.get("type") == "tool"]
+    if problems := params.check_nodes(fetches, fields=fields, values=values,
+                                      where=f"口径「{workflow.name}」v{version} 的入口"):
+        plan.refuse(f"{params.describe(problems)}，不代填出具")
         return None
     if principal.mode != "off" and not principal.at_least("builder"):
         plan.granted_by_app = await _granting_app(session, principal, workflow_id, int(version))
@@ -342,7 +362,7 @@ QUOTA = "ledger_issue"
 
 
 async def _hider(run_id: str) -> Any:
-    from app.api.evidence import _sealed
+    from app.engine.evidence_reader import load_sealed as _sealed
     from app.ledger.view import _hider as hider_of
 
     return (await hider_of(await _sealed(run_id))).hide
@@ -372,11 +392,13 @@ async def issue(run_id: str, workflow_id: str, version: int, *, principal: Any, 
 
             origin = {"source_run": run_id, **await _conversation_of(session, run), "caliber": plan.caliber,
                       "how": plan.how, "binding_hash": input_key(plan.binding), "match": plan.match_artifact,
-                      "auto": auto, **({"granted_by_app": plan.granted_by_app} if plan.granted_by_app else {})}
+                      "auto": auto, **({"granted_by_app": plan.granted_by_app} if plan.granted_by_app else {}),
+                      # K07：按哪一份发布依据出具（清单、版本、身份）——运行来源里保留，回看对得上
+                      **({"publication": plan.publication} if plan.publication else {})}
             actor = run.started_by if auto else principal.username
             # 先占一份今天的额度（库里带条件的加一，几个进程同时出具也正好到上限为止），发起不成退回
-            from app.api.settings import ledger_settings
             from app.cluster import quota
+            from app.ledger.settings import ledger_settings
 
             limit = int((await ledger_settings(session))["issue_daily_limit"])
             day = await quota.take(QUOTA, limit, seed=issued_today)
@@ -392,6 +414,16 @@ async def issue(run_id: str, workflow_id: str, version: int, *, principal: Any, 
             except BaseException:
                 await quota.give_back(QUOTA, day=day)
                 raise
+            try:
+                from app.ledger import usage as ledger_usage
+
+                await ledger_usage.record_use(
+                    session, workflow_id=workflow_id, version=int(version), how="issued", params=plan.inputs,
+                    run_id=run_id, actor=actor, auto=auto)
+                await session.commit()
+            except Exception:  # noqa: BLE001 - 审计是附加记录，正式运行已经发起，不能因此回滚
+                logger.warning("记录口径调用审计失败（来源运行 %s，口径 %s@%s）", run_id, workflow_id, version,
+                               exc_info=True)
             return launched, True
 
 

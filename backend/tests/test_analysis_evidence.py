@@ -578,7 +578,7 @@ def test_recheck_with_the_real_operators_says_a_sealed_result_holds():
     sealed = real_result(q)
     assert sealed["phrase"] == "销售额下降 194（-8.7%），主要来自华东（-120，占 61.9%）"
     out = analysis_recheck(sealed, store.get)
-    assert out == {"status": "same", "method": "decompose.additive@1", "text": "复算一致：按封存的输入重新计算，结论逐项相同"}
+    assert out == {"status": "same", "method": "decompose.additive@2", "text": "复算一致：按封存的输入重新计算，结论逐项相同"}
     assert analysis_recheck({**sealed, "hypothesis": "别的假设"}, store.get)["status"] == "same"
 
 
@@ -593,7 +593,7 @@ def test_recheck_follows_the_parent_of_a_drill_down_by_hash():
     assert analysis_recheck(child, store.get, load_result=store.get)["status"] == "same"
     # 上一层取不回：照实说取不回哪一份，不说两遍「复算」
     out = analysis_recheck(child, store.get, load_result=lambda sha: None)
-    assert out == {"status": "failed", "method": "decompose.additive@1", "text": "复算失败：取不回上一层的分析结论 A1"}
+    assert out == {"status": "failed", "method": "decompose.additive@2", "text": "复算失败：取不回上一层的分析结论 A1"}
 
 
 def test_recheck_says_what_differs_and_what_is_missing():
@@ -606,31 +606,47 @@ def test_recheck_says_what_differs_and_what_is_missing():
     assert out["text"] == "复算不一致：判定语和封存的不同"
     # 输入快照取不回（不在封存范围、哈希对不上的调用方都交 None）
     out = analysis_recheck(sealed, lambda sha: None)
-    assert out == {"status": "failed", "method": "decompose.additive@1", "text": "复算失败：取不回 Q2 的查询快照"}
+    assert out == {"status": "failed", "method": "decompose.additive@2", "text": "复算失败：取不回 Q2 的查询快照"}
     # 输入快照换了一份（同一个 sha256 交回了别的内容）：复算照样算，结果和封存的不同
     other = {**SNAPSHOT, "rows": [["华东", "W41", 820], ["华东", "W42", 650], *SNAPSHOT["rows"][2:]]}
     assert analysis_recheck(sealed, lambda sha: other)["status"] == "different"
+
+
+def test_recheck_says_the_phrase_template_was_upgraded(monkeypatch):
+    """说法模板升过版：复算按新模板渲染，旧结论改过的 phrase 不算差异，文字写明升过版；旧结论没记版本也照实说。"""
+    store = Store()
+    q = store.put(SNAPSHOT)
+    sealed = {**real_result(q), "phrase_version": 1, "phrase": "旧模板的判定语"}
+    monkeypatch.setattr("app.analysis.phrases.PHRASE_VERSION", 2)
+    out = analysis_recheck(sealed, store.get)
+    assert out == {"status": "same", "method": "decompose.additive@2", "phrase_version": 1, "phrase_now": 2,
+                   "text": "说法模板升过版（v1 → v2），复算结果相同"}
+    assert "fields" not in out
+    old = {k: v for k, v in sealed.items() if k != "phrase_version"}
+    out = analysis_recheck(old, store.get)
+    assert out["status"] == "same" and out["phrase_version"] is None and out["phrase_now"] == 2
+    assert out["text"] == "说法模板没有记录版本，现在是 v2，复算结果相同"
 
 
 def test_recheck_names_both_versions_when_the_method_was_upgraded(monkeypatch):
     store = Store()
     q = store.put(SNAPSHOT)
     sealed = real_result(q)
-    monkeypatch.setitem(contract.METHODS, ("decompose", "additive"), "decompose.additive@2")
+    monkeypatch.setitem(contract.METHODS, ("decompose", "additive"), "decompose.additive@3")
     out = analysis_recheck(sealed, store.get)
-    assert out == {"status": "same", "method": "decompose.additive@1", "method_now": "decompose.additive@2",
-                   "text": "运行时用的是 decompose.additive@1，现在是 decompose.additive@2，复算结果相同"}
+    assert out == {"status": "same", "method": "decompose.additive@2", "method_now": "decompose.additive@3",
+                   "text": "运行时用的是 decompose.additive@2，现在是 decompose.additive@3，复算结果相同"}
     out = analysis_recheck({**sealed, "phrase": "别的判定"}, store.get)
     assert out["status"] == "different" and out["fields"] == ["phrase"]
-    assert out["text"] == "运行时用的是 decompose.additive@1，现在是 decompose.additive@2，复算结果不同"
+    assert out["text"] == "运行时用的是 decompose.additive@2，现在是 decompose.additive@3，复算结果不同"
 
     def refuse(result, load, *, load_result=None):
         raise CallError("unknown_mode", "变化拆解要写模式：additive / ratio / factor")
 
     monkeypatch.setattr(analysis, "recompute", refuse)
     out = analysis_recheck(sealed, store.get)
-    assert out["status"] == "failed" and out["method_now"] == "decompose.additive@2"
-    assert out["text"] == ("运行时用的是 decompose.additive@1，现在是 decompose.additive@2：现在的方法按封存的输入复算不了"
+    assert out["status"] == "failed" and out["method_now"] == "decompose.additive@3"
+    assert out["text"] == ("运行时用的是 decompose.additive@2，现在是 decompose.additive@3：现在的方法按封存的输入复算不了"
                            "（变化拆解要写模式：additive / ratio / factor）")
 
 

@@ -32,8 +32,8 @@ NODE_TYPE = "analysis"
 #: 设置分组的键：settings 里的 analysis 一组、run.options["analysis"]
 SETTINGS_KEY = "analysis"
 
-Op = Literal["decompose", "baseline", "trend", "differ", "comparable"]
-OPS: tuple[str, ...] = ("decompose", "baseline", "trend", "differ", "comparable")
+Op = Literal["decompose", "baseline", "trend", "differ", "comparable", "reconcile", "cochange"]
+OPS: tuple[str, ...] = ("decompose", "baseline", "trend", "differ", "comparable", "reconcile", "cochange")
 #: 有模式的算子和它们的模式；其余算子 mode 为 None
 MODES: dict[str, tuple[str, ...]] = {
     "decompose": ("additive", "ratio", "factor"),
@@ -41,15 +41,17 @@ MODES: dict[str, tuple[str, ...]] = {
 }
 #: 每个算子（和模式）的方法名与版本：改算法就升版本号，结论里记下实际用的那一版
 METHODS: dict[tuple[str, str | None], str] = {
-    ("decompose", "additive"): "decompose.additive@1",
-    ("decompose", "ratio"): "decompose.ratio@1",
-    ("decompose", "factor"): "decompose.factor@1",
-    ("baseline", None): "baseline.robust@1",
-    ("trend", None): "trend.theil_sen_mk@1",
-    ("differ", "rate"): "differ.rate@1",
-    ("differ", "mean"): "differ.welch@1",
-    ("differ", "rows"): "differ.welch_rows@1",
-    ("comparable", None): "comparable@1",
+    ("decompose", "additive"): "decompose.additive@2",
+    ("decompose", "ratio"): "decompose.ratio@2",
+    ("decompose", "factor"): "decompose.factor@2",
+    ("baseline", None): "baseline.robust@2",
+    ("trend", None): "trend.theil_sen_mk@2",
+    ("differ", "rate"): "differ.rate@2",
+    ("differ", "mean"): "differ.welch@2",
+    ("differ", "rows"): "differ.welch_rows@2",
+    ("comparable", None): "comparable@2",
+    ("reconcile", None): "reconcile@1",
+    ("cochange", None): "cochange.mad@1",
 }
 #: agent 分析工具的名字（tools/builtin 里注册），一个算子一个工具：参数各自聚焦，模型少写错
 TOOL_NAMES: dict[str, str] = {op: f"analysis_{op}" for op in OPS}
@@ -57,6 +59,7 @@ TOOL_NAMES: dict[str, str] = {op: f"analysis_{op}" for op in OPS}
 #: （engine/labels 的 ANALYSIS_OP_LABEL / ANALYSIS_MODE_LABEL 引用这里）、「{叫法}没有做成」的判定语都用它（method_label 拼成一句）
 OP_LABELS: dict[str, str] = {
     "decompose": "变化拆解", "baseline": "波动基线", "trend": "趋势判断", "differ": "差异检验", "comparable": "可比性检查",
+    "reconcile": "跨源对账", "cochange": "伴随异动",
 }
 MODE_LABELS: dict[str, str] = {
     "additive": "可加", "ratio": "比率", "factor": "乘积", "rate": "比率", "mean": "均值", "rows": "逐行明细",
@@ -82,6 +85,8 @@ VERDICTS: dict[str, tuple[str, ...]] = {
     "trend": ("rising", "falling", "no_trend"),
     "differ": ("differs", "no_evidence"),
     "comparable": ("comparable", "conditional", "incomparable"),
+    "reconcile": ("aligned", "diverged", "missing_counterpart"),
+    "cochange": ("co_anomalous", "target_normal", "primary_normal"),
 }
 #: 算不了的原因（细案 01 §8.2）。算不了也记成结论：写作者可以照实写「历史只有 5 周，判断不了是否异常」。最后两种是分析卡
 #: 里随数据变化的调用错误记成的（analysis.run 的 refuse_data_errors，见 app/analysis 的 DATA_ERRORS）：parent_refused 上一层
@@ -312,6 +317,9 @@ class AnalysisResult(TypedDict, total=False):
     verdict: Verdict | None
     criterion: str            # 判定标准，一句，照实际阈值写
     phrase: str               # 判定语（app/analysis/phrases 渲染），[[a:A3]] 渲染成它
+    #: 渲染判定语时用的模板版本（app/analysis/phrases.PHRASE_VERSION）：版本不同时 phrase、caveats 不参与复算比较，
+    #: 旧结论没有这一项按没有记录版本算
+    phrase_version: int
     caveats: list[Caveat]
     hypothesis: str | None
 
@@ -436,8 +444,12 @@ FORMAT_CONVS: tuple[str, ...] = (CONV_PCT, CONV_POINTS)
 
 
 def same(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
-    """两份结论（封存的、复算的）是否逐字段相同（hypothesis 除外）。"""
+    """两份结论（封存的、复算的）是否逐字段相同（hypothesis 除外）。说法模板版本不同时，渲染出来的 phrase、caveats
+    和版本号本身都不比：改一句模板不该让旧结论报「复算不一致」；版本相同（两边都没有版本也算相同）仍严格比 phrase、
+    caveats。"""
     keys = (set(a) | set(b)) - NOT_RECOMPUTED
+    if a.get("phrase_version") != b.get("phrase_version"):
+        keys -= {"phrase", "caveats", "phrase_version"}
     return all(a.get(k) == b.get(k) for k in keys)
 
 

@@ -100,7 +100,7 @@ async def test_a_run_waiting_for_approval_can_be_abandoned(client):
     events = await _events(run_id)
     last = events[-1]
     assert last.type == "run.cancelled", [e.type for e in events[-3:]]
-    assert set(last.data["timing"]) == {"wall_ms", "active_ms", "wait_ms"}
+    assert set(last.data["timing"]) == {"wall_ms", "active_ms", "wait_ms", "queue_ms"}
     assert last.data.get("actor") == "审核员甲"
     verified = (await client.get(f"/api/runs/{run_id}/verify")).json()
     assert verified["sealed"] and verified["ok"], verified

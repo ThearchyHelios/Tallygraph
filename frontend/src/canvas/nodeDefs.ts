@@ -258,6 +258,11 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
         help: '需要审批时运行将暂停，请在运行面板或记录页的审批卡上处理',
       },
       {
+        key: 'investigation', label: '异常调查策略', type: 'json', advanced: true,
+        placeholder: '{"enabled":true,"max_rounds":2,"minimum_depth":1,"min_coverage":0.8}',
+        help: '发现异常或追问原因时继续调查。可设置是否启用、追加调查轮数、最低下钻深度和解释覆盖程度。查询仍受运行预算约束。',
+      },
+      {
         key: 'parallel_tools', label: '并行执行工具', type: 'switch', advanced: true,
         help: '默认关闭：每轮只调用一个工具，根据结果决定下一步。开启后每轮可同时调用多个工具，速度更快，'
           + '但同一批调用之间不会重新推理',
@@ -696,7 +701,11 @@ export const NODE_DEFS: Record<NodeType, NodeDef> = {
         when: (c) => !c.caliber_from,
       },
       { key: 'caliber_version', label: '口径版本', type: 'text', placeholder: 'v1', when: (c) => !c.caliber_from },
-      { key: 'metrics', label: '指标定义', type: 'metricsList', when: (c) => !c.caliber_from },
+      {
+        key: 'metrics', label: '指标定义', type: 'metricsList', when: (c) => !c.caliber_from,
+        help: '一条指标由定义卡（名称、同义词、单位、小数位、定义说明、负责人、生效日期）和计算组成。'
+          + '公式用表达式；外部常量直接给值；规则与评估按结构编辑。',
+      },
       {
         key: 'upgrade_policy', label: '上游发布新版本时', type: 'select', when: (c) => !!c.caliber_from,
         options: [

@@ -1,0 +1,191 @@
+{
+  "format": "agentlab-eval-suite",
+  "version": 1,
+  "exported_at": "2026-10-22T00:00:00+00:00",
+  "suite": {
+    "name": "跨源指标本体穿透题集",
+    "description": "配 tests/fixtures/acceptance/multi_source_ontology.py 的三源虚构制造库（ops_shift、equip_master、quality_scrap）与标准实体 production_line：覆盖契约越界穿透主数据失配（S1）、对账源断更早停（S2a）、量纲换算与超差对账（S2b）、切片定位加跨源设备停机伴随异动（S3），以及常规波动不误报（对照 1）、主指标异动但上游正常不乱归因（对照 2）。全部期望由 SQL 探针与平台确定性算子重算，零人工填数",
+    "timezone": "Asia/Shanghai",
+    "budget": {}
+  },
+  "cases": [
+    {
+      "seq": 1,
+      "kind": "ask",
+      "question": "为什么昨天 L3 产线的负荷率超过了 100%？请沿指标本体排查是不是关联主数据出了问题。",
+      "datasources": ["ops_shift", "equip_master"],
+      "tags": ["本体穿透", "S1", "契约越界", "主数据失配"],
+      "gold": {
+        "kind": "sql",
+        "datasource": "equip_master",
+        "sql": "SELECT equip_line_id AS 设备产线, rated_hourly_qty AS 额定每小时产量 FROM line_specs WHERE equip_line_id = 'EQ-L3'"
+      },
+      "expectations": [
+        {
+          "id": "stale_spec",
+          "kind": "scalar",
+          "column": "额定每小时产量",
+          "row": 0,
+          "label": "穿透定位到 EQ-L3 在设备主数据中的过期额定每小时产量"
+        },
+        {
+          "id": "inv_s1",
+          "kind": "investigation",
+          "status": "complete",
+          "minimum_depth": 1,
+          "min_ontology_hops": 1,
+          "diagnosis_stage": "ontology_penetration",
+          "label": "完成至少 1 跳跨源本体穿透定位因子分母"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 2,
+      "kind": "ask",
+      "question": "对比班次报工和质量报废台账，昨天各产线的报废数为什么对不上？是业务真变了还是数据源异常？",
+      "datasources": ["ops_shift", "quality_scrap"],
+      "tags": ["本体穿透", "S2a", "跨源对账", "数据源断更"],
+      "gold": {
+        "kind": "sql",
+        "datasource": "quality_scrap",
+        "sql": "SELECT workcenter_code AS 工作中心, scrap_units AS 报废件数 FROM scrap_ledger WHERE inspect_date = '{{ schedule.yesterday }}'"
+      },
+      "expectations": [
+        {
+          "id": "stalled_zero_rows",
+          "kind": "none",
+          "label": "质量报废台账昨天断更无记录（0 行）"
+        },
+        {
+          "id": "inv_s2a",
+          "kind": "investigation",
+          "status": "complete",
+          "require_source_health": true,
+          "diagnosis_stage": "health_and_contract",
+          "label": "先核查关联数据源健康度并在阶段一识别断更停止"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 3,
+      "kind": "ask",
+      "question": "核对昨天各产线能耗的抄表千瓦时与结算兆瓦时（1 兆瓦时 = 1000 千瓦时），换算后两侧对账是否一致？",
+      "datasources": ["ops_shift"],
+      "tags": ["本体穿透", "S2b", "跨源对账", "量纲换算"],
+      "gold": {
+        "kind": "sql",
+        "datasource": "ops_shift",
+        "sql": "SELECT line_code AS 产线, meter_kwh AS 抄表千瓦时, settled_mwh AS 结算兆瓦时 FROM energy_readings WHERE shift_date = '{{ schedule.yesterday }}' ORDER BY line_code"
+      },
+      "expectations": [
+        {
+          "id": "reconcile_energy",
+          "kind": "verdict",
+          "op": "reconcile",
+          "params": {
+            "by": ["产线"],
+            "measure": "抄表千瓦时",
+            "target_measure": "结算兆瓦时",
+            "unit_factor": 1000,
+            "label": "产线能耗"
+          },
+          "label": "按 1000 倍量纲换算后判定能耗对账存在显著超差"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 4,
+      "kind": "ask",
+      "question": "昨天产线综合合格产量明显下滑，请先拆解定位哪条产线拖累，再沿本体穿透上游设备数据源检验是否有同步异动。",
+      "datasources": ["ops_shift", "equip_master"],
+      "tags": ["本体穿透", "S3", "切片定位", "伴随异动"],
+      "gold": {
+        "kind": "sql",
+        "datasource": "equip_master",
+        "sql": "SELECT event_date AS 日期, net_run_ratio AS 有效运转率, unplanned_min AS 非计划停机分钟 FROM downtime_events WHERE equip_line_id = 'EQ-L2' AND event_date BETWEEN date('{{ schedule.yesterday }}', '-19 days') AND '{{ schedule.yesterday }}' ORDER BY event_date"
+      },
+      "expectations": [
+        {
+          "id": "cochange_l2",
+          "kind": "verdict",
+          "op": "cochange",
+          "params": {
+            "period": "日期",
+            "measure": "有效运转率",
+            "driver_measure": "非计划停机分钟",
+            "target": "{{ schedule.yesterday }}",
+            "label": "有效运转率"
+          },
+          "label": "EQ-L2 有效运转率下滑与非计划停机分钟飙升呈同期伴随异动"
+        },
+        {
+          "id": "inv_s3",
+          "kind": "investigation",
+          "status": "complete",
+          "minimum_depth": 1,
+          "min_ontology_hops": 1,
+          "require_source_health": true,
+          "diagnosis_stage": "ontology_penetration",
+          "label": "经健康核查后完成跨源本体穿透检验"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 5,
+      "kind": "ask",
+      "question": "昨天 L1 产线的合格产量比前一天略少一点，这算异常波动吗？",
+      "datasources": ["ops_shift"],
+      "tags": ["本体穿透", "对照", "常规波动"],
+      "gold": {
+        "kind": "sql",
+        "datasource": "ops_shift",
+        "sql": "SELECT shift_date AS 班次日期, good_qty AS 合格产量 FROM shift_output WHERE line_code = 'L1' AND shift_date BETWEEN date('{{ schedule.yesterday }}', '-19 days') AND '{{ schedule.yesterday }}' ORDER BY shift_date"
+      },
+      "expectations": [
+        {
+          "id": "normal_l1",
+          "kind": "verdict",
+          "op": "baseline",
+          "params": {
+            "period": "班次日期",
+            "measure": "合格产量",
+            "label": "L1合格产量"
+          },
+          "label": "L1 昨日波动处于历史常规波动带内，不误报异常"
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "seq": 6,
+      "kind": "ask",
+      "question": "三天前 L4 产线的有效运转率出现明显下滑，是不是上游设备非计划停机异常引起的？",
+      "datasources": ["ops_shift", "equip_master"],
+      "tags": ["本体穿透", "对照", "排除上游"],
+      "gold": {
+        "kind": "sql",
+        "datasource": "equip_master",
+        "sql": "SELECT event_date AS 日期, net_run_ratio AS 有效运转率, unplanned_min AS 非计划停机分钟 FROM downtime_events WHERE equip_line_id = 'EQ-L4' AND event_date BETWEEN date('{{ schedule.yesterday }}', '-21 days') AND date('{{ schedule.yesterday }}', '-2 days') ORDER BY event_date"
+      },
+      "expectations": [
+        {
+          "id": "upstream_normal_l4",
+          "kind": "verdict",
+          "op": "cochange",
+          "params": {
+            "period": "日期",
+            "measure": "有效运转率",
+            "driver_measure": "非计划停机分钟",
+            "label": "有效运转率"
+          },
+          "label": "主指标超出常规波动但同期设备非计划停机处于常规波动范围内（target_normal）"
+        }
+      ],
+      "enabled": true
+    }
+  ]
+}

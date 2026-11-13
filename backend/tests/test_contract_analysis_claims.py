@@ -2,7 +2,7 @@
 
 - 分析说法：出口按报告文档记下的那一项独立再核一遍（verify_doc）。strict 有违规记一条缺口（降档），报告节点报上来的同一条
   不重复收；check 只写进出具声明（analysis_claims，counted 为 false），不影响档位；没记这一项的老文档不核
-- 可比性：报告引用了的、契约必需的指标两期不可比记缺口（降档），有条件可比的只写进出具声明（comparability）
+- 可比性：报告引用了的、契约必需的指标两期不可比或有条件可比都记缺口（降档），并写进出具声明（comparability）
 - 血缘：报告引用的指标（[[m:]] 片段、句末 [[see:m:…]]）输入追不到原始数据的，受管级别的正式运行记缺口，其余写进出具声明的
   untraced（counted 为 false）
 """
@@ -190,7 +190,7 @@ def test_the_exit_policy_takes_the_stricter_of_the_doc_and_the_node():
 # --------------------------------------------------------------------------
 
 
-def test_comparability_gaps_only_for_incomparable_metrics():
+def test_comparability_gaps_for_incomparable_and_conditional_metrics():
     metrics = [
         {"id": "wow", "name": "环比增幅", "comparability": {"verdict": "incomparable", "phrase": "两期不可比：本期只有 3 天数据",
                                                        "reasons": ["本期只有 3 天数据"], "artifact": "c" * 64}},
@@ -200,7 +200,7 @@ def test_comparability_gaps_only_for_incomparable_metrics():
         {"id": "orders", "name": "订单数"},
     ]
     gaps, declared = _comparability(metrics + metrics[:1])
-    assert gaps == ["指标「环比增幅」两期不可比：本期只有 3 天数据"]
+    assert gaps == ["指标「环比增幅」两期不可比：本期只有 3 天数据", "指标「客单价」两期有条件可比：两段的周末天数不同：4 天对 6 天"]
     assert [(d["metric"], d["verdict"]) for d in declared] == [("wow", "incomparable"), ("aov", "conditional")]
     assert declared[0]["reasons"] == ["本期只有 3 天数据"] and declared[0]["artifact"] == "c" * 64
 
@@ -222,7 +222,7 @@ def comparability(monkeypatch):
     return marks
 
 
-async def test_a_cited_incomparable_metric_degrades_and_a_conditional_one_is_noted(monkeypatch, comparability):
+async def test_a_cited_incomparable_or_conditional_metric_degrades(monkeypatch, comparability):
     comparability["wow"] = {"verdict": "incomparable", "phrase": "两期不可比：本期只有 3 天数据",
                             "reasons": ["本期只有 3 天数据"]}
     writes(monkeypatch, "本周销售额 [[m:gmv]]，环比 [[m:wow]]。[[see:m:gmv,m:wow]]")
@@ -231,7 +231,7 @@ async def test_a_cited_incomparable_metric_degrades_and_a_conditional_one_is_not
     assert [c["metric"] for c in issuance["comparability"]] == ["wow"]
     comparability["wow"] = {"verdict": "conditional", "phrase": "两期有条件可比：两段的周末天数不同"}
     issuance = await issued(weekly())
-    assert issuance["tier"] == "formal" and issuance["comparability"][0]["verdict"] == "conditional"
+    assert issuance["tier"] == "degraded" and issuance["comparability"][0]["verdict"] == "conditional"
 
 
 async def test_an_incomparable_metric_nobody_cites_or_requires_is_left_alone(monkeypatch, comparability):

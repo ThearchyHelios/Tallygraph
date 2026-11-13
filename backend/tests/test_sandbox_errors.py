@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sys
 import types
 
 import pytest
@@ -72,6 +73,10 @@ def test_a_process_that_cannot_spawn_has_no_class_name(backend, monkeypatch) -> 
 
 
 def _microvm(monkeypatch) -> MicroVMSandbox:
+    sdk = types.ModuleType("microsandbox")
+    sdk.ExecTimeoutError = TimeoutError
+    monkeypatch.setitem(sys.modules, "microsandbox", sdk)
+
     async def nothing(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
         return None
 

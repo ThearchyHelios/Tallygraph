@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useNavigate, type NavigateFunction } from 'react-router-dom'
+import { useShallow } from 'zustand/react/shallow'
 import {
   ArchiveRestore, ArrowLeft, Check, MessageSquarePlus, PanelLeftClose, PanelLeftOpen, Pencil, RotateCw, Search,
   Trash2, X,
@@ -30,9 +31,19 @@ import type { Conversation } from '../types'
  * 对话，过了那几秒就该还有地方找回来。真正的删除只在回收站里做，而且要确认。
  */
 export function ConversationList() {
-  const { list, trash, showTrash, currentId, loading, error, load, create, rename, archive, restore, setShowTrash } =
-    useConversations()
-  const byConversation = useChat((s) => s.byConversation)
+  const list = useConversations((s) => s.list)
+  const trash = useConversations((s) => s.trash)
+  const showTrash = useConversations((s) => s.showTrash)
+  const currentId = useConversations((s) => s.currentId)
+  const loading = useConversations((s) => s.loading)
+  const error = useConversations((s) => s.error)
+  const load = useConversations((s) => s.load)
+  const create = useConversations((s) => s.create)
+  const rename = useConversations((s) => s.rename)
+  const archive = useConversations((s) => s.archive)
+  const restore = useConversations((s) => s.restore)
+  const setShowTrash = useConversations((s) => s.setShowTrash)
+  const runtimeByConv = useConversationRuntime()
   const forget = useChat((s) => s.forget)
   const navigate = useNavigate()
   // 相对时间和分组一分钟重算一次就够：「刚刚」「3 分钟前」不需要更细
@@ -164,10 +175,10 @@ export function ConversationList() {
           <section key={g.label} aria-label={g.label}>
             <div className="px-2 pb-0.5 pt-2.5 text-2xs text-faint">{g.label}</div>
             {g.items.map((c) => {
-              const turns = byConversation[c.id]
               // 取回内存的以内存为准（它是这一刻的）；没打开过的看列表接口带来的最后一轮状态
-              const live = turns ? liveStatus(turns) : listStatus(c)
-              const running = stillRunning(c, turns)
+              const mem = runtimeByConv[c.id]
+              const live = mem !== undefined ? (mem.split(':')[0] || null) : listStatus(c)
+              const running = mem !== undefined ? mem.endsWith(':1') : c.last_status === 'running'
               const active = c.id === currentId
               const when = c.last_active_at ?? c.created_at
               return (
@@ -312,9 +323,12 @@ function TrashView({ items, currentId, onBack }: {
 }) {
   const navigate = useNavigate()
   const emptyTrash = useConversations((s) => s.emptyTrash)
-  const byConversation = useChat((s) => s.byConversation)
+  const runtimeByConv = useConversationRuntime()
   const sorted = useMemo(() => [...items].sort((a, b) => stamp(b) - stamp(a)), [items])
-  const idle = items.filter((c) => !stillRunning(c, byConversation[c.id]))
+  const idle = items.filter((c) => {
+    const mem = runtimeByConv[c.id]
+    return mem !== undefined ? !mem.endsWith(':1') : c.last_status !== 'running'
+  })
 
   const emptyAll = async () => {
     // 确认框开着的时候谁又跑起来了，以点确认那一刻为准，所以挑两次
@@ -376,9 +390,9 @@ function TrashView({ items, currentId, onBack }: {
           const active = c.id === currentId
           const title = c.title || '新对话'
           const when = c.last_active_at ?? c.created_at
-          const turns = byConversation[c.id]
-          const live = turns ? liveStatus(turns) : listStatus(c)
-          const running = stillRunning(c, turns)
+          const mem = runtimeByConv[c.id]
+          const live = mem !== undefined ? (mem.split(':')[0] || null) : listStatus(c)
+          const running = mem !== undefined ? mem.endsWith(':1') : c.last_status === 'running'
           return (
             <div key={c.id}
                  className={clsx('group relative mb-0.5 rounded-lg text-xs',
@@ -501,6 +515,16 @@ const listStatus = (c: Conversation): string | null => (c.last_status && LIST_ST
  */
 export function stillRunning(c: Conversation, turns: ChatTurn[] | undefined): boolean {
   return turns ? !!busyTurn(turns) : c.last_status === 'running'
+}
+
+function useConversationRuntime(): Record<string, string> {
+  return useChat(useShallow((s) => {
+    const out: Record<string, string> = {}
+    for (const [id, turns] of Object.entries(s.byConversation)) {
+      out[id] = `${liveStatus(turns) ?? ''}:${busyTurn(turns) ? 1 : 0}`
+    }
+    return out
+  }))
 }
 
 export const RUNNING_NO_DELETE = '该对话正在运行，请先停止再删除'

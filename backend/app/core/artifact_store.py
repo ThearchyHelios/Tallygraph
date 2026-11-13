@@ -38,6 +38,26 @@ def graph_hash(graph: dict[str, Any]) -> str:
     return content_hash(canonical_json(slim))
 
 
+def execution_content(graph: dict[str, Any]) -> dict[str, Any]:
+    """执行定义的规范形式。历史 graph_hash 保持原算法，以便复验已封存证据。"""
+    from app.engine.schema import GraphSpec
+
+    spec = GraphSpec.model_validate(graph)
+    return {
+        "schema_version": 1,
+        "defaults": spec.defaults,
+        "nodes": sorted([{"id": n.id, "type": n.type.value, "data": n.data.model_dump()}
+                         for n in spec.nodes], key=lambda n: n["id"]),
+        "edges": sorted([{"source": e.source, "target": e.target, "sourceHandle": e.sourceHandle,
+                          "targetHandle": e.targetHandle} for e in spec.edges], key=canonical_json),
+    }
+
+
+def execution_hash(graph: dict[str, Any]) -> str:
+    """布局、选中态和边的显示标签不改变执行身份。"""
+    return content_hash(canonical_json(execution_content(graph)))
+
+
 def _path_of(artifact_id: str) -> Path:
     # 按前两位分桶，避免单目录塞几万个文件
     return settings.data_dir / "artifacts" / artifact_id[:2] / f"{artifact_id}.json"
@@ -56,31 +76,38 @@ async def put_json(
     幂等：同内容重复写只落一次盘；同一工件被多个 run 引用时，
     数据库里各记一行引用（溯源需要知道"谁产出的"），文件只有一份。
     """
+    from sqlalchemy.exc import IntegrityError
+
+    from app.cluster.mutex import lock
     from app.db.base import SessionLocal
     from app.db.models import Artifact
 
     text = canonical_json(obj)
     artifact_id = content_hash(text)
     path = _path_of(artifact_id)
-    if not path.exists():
-        # 原子落盘（core/atomic）：写一半崩了不会留下半个工件；临时文件名带随机后缀，两个进程同时写同一份内容
-        # 各写各的，不会一个把另一个写到一半的截断（以前共用 <id>.tmp，后到的会把先到的半成品改名成正式文件）
-        atomic.write_text(path, text)
+    async with lock(f"artifact:{artifact_id[:2]}"):
+        if not path.exists():
+            # 原子落盘（core/atomic）：写一半崩了不会留下半个工件；临时文件名带随机后缀，两个进程同时写同一份内容
+            # 各写各的，不会一个把另一个写到一半的截断；且与同分桶的 forget 互斥，不会刚写下就被并发回收删掉
+            atomic.write_text(path, text)
 
-    async with SessionLocal() as session:
-        existing = await session.get(Artifact, (artifact_id, run_id or ""))
-        if existing is None:
-            session.add(
-                Artifact(
-                    id=artifact_id,
-                    run_id=run_id or "",
-                    kind=kind,
-                    node_id=node_id,
-                    size=len(text.encode()),
-                    meta=meta or {},
+        async with SessionLocal() as session:
+            existing = await session.get(Artifact, (artifact_id, run_id or ""))
+            if existing is None:
+                session.add(
+                    Artifact(
+                        id=artifact_id,
+                        run_id=run_id or "",
+                        kind=kind,
+                        node_id=node_id,
+                        size=len(text.encode()),
+                        meta=meta or {},
+                    )
                 )
-            )
-            await session.commit()
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    await session.rollback()
     return artifact_id
 
 
@@ -128,27 +155,35 @@ async def forget(ids: Any) -> list[str]:
     读到错的内容。"""
     from sqlalchemy import select
 
+    from app.cluster.mutex import lock
     from app.db.base import SessionLocal
     from app.db.models import Artifact
 
     wanted = sorted({i for i in ids or () if isinstance(i, str) and i and i.isalnum()})
     if not wanted:
         return []
-    async with SessionLocal() as session:
-        kept: set[str] = set()
-        for start in range(0, len(wanted), 500):
-            chunk = wanted[start:start + 500]
-            kept |= set((await session.execute(select(Artifact.id).where(Artifact.id.in_(chunk)))).scalars())
-    removed: list[str] = []
+    by_bucket: dict[str, list[str]] = {}
     for artifact_id in wanted:
-        if artifact_id in kept:
-            continue
-        path = _path_of(artifact_id)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            continue
-        removed.append(artifact_id)
+        by_bucket.setdefault(artifact_id[:2], []).append(artifact_id)
+
+    removed: list[str] = []
+    for bucket in sorted(by_bucket):
+        bucket_ids = by_bucket[bucket]
+        async with lock(f"artifact:{bucket}"):
+            async with SessionLocal() as session:
+                kept: set[str] = set()
+                for start in range(0, len(bucket_ids), 500):
+                    chunk = bucket_ids[start:start + 500]
+                    kept |= set((await session.execute(select(Artifact.id).where(Artifact.id.in_(chunk)))).scalars())
+            for artifact_id in bucket_ids:
+                if artifact_id in kept:
+                    continue
+                path = _path_of(artifact_id)
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    continue
+                removed.append(artifact_id)
     return removed
 
 

@@ -495,6 +495,34 @@ async def remove(session: AsyncSession, principal: Any, file_id: str) -> None:
     await _drop_unreferenced(session, {sha})
 
 
+async def release_runs(session: AsyncSession, run_ids: Any) -> set[str]:
+    """运行被删除时，解除没有绑定到记录表的上传文件登记，返回待检查回收的 sha256 集合（不提交；提交后调 drop_unreferenced）。"""
+    ids = sorted({str(r) for r in run_ids or () if r})
+    if not ids:
+        return set()
+    shas: set[str] = set()
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        rows = list((await session.execute(
+            select(StoredFile.id, StoredFile.sha256).where(StoredFile.bound_run_id.in_(chunk), _NO_RECORD)
+        )).all())
+        if rows:
+            shas |= {sha for _, sha in rows}
+            await session.execute(
+                delete(StoredFile).where(StoredFile.id.in_([fid for fid, _ in rows]))
+                .execution_options(synchronize_session=False)
+            )
+    return shas
+
+
+async def drop_unreferenced(shas: set[str]) -> int:
+    """在独立会话里检查并删除已无任何 StoredFile 引用的物理文件与文本缓存。"""
+    if not shas:
+        return 0
+    async with SessionLocal() as session:
+        return await _drop_unreferenced(session, shas)
+
+
 async def _drop_unreferenced(session: AsyncSession, shas: set[str]) -> int:
     """这些内容没有任何登记引用了就删文件（连同抽出的文字缓存）。返回删了几个。"""
     if not shas:

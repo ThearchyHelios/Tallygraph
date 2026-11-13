@@ -59,9 +59,9 @@ from app.db.base import SessionLocal, current_owner, utcnow
 
 logger = logging.getLogger(__name__)
 
-#: 发起一轮的几种方式：ask 新问；retry 重试本轮（带着上一次的原因重建）；rerun 原图重新运行；max_steps 放宽步数重新运行；
-#: run 只建了图、用户点「运行」；continue 从断点接着跑（失败的、服务重启挂起的）；resume 接着等这一轮的那次运行、复核收尾
-MODES = ("ask", "retry", "rerun", "max_steps", "run", "continue", "resume")
+#: 发起一轮的几种方式：ask 新问；retry 重试本轮（带着上一次的原因重建）；escalate 沿本体排查关联数据源升级重跑；rerun 原图重新运行；
+#: max_steps 放宽步数重新运行；run 只建了图、用户点「运行」；continue 从断点接着跑（失败的、服务重启挂起的）；resume 接着等这一轮的那次运行、复核收尾
+MODES = ("ask", "retry", "escalate", "rerun", "max_steps", "run", "continue", "resume")
 #: 复核之后会自动重来的方式（用户点的「重新运行」「跑一下」「继续运行」照以前不自动重来）
 AUTO_RETRY_MODES = ("ask", "retry")
 #: 并发类别（第 2 波按它给上限和优先级）
@@ -153,8 +153,8 @@ class ChatDriver(TurnDriver):
         from app.api.copilot import GenerateIn
 
         return GenerateIn(instruction=instruction, base_graph=base_graph, intent="answer",
-                          conversation_id=self.execution.conversation_id, datasource_ids=self.datasource_ids or None,
-                          question=self.question)
+                          conversation_id=self.execution.conversation_id, turn_id=self.execution.turn_id,
+                          datasource_ids=self.datasource_ids or None, question=self.question)
 
     async def on_op(self, op: dict[str, Any]) -> None:
         kind = op.get("op")
@@ -197,7 +197,7 @@ class ChatDriver(TurnDriver):
         from app.chat import turn as policy
 
         # 换下来的那次运行交出去并进 earlier；这一次从「还没有运行」起，收尾时不再把它当这一次的运行记一遍
-        run, self.last_run = (self.last_run if kind == "review" else None), None
+        run, self.last_run = (self.last_run if kind in ("review", "escalation") else None), None
         await self.execution.retrying(reason, kind=kind, base=policy.has_nodes(base_graph), attempt=self.turn.attempts,
                                       run=run, detail=detail)
 
@@ -214,13 +214,19 @@ class ChatDriver(TurnDriver):
         from app.api.deps import restricted
         from app.chat.launch import ChatRunRefused, user_chat_run
         from app.engine.launch import LaunchRefused
+        from app.chat.optimization import prepare
 
-        args: dict[str, Any] = {"actor": self.execution.actor, "origin_kind": "chat",
+        graph = prepare(graph, self.question)
+
+        args: dict[str, Any] = {"graph": graph, "actor": self.execution.actor, "origin_kind": "chat",
                                 "origin": {"conversation_id": self.execution.conversation_id,
                                            "turn_id": self.execution.turn_id}}
         if restricted():
             try:
-                args["memory_scope"], args["options"] = user_chat_run(graph, self.execution.actor)
+                # 第三项是这次要发起的图：使用者的口径查询工具由 chat/launch 补上（有授权的口径那一份），
+                # drive._launch 认 args 里的 graph，发起用的是补过的那一张（见 chat/launch 模块说明）
+                args["memory_scope"], args["options"], args["graph"] = await user_chat_run(
+                    session, graph, self.execution.actor)
             except ChatRunRefused as e:
                 raise LaunchRefused(403, str(e)) from e
         return args
@@ -410,7 +416,14 @@ class ChatTurnExecution(runtime.JobRun):
             return
         set_principal(principal)
         scope = [s.get("id") for s in self.request.get("scope") or [] if isinstance(s, Mapping) and s.get("id")]
-        driver = self.driver = ChatDriver(self, question=row.question, datasource_ids=scope)
+        req_depth = str(self.request.get("depth") or "").strip().lower()
+        if req_depth == "fast" and self.mode != "escalate":
+            from app.chat.direct import DirectChatDriver
+
+            driver: ChatDriver = DirectChatDriver(self, question=row.question, datasource_ids=scope)
+        else:
+            driver = ChatDriver(self, question=row.question, datasource_ids=scope)
+        self.driver = driver
         driver.turn.attempts = int(job.attempt or 0)
         retry = self.mode in AUTO_RETRY_MODES
         graph = row.graph if policy.has_nodes(row.graph) else None
@@ -422,7 +435,7 @@ class ChatTurnExecution(runtime.JobRun):
                 graph = record.with_max_steps(graph, int(self.request.get("max_steps") or 0))
                 await self.save(graph=graph)
             await driver.drive(graph=graph, retry=False)
-        elif self.mode == "retry":
+        elif self.mode in ("retry", "escalate"):
             await driver.drive(instruction=str(self.request.get("instruction") or row.question),
                                base_graph=graph if self.request.get("base") else None)
         else:
@@ -680,7 +693,7 @@ def _timing(request: Mapping[str, Any]) -> dict[str, Any]:
 
 
 async def _queries(run_id: str | None) -> int | None:
-    """这次运行查了几次库（db_query 的每一次调用，同页面的 countQueries）。"""
+    """这次运行查了几次库（db_query / metric_query / caliber_query 的每一次调用，同页面的 countQueries）。"""
     from app.core.events import EventType
     from app.db.models import RunEvent
 
@@ -689,7 +702,15 @@ async def _queries(run_id: str | None) -> int | None:
     async with SessionLocal() as session:
         rows = (await session.execute(select(RunEvent.data).where(
             RunEvent.run_id == run_id, RunEvent.type == EventType.TOOL_START))).scalars().all()
-    return sum(1 for d in rows if isinstance(d, dict) and str(d.get("tool") or "").startswith("db_query"))
+    return sum(
+        1
+        for d in rows
+        if isinstance(d, dict)
+        and (
+            str(d.get("tool") or "").startswith("db_query")
+            or str(d.get("tool") or "") in ("metric_query", "caliber_query")
+        )
+    )
 
 
 async def _rejected_by(run_id: str) -> dict[str, Any]:
@@ -807,7 +828,13 @@ async def _settled(driver: ChatDriver, execution: ChatTurnExecution
     output = run.output if isinstance(run.output, dict) else {}
     review = driver.last_review if driver.late_review is None else None
     rewritten = (review or {}).get("answer") if (review or {}).get("verdict") != "ok" else None
-    fields.update(status="done", answer=rewritten or record.answer_text(output), review=review or {})
+    answer = rewritten or record.answer_text(output)
+    if (term.get("execution") or {}).get("run_id") and term.get("explanation"):
+        # 这一轮的运行是**生成这一轮里就跑完的固定执行**（chat/turn.NEXT_DONE）：运行照常归属这一轮、能重载查看（上面那一段），
+        # 但它的成果不是自由生成的报告（服务端按固定口径搭的那张图），答案用 final 里那句白话——使用者看到的数与说法就是
+        # api/copilot 投影出来的那一份（builder 的详细依据、user 的安全白话都在里面）
+        answer = str(term["explanation"])
+    fields.update(status="done", answer=answer, review=review or {})
     meta.update(issuance=record.slim_issuance(output.get("_issuance")),
                 evidence=True if record.has_evidence(output) else None)
     return fields, meta, "done", output, usage
@@ -881,7 +908,7 @@ async def hold_conversation(session: AsyncSession, conversation_id: str, *, touc
 
 async def start(session: AsyncSession, *, conversation: Any, question: str, datasource_ids: list[str] | None,
                 actor: str | None, mode: str | None = None, retry_of: Any = None,
-                max_steps: int | None = None) -> str:
+                max_steps: int | None = None, depth: str | None = None) -> str:
     """发起一轮（新问，或者对已有的一轮重试、重新运行、继续运行、接着收尾）。交回这一轮的 id（conversation_turns.id）。
 
     新问：建 conversation_turns 那一行（同 POST /api/conversations/{id}/turns）和任务。已有的一轮：上一次的结局归档进
@@ -920,7 +947,7 @@ async def start(session: AsyncSession, *, conversation: Any, question: str, data
     try:
         turn_id, stale_run = await _claim(session, conversation=conversation, question=question,
                                           datasource_ids=datasource_ids, actor=actor, mode=mode, retry_of=retry_of,
-                                          max_steps=max_steps)
+                                          max_steps=max_steps, depth=depth)
     except BaseException:
         await session.rollback()
         if continued:
@@ -953,7 +980,8 @@ async def start(session: AsyncSession, *, conversation: Any, question: str, data
 
 
 async def _claim(session: AsyncSession, *, conversation: Any, question: str, datasource_ids: list[str] | None,
-                 actor: str | None, mode: str, retry_of: Any, max_steps: int | None) -> tuple[str, str | None]:
+                 actor: str | None, mode: str, retry_of: Any, max_steps: int | None,
+                 depth: str | None = None) -> tuple[str, str | None]:
     """在一个事务里核对、写轮次、排队、写这一次尝试的第一条事件，提交。交回 (这一轮的 id, 提交之后要取消的挂起旧运行)。"""
     from app.api.conversations import new_turn, turn_run_id
     from app.chat import turn as policy
@@ -974,8 +1002,16 @@ async def _claim(session: AsyncSession, *, conversation: Any, question: str, dat
     if retry_of is None:
         scope = await _scope(session, datasource_ids)
         row = await new_turn(session, conversation, question)
-        row.meta = {"v": 1, **({"scope": scope} if scope else {}), "at": now_ms}
+        clean_depth = depth if depth in ("fast", "deep") else None
+        row.meta = {
+            "v": 1,
+            **({"scope": scope} if scope else {}),
+            **({"depth": clean_depth} if clean_depth else {}),
+            "at": now_ms,
+        }
         request["scope"] = scope
+        if clean_depth:
+            request["depth"] = clean_depth
         job = ChatTurnJob(id=row.id, conversation_id=conversation.id, status="queued", mode=mode, request=request,
                           principal=principal_snapshot(), actor=actor, started_at=None)
         session.add(job)
@@ -990,6 +1026,10 @@ async def _claim(session: AsyncSession, *, conversation: Any, question: str, dat
         if job is not None and job.status in runtime.ACTIVE:
             raise TurnRefused(409, BUSY, TURN_BUSY)
         meta = dict(row.meta or {}) if isinstance(row.meta, dict) else {}
+        prev_depth = meta.get("depth") if meta.get("depth") in ("fast", "deep") else None
+        effective_depth = "deep" if mode == "escalate" else (depth if depth in ("fast", "deep") else prev_depth)
+        if effective_depth:
+            request["depth"] = effective_depth
         scope = await _scope(session, datasource_ids) if datasource_ids is not None else list(meta.get("scope") or [])
         request["scope"] = scope
         run_id = turn_run_id(row)
@@ -1027,13 +1067,27 @@ async def _claim(session: AsyncSession, *, conversation: Any, question: str, dat
                 archived = record.attempt_record(row, meta, n=len(attempts) + 1,
                                                  at_ms=int(row.updated_at.timestamp() * 1000) if row.updated_at else now_ms)
                 attempts.append(archived)
+                switching_mode = prev_depth != effective_depth and effective_depth in ("fast", "deep")
                 if mode == "retry":
-                    reason = record.attempt_reason(archived)
-                    request["base"] = graphful
-                    request["instruction"] = policy.user_retry_instruction(row.question, reason, graphful)
+                    if switching_mode:
+                        # 快速直查 ⇄ 深度分析切换：不沿用异构底图，按原问题重新完整执行目标模式
+                        request["base"] = False
+                        request["instruction"] = row.question
+                    else:
+                        reason = record.attempt_reason(archived)
+                        request["base"] = graphful
+                        request["instruction"] = policy.user_retry_instruction(row.question, reason, graphful)
+                elif mode == "escalate":
+                    esc = ((row.review or {}).get("anomaly_escalation") or {}) if isinstance(row.review, dict) else {}
+                    reason = str(esc.get("reason") or record.attempt_reason(archived) or "指标触发异常")
+                    request["base"] = graphful and prev_depth != "fast"
+                    request["instruction"] = str(
+                        esc.get("follow_up_instruction")
+                        or policy.escalation_instruction(row.question, reason, graphful and prev_depth != "fast")
+                    )
             usage = record.retire_run(meta.get("usage"))
             new_meta = {"v": 1, "attempts": attempts or None, "scope": scope or None, "usage": usage or None,
-                        "runId": None, "at": now_ms}
+                        "depth": effective_depth, "runId": None, "at": now_ms}
             if mode == "run":
                 # 「跑一下」不是重来：这一轮还没有答过，别的照旧
                 new_meta = {**meta, "runId": None, "at": now_ms, "asked": meta.get("asked")}
@@ -1061,6 +1115,7 @@ async def _claim(session: AsyncSession, *, conversation: Any, question: str, dat
     seq = await turn_log.add(session, turn_id, "turn.attempt", {
         "mode": mode, "attempts": attempts, "scope": request.get("scope") or [], "usage": usage_now or {},
         "started_ms": request.get("started_ms"),
+        **({"depth": request["depth"]} if request.get("depth") else {}),
         **({"ended_ms": request["ended_ms"]} if request.get("ended_ms") else {}),
         **({"max_steps": request["max_steps"]} if request.get("max_steps") else {})})
     await session.execute(update(ChatTurnJob).where(ChatTurnJob.id == turn_id).values(attempt_seq=seq)

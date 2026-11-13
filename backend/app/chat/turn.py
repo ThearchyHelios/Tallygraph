@@ -10,7 +10,7 @@
 - retry_after_review：复核之后要不要带着原图重来一次；
 - retry_instruction：重来时交给助手的那句话（两种措辞）。
 
-接口把决定交给问数据页：/copilot/generate-stream 的 final 带 next（run | ready | fail），error 带 next（retry | fail），
+接口把决定交给问数据页：/copilot/generate-stream 的 final 带 next（run | ready | done | fail），error 带 next（retry | fail），
 /copilot/review 的结果带 retry_instruction（要重来时是那句话，不重来是 null）。问数据页照后端给的走；老后端没有这两个字段时退回它自己那份同样的
 规则（tests/test_chat_turn_policy.py 逐条对照两边的常量和措辞）。评测（第 3 波）用同一组函数把一轮串起来。
 
@@ -26,9 +26,9 @@ from typing import Any
 #: 一轮最多自动试几次（含第一次）：第二次还不行多半是问题本身没说清，该让用户介入（同 chat.ts 的 MAX_ATTEMPTS）
 MAX_ATTEMPTS = 2
 
-#: final 之后的三种走法（final.next）：运行、只建不跑（摆着等用户点运行）、判失败（没过检查的图不拿去跑）
-NEXT_RUN, NEXT_READY, NEXT_FAIL = "run", "ready", "fail"
-NEXT_STEPS = (NEXT_RUN, NEXT_READY, NEXT_FAIL)
+#: final 之后的四种走法（final.next）：运行、只建不跑（摆着等用户点运行）、这一轮已经有了跑完的运行（固定执行）、判失败
+NEXT_RUN, NEXT_READY, NEXT_DONE, NEXT_FAIL = "run", "ready", "done", "fail"
+NEXT_STEPS = (NEXT_RUN, NEXT_READY, NEXT_DONE, NEXT_FAIL)
 #: 别的结局：直接回答了（reply）、助手反问了等用户答（asked）、重来一次（retry：没自查过的老服务端交来没过检查的图，或者
 #: 生成过程一个操作都没给）
 NEXT_REPLY, NEXT_ASKED, NEXT_RETRY = "reply", "asked", "retry"
@@ -63,6 +63,23 @@ EMPTY_FALLBACK = "这次请直接按输出格式给出操作（每行一个 JSON
 RETRY_USER_WITH_BASE = ("这个工作流上一次没有给出可用的结果：{reason}。\n\n"
                         "请针对这个原因改它（比如调大最大步数、改正工具参数、换个查询方式），"
                         "改完继续回答原来的问题：{question}")
+#: 简单查数命中硬异常信号时，界面提供的一键本体排查提示按钮文案与升级重跑指令（P1）
+ESCALATION_BUTTON_LABEL = "指标触发异常，沿本体排查关联数据源"
+ESCALATION_WITH_BASE = (
+    "上一次回答「{question}」时触发了指标或数据异常：{reason}。\n\n"
+    "请升级为跨源本体穿透排查工作流（input → agent → report → output）："
+    "给 agent 绑定 ontology_neighbors、source_health、caliber_query 及分析工具（analysis_comparable、"
+    "analysis_baseline、analysis_trend、analysis_decompose、analysis_differ、analysis_reconcile、analysis_cochange），"
+    "按「先调 ontology_neighbors 找已确认关联口径并调 source_health / analysis_reconcile 验数据源健康（发现断更、缺口、"
+    "量级断崖或单位错位即早停归因数据故障并引用 [[h:H1]] / [[a:A1]]）→ 若触发数值契约越界则核查 factor 构成因子与跨库主数据 → "
+    "若源健康通过则同源 decompose 锁定异常实体切片后沿标准实体桥调 caliber_query + analysis_cochange 检验上游驱动同步异动"
+    "（严禁把统计共变写成确定因果）」排查异常并给出可核验报告。"
+)
+ESCALATION_FROM_SCRATCH = (
+    "{question}\n\n（指标结果触发异常：{reason}。请沿业务本体排查关联口径与关联数据源健康：搭 input → agent → report → output，"
+    "绑定 ontology_neighbors、source_health、caliber_query 与分析工具，先验源健康与跨源对账，再查构成因子与跨源驱动，"
+    "报告引用 [[h:]] / [[a:]] 证据。）"
+)
 
 
 def _blockers(final: Mapping[str, Any]) -> list[str]:
@@ -77,9 +94,11 @@ def next_step(terminal: Mapping[str, Any] | None, *, self_checked: bool = True) 
     - reply：直接回答，这一轮到此为止；只有反问：等用户回答；
     - error：生成过程一个操作都没给（code 是 EMPTY_GENERATION）时重来一次（retry，次数由调用方按 MAX_ATTEMPTS 管，原因
       取 error_reason），别的判失败；
-    - final：有 error 级问题时，服务端已经自查过（收到过 check 的结论）就判失败——没过的问题已经交回模型在同一轮里改过
-      了，再整轮重来是再烧一次完整生成、改的还是同一批问题；没自查过（老服务端）才重来一次（retry）；模型说不运行
-      （autorun=false：用户要的是流程本身、或者问了用户）只建不跑；其余运行。
+    - final：这一轮的运行**已经在生成这一轮里跑完了**（固定执行的 final 带 execution.run_id，app/ledger/nlchange 的两条
+      接缝）就是 NEXT_DONE——不发起第二次，收下那次运行（chat/drive.TurnDriver 把 run_id 记进这一轮）；有 error 级问题时，
+      服务端已经自查过（收到过 check 的结论）就判失败——没过的问题已经交回模型在同一轮里改过了，再整轮重来是再烧一次完整
+      生成、改的还是同一批问题；没自查过（老服务端）才重来一次（retry）；模型说不运行（autorun=false：用户要的是流程本身、
+      或者问了用户）只建不跑；其余运行。
     """
     if terminal is None:
         return NEXT_ASKED
@@ -90,11 +109,22 @@ def next_step(terminal: Mapping[str, Any] | None, *, self_checked: bool = True) 
         return NEXT_RETRY if terminal.get("code") in RETRY_ERRORS else NEXT_FAIL
     if kind != "final":
         return NEXT_FAIL
+    # 这一轮的运行已经跑完了：运行已经发生，不能再按 ready / run 解释一遍（见 _completed_run）
+    if _completed_run(terminal):
+        return NEXT_DONE
     if _blockers(terminal):
         return NEXT_FAIL if self_checked else NEXT_RETRY
     if terminal.get("autorun") is False:
         return NEXT_READY
     return NEXT_RUN
+
+
+def _completed_run(terminal: Mapping[str, Any]) -> str | None:
+    """生成这一轮里就跑完的那次运行（final.execution.run_id）；不是固定执行那一档、没有运行 id 时为 None。"""
+    execution = terminal.get("execution")
+    if not isinstance(execution, Mapping):
+        return None
+    return str(execution.get("run_id") or "") or None
 
 
 def error_reason(error: Mapping[str, Any]) -> str:
@@ -174,13 +204,29 @@ def user_retry_instruction(question: str, reason: str, has_base: bool) -> str:
     return template.format(question=question, reason=reason)
 
 
+def escalation_instruction(question: str, reason: str, has_base: bool) -> str:
+    """指标触发硬异常信号后，沿业务本体排查关联数据源的诊断升级指令（P1）。"""
+    template = ESCALATION_WITH_BASE if has_base else ESCALATION_FROM_SCRATCH
+    return template.format(question=question, reason=reason)
+
+
+def escalate_after_review(review: Mapping[str, Any] | None, attempt: int) -> bool:
+    """异常自动升级模式（anomaly_escalation_mode == 'auto'）下最多自动升级 1 轮（attempt == 0）。"""
+    if not review or attempt != 0:
+        return False
+    esc = review.get("anomaly_escalation")
+    return isinstance(esc, Mapping) and bool(esc.get("available")) and bool(esc.get("auto_escalate"))
+
+
 def has_nodes(graph: Any) -> bool:
     """一张图有没有节点（有才交回去改）。"""
     return isinstance(graph, Mapping) and bool(graph.get("nodes"))
 
 
-__all__ = ["EMPTY_FALLBACK", "EMPTY_GENERATION", "MAX_ATTEMPTS", "NEXT_ASKED", "NEXT_FAIL", "NEXT_READY",
+__all__ = ["EMPTY_FALLBACK", "EMPTY_GENERATION", "ESCALATION_BUTTON_LABEL", "ESCALATION_FROM_SCRATCH",
+           "ESCALATION_WITH_BASE", "MAX_ATTEMPTS", "NEXT_ASKED", "NEXT_DONE", "NEXT_FAIL", "NEXT_READY",
            "NEXT_REPLY", "NEXT_RETRY", "NEXT_RUN", "NEXT_STEPS", "QUESTION_FIELD", "RETRY_EMPTY", "RETRY_ERRORS",
            "RETRY_FROM_SCRATCH", "RETRY_USER_WITH_BASE", "RETRY_WITH_BASE", "blocked_reason",
-           "empty_retry_instruction", "error_reason", "fill_input", "has_nodes", "next_step", "retry_after_review",
+           "empty_retry_instruction", "error_reason", "escalate_after_review", "escalation_instruction",
+           "fill_input", "has_nodes", "next_step", "retry_after_review",
            "retry_instruction", "review_reason", "user_retry_instruction"]

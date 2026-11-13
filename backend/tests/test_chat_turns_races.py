@@ -172,7 +172,7 @@ async def test_the_job_manager_does_not_start_a_turn_twice(client, monkeypatch, 
     gate = asyncio.Event()
     es.use_copilot(monkeypatch, Counting(source["name"], gate=gate, mode="reply"))
     conversation_id = await _conversation(client)
-    turn_id = await _ask(client, conversation_id)
+    turn_id = await _ask(client, conversation_id, datasource_ids=[source["id"]])
     await _stage(turn_id, "build")
     first = chat_job.manager._runs[turn_id]
     assert chat_job.manager.start(turn_id) is False, "还在跑的同一轮不起第二个"

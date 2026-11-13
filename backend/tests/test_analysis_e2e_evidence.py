@@ -70,7 +70,7 @@ async def test_a_card_conclusion_opens_and_rechecks_everywhere(monkeypatch, shop
         judged = body["chain"][0]
         assert (judged["origin"], judged["item"]) == ("card", "where")
         again = next(s for s in body["chain"] if s["step"] == "analysis_recompute")
-        assert again["status"] == "same" and again["method"] == "decompose.additive@1", again
+        assert again["status"] == "same" and again["method"] == "decompose.additive@2", again
         inputs = [s for s in body["chain"] if s["step"] == "analysis_input"]
         assert [s["role"] for s in inputs] == ["headline_base", "headline_target", "data"]
         assert all(s["sealed"] for s in inputs)
@@ -157,8 +157,8 @@ async def test_a_metric_comparability_opens_and_rechecks_everywhere(monkeypatch,
         view = body["chain"][0]["comparability"]
         # 表里只有周次这一列文字、没有业务日期：窗口长度、整期、星期构成核对不了，不判不可比
         assert (view["verdict"], view["phrase"], view["reasons"]) == (
-            "comparable", "两期可比，窗口长度、整期、星期构成核对不了", [])
-        assert view["sealed"] is True and view["hash_ok"] is True and view["method"] == "comparable@1"
+            "conditional", "两期有条件可比：窗口长度、整期、星期构成核对不了", [])
+        assert view["sealed"] is True and view["hash_ok"] is True and view["method"] == "comparable@2"
         steps = view["steps"]
         assert [s["step"] for s in steps] == ["analysis", "analysis_method", "analysis_calc", "analysis_input",
                                              "analysis_input", "analysis_recompute", "analysis_seal"]

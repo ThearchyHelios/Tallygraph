@@ -33,7 +33,9 @@ export function Composer({ hero, onFocusChange }: {
 }) {
   const nodes = useStudio((s) => s.nodes)
   const copilot = useStudio((s) => s.copilot)
-  const { runCopilot, stopCopilot, retryCopilot } = useStudio()
+  const runCopilot = useStudio((s) => s.runCopilot)
+  const stopCopilot = useStudio((s) => s.stopCopilot)
+  const retryCopilot = useStudio((s) => s.retryCopilot)
   const providers = useCatalog((s) => s.providers)
   const tools = useCatalog((s) => s.tools)
   // 数据源和检查器挑工具读的是 catalog 里同一份（数据页改了会 reload）。停用的助手看不见，不算

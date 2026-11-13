@@ -485,6 +485,11 @@ def test_old_postgres_databases_get_the_missing_columns_and_indexes(scratch_pg):
         for cid, at in (("c1", "2026-01-01"), ("c2", "2026-01-02")):
             conn.execute(text("INSERT INTO conversations (id, kind, archived, last_active_at) "
                               "VALUES (:i, 'app', false, :at)"), {"i": cid, "at": at})
+        # 加发布依据这一列（K07）之前建的库：这张表少「发布时要不要证明」这一列，而且它定过义：回填 false
+        conn.execute(text("CREATE TABLE workflow_publications (id VARCHAR PRIMARY KEY, workflow_id VARCHAR, "
+                          "version BIGINT, level VARCHAR, manifest VARCHAR)"))
+        conn.execute(text("INSERT INTO workflow_publications (id, workflow_id, version, level, manifest) "
+                          "VALUES ('p1', 'w1', 1, 'published', 'm1')"))
         db_base._migrate(conn)
         db_base._migrate(conn)
         runs = _columns(conn, "runs")
@@ -498,6 +503,10 @@ def test_old_postgres_databases_get_the_missing_columns_and_indexes(scratch_pg):
         assert conn.execute(text("SELECT trigger_kind FROM schedules")).scalar_one() == "cron"
         indexes = {r[0] for r in conn.execute(text("SELECT indexname FROM pg_indexes WHERE tablename = 'runs'"))}
         assert {"ix_runs_schedule_id", "ix_runs_wf_ver_status"} <= indexes
+        # 补上的布尔列：类型是 boolean、缺省是 false（SQLite 的 0 换成 false），存量行回填 false 而不是 NULL
+        publications = _columns(conn, "workflow_publications")
+        assert publications["required"][0] == "boolean" and publications["required"][1].startswith("false")
+        assert conn.execute(text("SELECT required FROM workflow_publications WHERE id = 'p1'")).scalar_one() is False
         # 同一个人在同一个应用里两段没归档的助手对话：created_by 是迁移补上的列（NULL 不受约束），唯一索引照样建上
         convs = {r[0] for r in conn.execute(text("SELECT indexname FROM pg_indexes WHERE tablename = 'conversations'"))}
         assert "ux_conversations_app_owner" in convs

@@ -47,11 +47,17 @@ export function paramSpecs(op: AnalysisOp, mode?: string | null): ParamSpec[] {
     }
     case 'comparable':
       return [...PERIODS, col('measure'), { key: 'grain', kind: 'grain' }]
+    case 'reconcile':
+      return [cols('by'), cols('target_by'), col('measure'), col('target_measure'), val('unit_factor'), val('label')]
+    case 'cochange':
+      return [col('period'), col('target_period'), col('measure'), col('driver_measure'), val('target'),
+        { key: 'basis', kind: 'basis' }, { key: 'grain', kind: 'grain' }, { key: 'lag', kind: 'int' }, val('label')]
   }
 }
 
-/** 这种分析能不能写成基期、本期两份查询（DecomposeArgs、ComparableArgs 有 base_query / target_query） */
-export const allowsTwoQueries = (op: AnalysisOp): boolean => op === 'decompose' || op === 'comparable'
+/** 这种分析能不能写成两份查询（DecomposeArgs、ComparableArgs、ReconcileArgs、CochangeArgs 有 base_query / target_query） */
+export const allowsTwoQueries = (op: AnalysisOp): boolean =>
+  op === 'decompose' || op === 'comparable' || op === 'reconcile' || op === 'cochange'
 /** 有总数核对（headline）的：可加、比率的变化拆解 */
 export const allowsHeadline = (op: AnalysisOp, mode?: string | null): boolean =>
   op === 'decompose' && mode !== 'factor'

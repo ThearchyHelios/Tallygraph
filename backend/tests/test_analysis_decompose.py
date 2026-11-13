@@ -40,7 +40,7 @@ def _rows(base: dict, target: dict) -> list[list]:
 
 async def test_a_driver_is_named_with_its_share_and_the_whole_shape_is_filled():
     result = await additive(label="销售额", hypothesis="华东拖累")
-    assert result["method"] == "decompose.additive@1" and result["status"] == "ok"
+    assert result["method"] == "decompose.additive@2" and result["status"] == "ok"
     assert result["verdict"] == {"code": "driver", "subjects": [["华东"]], "direction": "down"}
     assert result["phrase"] == "销售额下降 194（-8.7%），主要来自华东（-120，占 61.9%）"
     assert result["values"]["delta_total"] == "-194" and result["values"]["top_key"] == "华东"

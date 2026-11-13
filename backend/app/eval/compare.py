@@ -31,10 +31,10 @@ CAUSES = ("data", "method", "params", "path", "unknown")
 CAUSE_LABEL = {"data": "数据变", "method": "做法变", "params": "只参数变", "path": "路径变", "unknown": "说不清"}
 #: 指纹里比的几项和叫法
 FINGERPRINT_LABEL = {"assistant_model": "助手模型", "writer_model": "写作模型", "catalog": "目录快照",
-                     "analysis_tools": "分析工具", "prompt": "提示词", "schemas": "表结构", "cases": "题目",
-                     "scorer_version": "评分规则", "analysis": "分析设置"}
+                     "analysis_tools": "分析工具", "ontology_tools": "本体穿透", "prompt": "提示词", "schemas": "表结构",
+                     "cases": "题目", "scorer_version": "评分规则", "analysis": "分析设置"}
 #: 指纹里照实写前后两边的几项（别的只说变没变）
-_SHOWN = ("assistant_model", "writer_model", "catalog", "analysis_tools", "scorer_version")
+_SHOWN = ("assistant_model", "writer_model", "catalog", "analysis_tools", "ontology_tools", "scorer_version")
 NO_DIFFERENCE = "这批题上看不出差别"
 SIGNIFICANT = 0.05
 #: 基准能是哪几种状态
@@ -130,18 +130,20 @@ def transitions(base: Sequence[Mapping[str, Any]], target: Sequence[Mapping[str,
     return {"counts": counts, "causes": causes, "items": items}
 
 
-def _tools(fingerprint: Mapping[str, Any]) -> str:
-    """分析工具这一项给人看的样子：开 / 关。加这一项之前的评测指纹里没有它，那时一直开着。"""
+def _tools(fingerprint: Mapping[str, Any], key: str = "analysis_tools") -> str:
+    """分析工具、本体穿透这一项给人看的样子：开 / 关。加这一项之前的评测指纹里没有它，那时一直开着。"""
     from app.eval.variants import ANALYSIS_TOOLS_LABEL
 
-    return ANALYSIS_TOOLS_LABEL["off" if fingerprint.get("analysis_tools") == "off" else "on"]
+    return ANALYSIS_TOOLS_LABEL["off" if fingerprint.get(key) == "off" else "on"]
 
 
 def fingerprint_diff(base: Mapping[str, Any], target: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """两次之间指纹里哪几项变了：[{key, label, before, after}]（表结构、题目只说变没变，不展开；分析工具写开、关）。"""
+    """两次之间指纹里哪几项变了：[{key, label, before, after}]（表结构、题目只说变没变，不展开；分析工具、本体穿透写开、关）。"""
     out = []
     for key, label in FINGERPRINT_LABEL.items():
-        a, b = (_tools(base), _tools(target)) if key == "analysis_tools" else (base.get(key), target.get(key))
+        a, b = ((_tools(base, key), _tools(target, key))
+                if key in ("analysis_tools", "ontology_tools")
+                else (base.get(key), target.get(key)))
         if a == b:
             continue
         item: dict[str, Any] = {"key": key, "label": label}

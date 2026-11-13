@@ -1,7 +1,7 @@
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { ArrowLeft, Search } from 'lucide-react'
 import { Kbd } from '../components/ui'
-import { openCommandPalette } from '../components/CommandPalette'
+import { openCommandPalette } from '../components/shellCommands'
 import { usePageTitle } from '../lib/notify'
 
 /**

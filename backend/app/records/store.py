@@ -46,15 +46,29 @@ NAME_MAX = 64
 _KEY = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 #: 列名里不许出现的字符：引号（拼进 SQL 的标识符）、控制字符
 _BAD_NAME = re.compile(r"[\"`\[\]\x00-\x1f\x7f]")
-#: 所有写入（建表、加列、追加）共用的锁。写都是几毫秒的短事务，不按表分锁也不会互相拖住
+#: 所有写入（建表、加列、追加）按文件路径/表键分锁；保留 _WRITE_LOCK 供直接引用方兜底
 _WRITE_LOCK = threading.Lock()
+_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: dict[str, threading.Lock] = {}
 
 
-def write_lock() -> Any:
+def _path_lock(path: Path) -> threading.Lock:
+    key = os.path.realpath(os.fspath(path))
+    with _LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PATH_LOCKS[key] = lock
+        return lock
+
+
+def write_lock(table_key: str | None = None) -> Any:
     """跨进程的写锁（app/cluster/mutex：PostgreSQL 时是咨询锁，SQLite 只有一个进程、就是本进程的锁）。异步的调用方在把写入
-    放进线程之前持着它（async with）。"""
+    放进线程之前持着它（async with）。给 table_key 时按表分锁，不同记录表的写入互不阻塞。"""
     from app.cluster import mutex
 
+    if table_key and _KEY.match(table_key):
+        return mutex.lock(f"records-store:{table_key}")
     return mutex.lock("records-store")
 
 
@@ -137,6 +151,19 @@ def table_path(table_key: str, version: int) -> Path:
     return records_root() / f"{table_key}.v{version}.db"
 
 
+def archive_path(table_key: str) -> Path:
+    """data/records/<table_key>.archive.db：超过 SQLite 挂库上限的早期版本按物理表 rows_v<version> 增量汇总在这里。"""
+    if not _KEY.match(table_key or ""):
+        raise ValueError("记录表的键格式不对")
+    return records_root() / f"{table_key}.archive.db"
+
+
+def archive_table_name(version: int) -> str:
+    if not isinstance(version, int) or version < 1:
+        raise ValueError("记录表的版本号需要是正整数")
+    return f"rows_v{version}"
+
+
 def _q(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
@@ -146,10 +173,20 @@ def _lit(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.Error:
+        pass
+
+
 def _rw(path: Path) -> sqlite3.Connection:
     if not path.is_file():
         raise RecordsRefused("records.table_missing", "记录表的数据文件不见了，请联系管理员")
-    return open_checked_sqlite(str(path), readonly=False)
+    conn = open_checked_sqlite(str(path), readonly=False)
+    _enable_wal(conn)
+    return conn
 
 
 def _ro(path: Path) -> sqlite3.Connection:
@@ -166,15 +203,18 @@ def _ro(path: Path) -> sqlite3.Connection:
 def create_file(path: Path, columns: list[Column]) -> None:
     """新建一个表版本的文件。路径上已有文件时：没有任何行（上次建了一半、登记没提交）就重建，有行就拒绝——
     有数据的文件绝不覆盖。"""
-    with _WRITE_LOCK:
+    with _path_lock(path):
         if path.exists():
             if _row_count(path) > 0:
                 raise RecordsRefused("records.file_exists", f"记录表文件 {path.name} 已经有数据，不能重建")
             path.unlink()
+            for suffix in ("-wal", "-shm"):
+                Path(f"{path}{suffix}").unlink(missing_ok=True)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.tmp-{new_id()[:12]}")
         conn = open_checked_sqlite(str(tmp), readonly=False)
         try:
+            _enable_wal(conn)
             business = "".join(f", {_q(c.name)} {COLUMN_TYPES[c.type]}" for c in columns)
             conn.execute(
                 f"CREATE TABLE {_q(TABLE)} ("
@@ -193,7 +233,7 @@ def add_columns(path: Path, columns: list[Column]) -> None:
     """兼容的改动（只加可选字段）：在同一个版本上 ALTER TABLE ADD COLUMN。已有的列跳过（重做一次也没事）。"""
     if not columns:
         return
-    with _WRITE_LOCK:
+    with _path_lock(path):
         conn = _rw(path)
         try:
             have = {str(r[1]).lower() for r in conn.execute(f"PRAGMA table_info({_q(TABLE)})")}
@@ -326,7 +366,7 @@ def append(path: Path, columns: list[Column], values: Any, *, version: int, run_
     missing = [c.label or c.name for c in columns if c.required and row[c.name] in (None, "")]
     if missing:
         raise RecordsRefused("records.required_missing", f"必填的字段没有值：{'、'.join(missing)}")
-    with _WRITE_LOCK:
+    with _path_lock(path):
         conn = _rw(path)
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -411,7 +451,7 @@ def union_compatible(new: Column, old: Column) -> bool:
 
 
 def view_select(columns: list[Column], *, high_water: int | None, scope: str, viewer: str | None,
-                schema: str = "main", present: list[Column] | None = None) -> str:
+                schema: str = "main", present: list[Column] | None = None, table: str = TABLE) -> str:
     """临时视图（和看板、记录列表）看到的那一份：
 
     - _seq ≤ 高水位（None 为不限，现在有的都算）；
@@ -430,7 +470,7 @@ def view_select(columns: list[Column], *, high_water: int | None, scope: str, vi
             else f"NULL AS {_q(c.name)}"
 
     cols = ", ".join([*(f"r.{_q(n)}" for n in SYSTEM_COLUMNS), *(pick(c) for c in columns)])
-    src = f"{_q(schema)}.{_q(TABLE)}"
+    src = f"{_q(schema)}.{_q(table)}"
     where = []
     if high_water is not None:
         seq = int(high_water)
@@ -449,11 +489,96 @@ def view_select(columns: list[Column], *, high_water: int | None, scope: str, vi
 @dataclass(frozen=True)
 class OlderVersion:
     """跨版本汇总时并进来的一个旧表版本：挂在查询连接上的库名（ATTACH … AS schema）、那一版的业务列、这次查询的高水位
-    （None 为不限）。"""
+    （None 为不限），以及该版本所在的物理表名（直接挂库时是 records，超挂库上限汇总进归档库时是 rows_v<version>）。"""
 
     schema: str
     columns: list[Column]
     high_water: int | None
+    table: str = TABLE
+
+
+@dataclass(frozen=True)
+class ArchiveSpec:
+    """需要增量同步进单库多物理表归档（<table_key>.archive.db）的旧版本描述。"""
+
+    version: int
+    path: str
+    columns: list[Column]
+
+
+def sync_archive(table_key: str, specs: list[ArchiveSpec] | tuple[ArchiveSpec, ...]) -> Path:
+    """把超挂库上限的旧版本增量同步进单库多物理表归档文件（rows_v<version>），规避 SQLite 最多 10 个 ATTACH 库的限制。
+
+    行只追加、不修改：已同步到相同列结构且 _seq 无新增的版本 O(1) 跳过；退役前发起的在途运行补写了新行时，只复制
+    _seq > meta_max_seq 的增量行。"""
+    dest = archive_path(table_key)
+    if not specs:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with _path_lock(dest):
+        arch = open_checked_sqlite(str(dest), readonly=False)
+        try:
+            _enable_wal(arch)
+            arch.execute(
+                "CREATE TABLE IF NOT EXISTS _archive_meta ("
+                "version INTEGER PRIMARY KEY, max_seq INTEGER NOT NULL, col_sig TEXT NOT NULL)"
+            )
+            meta = {
+                int(r[0]): (int(r[1]), str(r[2]))
+                for r in arch.execute("SELECT version, max_seq, col_sig FROM _archive_meta").fetchall()
+            }
+            dirty = False
+            for spec in specs:
+                src_file = Path(spec.path)
+                if not src_file.is_file():
+                    continue
+                src = _ro(src_file)
+                try:
+                    info = [(str(r[1]), str(r[2] or "TEXT")) for r in src.execute(f"PRAGMA table_info({_q(TABLE)})")
+                            if str(r[1]) != ACTION_KEY_COLUMN]
+                    src_max = int(src.execute(f"SELECT coalesce(max(_seq), 0) FROM {_q(TABLE)}").fetchone()[0] or 0)
+                    sig = json.dumps(info, ensure_ascii=False)
+                    tbl = archive_table_name(spec.version)
+                    prev = meta.get(spec.version)
+                    if prev is not None and prev[1] == sig and prev[0] == src_max:
+                        continue
+                    col_names = [name for name, _ in info]
+                    select_cols = ", ".join(_q(n) for n in col_names)
+                    placeholders = ", ".join("?" for _ in col_names)
+                    if prev is None or prev[1] != sig:
+                        arch.execute(f"DROP TABLE IF EXISTS {_q(tbl)}")
+                        ddl_cols = ", ".join(
+                            "_seq INTEGER PRIMARY KEY" if name == "_seq" else f"{_q(name)} {col_type}"
+                            for name, col_type in info
+                        )
+                        arch.execute(f"CREATE TABLE {_q(tbl)} ({ddl_cols})")
+                        arch.execute(f"CREATE INDEX ix_{tbl}_supersedes ON {_q(tbl)} (_supersedes)")
+                        arch.execute(f"CREATE INDEX ix_{tbl}_submitted_by ON {_q(tbl)} (_submitted_by)")
+                        since_seq = 0
+                    else:
+                        since_seq = prev[0]
+                    cur = src.execute(
+                        f"SELECT {select_cols} FROM {_q(TABLE)} WHERE _seq > ? ORDER BY _seq ASC",
+                        (since_seq,),
+                    )
+                    insert_sql = f"INSERT OR REPLACE INTO {_q(tbl)} ({select_cols}) VALUES ({placeholders})"
+                    while batch := cur.fetchmany(500):
+                        arch.executemany(insert_sql, batch)
+                    arch.execute(
+                        "INSERT OR REPLACE INTO _archive_meta (version, max_seq, col_sig) VALUES (?, ?, ?)",
+                        (spec.version, src_max, sig),
+                    )
+                    dirty = True
+                finally:
+                    src.close()
+            if dirty:
+                arch.commit()
+        except BaseException:
+            arch.rollback()
+            raise
+        finally:
+            arch.close()
+    return dest
 
 
 def view_prelude(columns: list[Column], *, high_water: int | None, scope: str, viewer: str | None,
@@ -465,7 +590,7 @@ def view_prelude(columns: list[Column], *, high_water: int | None, scope: str, v
     列照这一版的来，旧版本没有的列补 NULL；每一版各按自己的高水位、自己文件里的更正判，行级过滤同一个。"""
     parts = [view_select(columns, high_water=high_water, scope=scope, viewer=viewer)]
     parts += [view_select(columns, high_water=o.high_water, scope=scope, viewer=viewer, schema=o.schema,
-                          present=o.columns) for o in older]
+                          present=o.columns, table=o.table) for o in older]
     return (f"DROP VIEW IF EXISTS temp.{_q(TABLE)}",
             f"CREATE TEMP VIEW {_q(TABLE)} AS " + " UNION ALL ".join(parts))
 

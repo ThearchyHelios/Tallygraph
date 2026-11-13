@@ -24,7 +24,6 @@ from app.engine.evidence import (
     ledger_enabled,
     make_eid,
     next_exec,
-    query_entry_fields,
     schema_ledger_entry,
 )
 from app.engine.expressions import CellError, cell_value, column_kind, locate_cell, numeric_text, same_value
@@ -50,18 +49,25 @@ from app.providers.factory import (
 )
 from app.engine.sql_problems import event_checks
 from app.data import catalog_view
+from app.data.source_health import ledger_entry as health_ledger_entry
+from app.ledger.querycore import CALIBER_QUERY
 from app.tools.analysis import (
     REFUSED_CODE as ANALYSIS_REFUSED,
     SCOPE_KEY as ANALYSIS_SCOPE_KEY,
     AnalysisScope,
     call_error_text,
     event_view,
+    health_event_view,
+    health_payload_of,
+    health_reply_text,
     input_snapshot,
     is_analysis_tool,
     payload_of,
+    record_ontology_call,
     reply_text,
     run_snapshot,
 )
+from app.tools.ontology import ONTOLOGY_TOOLS, SOURCE_HEALTH
 from app.tools.datasource import QUERY_PREFIX, run_masks_results, run_reads_only, run_scope_fixed, run_versions
 from app.tools.registry import (
     ToolArgsError,
@@ -70,11 +76,12 @@ from app.tools.registry import (
     args_model_of,
     build_tools,
     describe_args,
+    execution_id_of,
     guides_text,
     prepare_args,
 )
 from app.tools.trust import asks_trustable, ask_gate, call_policy, node_task, trust_key_of
-from app.capabilities.registry import is_platform_query, snapshot_owned
+from app.capabilities.registry import is_platform_query, query_items, snapshot_owned
 
 # --------------------------------------------------------------------------
 # 公共部分
@@ -132,6 +139,10 @@ async def _build_messages(state: GraphState, ctx: NodeContext, tools: list[BaseT
     messages: list[BaseMessage] = []
 
     system_parts: list[str] = []
+    if ctx.cfg("ask_data_optimization") == 1:
+        from app.chat.optimization import CONCISE_RULE
+
+        system_parts.append(CONCISE_RULE)
     system = ctx.render_str(ctx.cfg("system", ""), state)
     if system:
         system_parts.append(system)
@@ -164,11 +175,23 @@ def _usage_of(message: BaseMessage, model_id: str) -> dict[str, Any]:
     meta = getattr(message, "usage_metadata", None) or {}
     inp = int(meta.get("input_tokens") or 0)
     out = int(meta.get("output_tokens") or 0)
+    details = meta.get("input_token_details") or {}
+    cache_read = int(details.get("cache_read") or 0) if isinstance(details, dict) else 0
+    cache_create = int(details.get("cache_creation") or 0) if isinstance(details, dict) else 0
+    if cache_read > 0 or cache_create > 0:
+        try:
+            cost = catalog.estimate_cost(
+                model_id, inp, out, cache_read_tokens=cache_read, cache_creation_tokens=cache_create
+            )
+        except TypeError:
+            cost = catalog.estimate_cost(model_id, inp, out)
+    else:
+        cost = catalog.estimate_cost(model_id, inp, out)
     return {
         "input_tokens": inp,
         "output_tokens": out,
         "total_tokens": inp + out,
-        "cost_usd": round(catalog.estimate_cost(model_id, inp, out), 6),
+        "cost_usd": round(cost, 6),
         "calls": 1,
     }
 
@@ -202,14 +225,31 @@ def explain_model_error(exc: Exception, model_id: str) -> str:
             "请稍后重试；如持续失败，请到「设置 → 模型接入」测试该模型")
 
 
+def _non_retriable_stream_error(exc: Exception) -> bool:
+    """鉴权失败、模型不存在、额度用尽、频率限制、上下文超长、输出额度被拒：非流式重发也必然因为同一原因失败，直接上报。"""
+    from langchain_core.exceptions import ContextOverflowError
+
+    from app.providers.budget import budget_refused
+
+    if isinstance(exc, ContextOverflowError) or budget_refused(exc):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status in (401, 403, 413, 429):
+        return True
+    low = str(exc).lower()
+    return any(k in low for k in (
+        "invalid_model", "model does not exist", "insufficient", "quota",
+        "rate limit", "unauthorized", "invalid api key",
+    ))
+
+
 async def _invoke_streaming(
     model: Any, messages: list[BaseMessage], ctx: NodeContext, model_id: str = ""
 ) -> AIMessage:
     """流式调用并把 token 实时推给前端。
 
     失败时回退到非流式 —— 有些兼容网关不支持 SSE，不该因此让整个节点挂掉。
-    但回退也失败的话，两次都是同一个原因，不能只把原始异常往上抛：用户看到的
-    会是两段一模一样的供应商报错，而里面既没有模型名也没有下一步该干什么。
+    但鉴权、模型不存在、限流、上下文超长这类请求本身就不成立的报错直接抛出，不再白发第二次请求。
     """
     # 模型 id 要跟着 llm.start 走。以前这条事件只有 message_count，于是调用失败时
     # 整条轨迹里**没有任何地方**记着试的是哪个模型——排查只能靠翻配置猜。
@@ -229,6 +269,8 @@ async def _invoke_streaming(
     except NotImplementedError:
         response = await model.ainvoke(messages)
     except Exception as e:  # noqa: BLE001
+        if _non_retriable_stream_error(e):
+            raise NodeError(ctx.node.id, explain_model_error(e, model_id)) from e
         ctx.emit(EventType.LOG, level="warn",
                  message=f"流式输出失败，已改用非流式调用：{explain_model_error(e, model_id)}",
                  code="stream_fallback")
@@ -279,15 +321,24 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     spent: list[dict[str, Any]] = []
 
     if schema:
-        # 要结构化结果就走原生 structured output，这条路径拿不到 token 流
+        # 要结构化结果就走原生 structured output，带上 include_raw=True 把真实 token 用量一起拿回来
         ctx.emit(EventType.LLM_START, model=model_id, structured=True,
                  message_count=len(messages))
         try:
             # langchain 靠 "title" 识别裸 JSON Schema dict，缺了会抛 Unsupported function
             if isinstance(schema, dict) and "title" not in schema:
                 schema = {"title": "output", **schema}
-            structured = model.with_structured_output(schema)
-            value = await structured.ainvoke(messages)
+            try:
+                structured = model.with_structured_output(schema, include_raw=True)
+            except TypeError:
+                structured = model.with_structured_output(schema)
+            got = await structured.ainvoke(messages)
+            if isinstance(got, dict) and got.get("parsing_error"):
+                err = got["parsing_error"]
+                raise err if isinstance(err, BaseException) else ValueError(str(err))
+            raw_msg, value = _split_structured(got)
+            if value is None:
+                raise ValueError("模型返回的结构化结果为空")
         except Exception as e:  # noqa: BLE001
             # 模型压根不存在也会走到这里，那不是"结构化输出失败"
             if "invalid_model" in str(e) or "model does not exist" in str(e).lower():
@@ -299,8 +350,12 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             ) from e
         payload = value if isinstance(value, (dict, list)) else getattr(value, "model_dump", lambda: value)()
         output = {"data": payload, "text": json.dumps(payload, ensure_ascii=False, indent=2)}
-        response: BaseMessage = AIMessage(content=output["text"])
-        spent.append(_report_call(ctx, response, model_id, started))
+        response = AIMessage(
+            content=output["text"],
+            usage_metadata=getattr(raw_msg, "usage_metadata", None),
+            response_metadata=dict(getattr(raw_msg, "response_metadata", None) or {}),
+        )
+        spent.append(_report_call(ctx, raw_msg if raw_msg is not None else response, model_id, started))
     else:
         response = await _invoke_streaming(model, messages, ctx, model_id)
         spent.append(_report_call(ctx, response, model_id, started))
@@ -353,6 +408,11 @@ async def _resolve_tools(ctx: NodeContext, state: GraphState, scope: AnalysisSco
     names = ctx.cfg("tools", []) or []
     # 遮罩、只读的运行：记忆范围、知识库只认运行定下的，模型在参数里挑的也不算（tools/registry.ToolContext.fixed_scope）
     fixed = run_scope_fixed(ctx.run)
+    # K10：这次运行的类别、发起人与来源（发起时定下，恢复、接着跑沿用同一份）。caliber_query 按 run_class 选用途、
+    # 用发起人当主体，并把来源带进派生的子运行；模型改不了这三样
+    from app.engine.runner import RUN_OPTIONS_KEY
+    from app.tools.registry import RUN_CLASS_KEY, RUN_ORIGIN_KEY, RUN_STARTED_BY_KEY
+
     tool_ctx = ToolContext(
         run_id=ctx.run.run_id,
         node_id=ctx.node.id,
@@ -367,6 +427,10 @@ async def _resolve_tools(ctx: NodeContext, state: GraphState, scope: AnalysisSco
         catalog_view=catalog_view.of_run(ctx.run),
         # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
         emit=ctx.emit,
+        run_class=ctx.run.extra.get(RUN_CLASS_KEY),
+        started_by=ctx.run.extra.get(RUN_STARTED_BY_KEY),
+        run_options=dict(ctx.run.extra.get(RUN_OPTIONS_KEY) or {}),
+        origin=ctx.run.extra.get(RUN_ORIGIN_KEY),
         extra={ANALYSIS_SCOPE_KEY: scope} if scope is not None else {},
     )
     async with SessionLocal() as session:
@@ -412,7 +476,8 @@ def _guard(ctx: NodeContext, model_id: str) -> Guard | None:
         {k: ctx.cfg(k) for k in ("max_steps", "budget_tokens", "budget_usd")},
         ctx.run.agent_limits, settings.max_agent_steps,
     )
-    return Guard(limits=limits, window=catalog.find_context(model_id) or FALLBACK_CONTEXT)
+    return Guard(limits=limits, window=catalog.find_context(model_id) or FALLBACK_CONTEXT,
+                 canonical_calls=ctx.cfg("ask_data_optimization") in (1, 2))
 
 
 def _policy(ctx: NodeContext, tool: BaseTool, args: dict[str, Any], granted: set[str]) -> str:
@@ -447,9 +512,12 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         except ProviderNotConfigured as e:
             raise NodeError(ctx.node.id, not_configured(e)) from e
 
-    # 绑了分析工具才建分析容器：本节点查过的结果、做过的分析都放在这里（app/tools/analysis.py），编号和交回模型的一致
+    # 绑了分析工具、本体工具、口径查询或显式开启调查策略时建分析容器：本节点查过的结果、做过的分析与健康核查都放在这里
+    bound_names = ctx.cfg("tools", []) or []
     scope = (AnalysisScope(node_id=ctx.node.id, snapshot=run_snapshot(ctx.run))
-             if any(is_analysis_tool(n) for n in ctx.cfg("tools", []) or []) else None)
+             if (any(is_analysis_tool(n) or n in ONTOLOGY_TOOLS or n == CALIBER_QUERY for n in bound_names)
+                 or bool(ctx.cfg("investigation")))
+             else None)
     tools = await _resolve_tools(ctx, state, scope)
     tool_map = {t.name: t for t in tools}
     # 默认串行：一轮只调一个工具，拿到结果再想下一步。并行更快，但一批工具
@@ -484,12 +552,54 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             total_usage[key] += usage[key]
         total_usage["cost_usd"] = round(total_usage["cost_usd"] + usage["cost_usd"], 6)
 
+    inline_evidence = ctx.cfg("ask_data_optimization") == 2 and evidence_on
+
+    def _live_catalog() -> dict[str, Any]:
+        from app.engine.evidence import build_catalog
+
+        return build_catalog(
+            nodes=state.get("nodes") or {},
+            ledger=[*(state.get("evidence") or []), *entries],
+            inputs=state.get("input") or {},
+        )
+
+    class _InlineStreamProxy:
+        def __init__(self, inner_ctx: NodeContext, live_cat: dict[str, Any]) -> None:
+            from app.engine.evidence import StreamRenderer
+
+            self._ctx = inner_ctx
+            self._cat = live_cat
+            self._renderer = StreamRenderer(live_cat, cells_allowed=True)
+
+        def __getattr__(self, attr: str) -> Any:
+            return getattr(self._ctx, attr)
+
+        def emit(self, event_type: EventType | str, **data: Any) -> None:
+            if event_type == EventType.LLM_TOKEN:
+                if txt := self._renderer.feed(str(data.get("delta") or "")):
+                    self._ctx.emit(EventType.LLM_TOKEN, delta=txt)
+                return
+            if event_type == EventType.LOG and data.get("code") == "stream_fallback":
+                from app.engine.evidence import StreamRenderer
+
+                self._renderer = StreamRenderer(self._cat, cells_allowed=True)
+            self._ctx.emit(event_type, **data)
+
+        def flush(self) -> None:
+            if tail := self._renderer.flush():
+                self._ctx.emit(EventType.LLM_TOKEN, delta=tail)
+
     # @task 的返回值会进 checkpoint：人工审批导致节点重放时，
     # 之前已经完成的模型调用和工具执行不会重跑，也就不会重复计费。
     @task
     async def llm_step(step: int, payload: list[BaseMessage]) -> BaseMessage:
         started = time.perf_counter()
-        response = await _invoke_streaming(model, payload, ctx, model_id)
+        if inline_evidence and any(e.get("kind") == "query" for e in entries):
+            proxy = _InlineStreamProxy(ctx, _live_catalog())
+            response = await _invoke_streaming(model, payload, proxy, model_id)  # type: ignore[arg-type]
+            proxy.flush()
+        else:
+            response = await _invoke_streaming(model, payload, ctx, model_id)
         _report(response, started)
         return response
 
@@ -498,7 +608,12 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         # 用 base_model 而不是上面那个绑过工具的 model：收尾轮必须在**结构上**
         # 发不出工具调用，靠提示词说"别调工具"是约束不住的
         started = time.perf_counter()
-        response = await _invoke_streaming(base_model, payload, ctx, model_id)
+        if inline_evidence and any(e.get("kind") == "query" for e in entries):
+            proxy = _InlineStreamProxy(ctx, _live_catalog())
+            response = await _invoke_streaming(base_model, payload, proxy, model_id)  # type: ignore[arg-type]
+            proxy.flush()
+        else:
+            response = await _invoke_streaming(base_model, payload, ctx, model_id)
         _report(response, started)
         return response
 
@@ -545,17 +660,24 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 snapshot_id = None
         # 查库成功时工具交回的 JSON 里带着查询快照的工件 id：记进返回值（进 checkpoint，重放拿到的
         # 是同一份）和 tool.end（在封存范围内，证据接口从这里出发找快照）。只认平台执行的查询（数据源工具、
-        # 能力登记里声明了表格的端点读取，is_platform_query 按名字认身份、不看结果长什么样）：那个 id 是
-        # 我们自己落的；MCP、自定义工具的文字来自外面，拼一个同样形状的 JSON 就能把任意快照塞进封存范围。
-        # 端点读取另核一道：工件得是这次运行落下的端点快照
-        query = query_entry_fields(content) if evidence_on and ok and is_platform_query(name) else None
-        if query and not await snapshot_owned(query["artifact"], ctx.run.run_id, name):
-            query = None
+        # K10 的口径查询 caliber_query、能力登记里声明了表格的端点读取，is_platform_query 按名字认身份、不看结果
+        # 长什么样）：那个 id 是我们自己落的；MCP、自定义工具的文字来自外面，拼一个同样形状的 JSON 就能把任意快照
+        # 塞进封存范围。口径查询一次交回**多条**（queries 数组），这里逐条摊开、逐条核工件。
+        queries: list[dict[str, Any]] = []
+        if evidence_on and ok and is_platform_query(name):
+            for item in query_items(content, name):
+                artifact = str(item.get("artifact") or "")
+                # 端点读取、口径查询另核一道：工件得是这次运行（或它明确派生的子运行）落下的那一种快照
+                if artifact and await snapshot_owned(artifact, ctx.run.run_id, name):
+                    queries.append(item)
+        first = queries[0] if queries else None
         # 分析工具交回的结论工件：同查询快照，记进 tool.end（封存范围内），证据接口、时间线从这里认这一步的结论。另带一小段
         # 判定（event_view：编号、算子、判定码、判定语……）：preview 只是结论的前一截，判定语多半被截掉。编号和记台账时
         # 交回模型的「【分析 An】」是同一个（_record_call 紧接着按同一个容器编），不记台账的执行没有编号
         analysis = payload_of(content) if ok and is_analysis_tool(name) else None
         alias = scope.next_alias() if analysis and scope is not None and evidence_on else None
+        health = health_payload_of(content) if ok and name == SOURCE_HEALTH else None
+        health_alias = scope.next_health_alias() if health and scope is not None and evidence_on else None
         ctx.emit(
             EventType.TOOL_END if ok else EventType.TOOL_ERROR,
             tool=name,
@@ -563,11 +685,15 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             duration_ms=elapsed,
             preview=content[:2000],
             artifact=snapshot_id,
-            **({"query_artifact": query["artifact"]} if query else {}),
+            **({"query_artifact": first["artifact"]} if first else {}),
+            # 一次调用交回多条查询（caliber_query）时把工件 id 全列出来：只给第一条，界面上剩下的就点不开
+            **({"query_artifacts": [q["artifact"] for q in queries]} if len(queries) > 1 else {}),
             **({"analysis_artifact": analysis["artifact"], "analysis": event_view(analysis["result"], alias)}
                if analysis else {}),
+            **({"health_artifact": health["artifact"], "source_health": health_event_view(health["result"], health_alias)}
+               if health else {}),
             # 查询当时数据源的表结构快照：和查询快照一样落在封存范围内，证据接口从这里认它
-            **({"schema_artifact": query["schema_artifact"]} if query and query.get("schema_artifact") else {}),
+            **({"schema_artifact": first["schema_artifact"]} if first and first.get("schema_artifact") else {}),
             # 这次查询的 SQL 检查结果单独带上：preview 截到前 2000 个字符，checks 通常在截掉的那段里
             **({"checks": checks} if ok and name.startswith(QUERY_PREFIX) and (checks := event_checks(content)) else {}),
             **extra,
@@ -579,7 +705,10 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                      message=f"{name} 没有做成：{analysis['result'].get('reason') or '原因未知'}")
         outcome: dict[str, Any] = {"content": content, "ok": ok, "duration_ms": elapsed}
         if evidence_on:
-            outcome.update(snapshot=snapshot_id, query_artifact=query["artifact"] if query else None)
+            # 这次调用交回的全部查询（数据源一条；口径查询多条）：一起进 checkpoint，重放取同一份，_record_call
+            # 据此逐条记台账——只留第一条，后面的查询就没了出处
+            outcome.update(snapshot=snapshot_id, query_artifact=first["artifact"] if first else None,
+                           queries=queries)
         return outcome
 
     @task
@@ -664,6 +793,12 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     #: 为什么没等到模型自己给结论：steps / stall / budget_tokens / budget_usd / context
     settle_reason: str | None = None
     answered = False
+    from app.engine.investigation import InvestigationPolicy, assess as assess_investigation
+
+    investigation_policy = InvestigationPolicy.model_validate(ctx.cfg("investigation", {}) or {})
+    investigation_rounds = 0
+    investigation_question = "\n".join(message_text(m) for m in messages if isinstance(m, HumanMessage))
+
     for step in range(max_steps):
         response = await llm_step(step, messages)
         if guard:
@@ -683,6 +818,18 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 await once(ctx, EventType.LOG, level="warn", code="tool_markup_leak",
                            message=f"{markup_warning(snippet)}，已要求模型重试一次")
                 messages.append(HumanMessage(content=TOOL_MARKUP_NUDGE))
+                final_text = ""
+                continue
+            investigation = assess_investigation(scope, investigation_question, investigation_policy)
+            if (investigation["active"] and investigation["status"] != "complete"
+                    and investigation_rounds < investigation_policy.max_rounds and step < max_steps - 1):
+                investigation_rounds += 1
+                messages.append(HumanMessage(content=(
+                    f"调查尚未完成：{investigation['reason']}。{investigation['next_step']}"
+                    "仅在现有权限和查询预算内补充证据；不能获得证据时明确说明，不编造原因。")))
+                await once(ctx, EventType.LOG, level="info", code="investigation_continue",
+                           round=investigation_rounds, stage=investigation.get("stage"),
+                           message=investigation["reason"])
                 final_text = ""
                 continue
             answered = True
@@ -767,12 +914,17 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
             outcome = await tool_step(step, name, args, call_id)
             content = outcome["content"]
+            if outcome["ok"]:
+                record_ontology_call(scope, name, content)
             record = {"tool": name, "args": args, "ok": outcome["ok"],
                       "duration_ms": outcome["duration_ms"], "result": content[:4000]}
             if evidence_on:
                 # 编号只取决于 tool_step 的返回值（重放时取自 checkpoint），重放出来的还是这一套
                 content = _record_call(ctx.node.id, exec_no, call_id, name, args, outcome, record,
-                                       queries, entries, scope)
+                                       queries, entries, scope, run_id=ctx.run.run_id)
+            elif scope is not None and outcome["ok"] and name == SOURCE_HEALTH:
+                if found_health := health_payload_of(content):
+                    scope.add_health(found_health["result"], found_health["artifact"])
             transcript.append(record)
             messages.append(ToolMessage(content=content, tool_call_id=call_id))
             if guard:
@@ -861,6 +1013,16 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             final_text = f"{final_text}\n\n（{hint}）".strip() if final_text else f"（{hint}）"
             ctx.emit(EventType.LOG, level="warn", message=hint, code="step_limit", **limited)
 
+    investigation = assess_investigation(scope, investigation_question, investigation_policy)
+    if investigation["active"]:
+        investigation["rounds"] = investigation_rounds
+        investigation["stop_reason"] = (settle_reason or "evidence_sufficient" if investigation["status"] == "complete"
+                                        else settle_reason or "evidence_insufficient")
+        if investigation["status"] != "complete":
+            final_text = f"{final_text}\n\n调查范围：{investigation['reason']}；现有证据不足以确认根因。".strip()
+            await once(ctx, EventType.LOG, level="warn", code="investigation_incomplete", investigation=investigation,
+                       message=investigation["reason"])
+
     cited: tuple[dict[str, Any], dict[str, Any]] | None = None
     schema = _output_schema(ctx) if evidence_on and ctx.cfg("cite_fields") is True else None
     if schema is not None and (fields := cited_fields(schema)):
@@ -878,10 +1040,24 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             extra = {"max_tokens": extracted.get("max_tokens")} if code == "agent_field_truncated" else {}
             await once(ctx, EventType.LOG, level="warn", code=code, message=message, fields=names, **extra)
 
+    raw_final_text: str | None = None
+    shown_text = final_text
+    if inline_evidence and final_text:
+        raw_final_text = final_text
+        if any(e.get("kind") == "query" for e in entries):
+            from app.chat.direct_evidence import normalize_and_bind_fast_citations
+            from app.engine.evidence import render_markers
+
+            live_cat = _live_catalog()
+            cleaned_raw = normalize_and_bind_fast_citations(final_text, live_cat)
+            shown_text = render_markers(cleaned_raw, live_cat, cells_allowed=True)
+
     total_usage["total_tokens"] = total_usage["input_tokens"] + total_usage["output_tokens"]
     result = {
-        "text": final_text,
+        "text": shown_text,
+        **({"raw_text": raw_final_text} if raw_final_text is not None else {}),
         "steps": len(transcript),
+        **({"investigation": investigation} if investigation["active"] else {}),
         "tool_calls": transcript,
         "model": model_id,
         # 没等到模型自己给结论就收了尾：下游校验失败时拿它说明根源（human.py）
@@ -896,11 +1072,11 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if entries:
         updates["evidence"] = entries
     if ctx.cfg("emit_message", True):
-        updates["messages"] = [AIMessage(content=final_text or "（空）")]
+        updates["messages"] = [AIMessage(content=shown_text or "（空）")]
     var_name = ctx.cfg("assign_to", "")
     if var_name:
         # 开了 cite_fields 的，变量里是核对过的 data（值以快照为准），下游口径卡按字段取
-        updates["vars"] = {var_name: cited[0] if cited is not None else final_text}
+        updates["vars"] = {var_name: cited[0] if cited is not None else shown_text}
     return updates
 
 
@@ -911,12 +1087,13 @@ async def run_agent(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
 def _record_call(node_id: str, exec_no: int, call_id: str, name: str, args: dict[str, Any],
                  outcome: dict[str, Any], record: dict[str, Any], queries: list[dict[str, Any]],
-                 entries: list[dict[str, Any]], scope: AnalysisScope | None = None) -> str:
+                 entries: list[dict[str, Any]], scope: AnalysisScope | None = None, run_id: str = "") -> str:
     """把一次执行过的工具调用记进台账、调用记录和本节点的查询清单，返回给模型看的内容。
 
     查库成功的结果前面加一行「【证据 Q1】」：模型在循环里就知道每次查询的编号，cite_fields
     抽取时照这个编号写出处。编号只在本节点内有效；报告目录里的 Q1… 按全局台账另编，两边
-    靠工件 id 对应，不靠编号。
+    靠工件 id 对应，不靠编号。一次调用交回多条查询（K10 的口径查询，queries 数组）时逐条编号，
+    结果前面一行写全（「【证据 Q1、Q2】」），每条各记一条台账、各带自己的执行身份。
 
     绑了分析工具的节点（scope）：每次查询另往分析容器里放一份输入快照（编号同上）；分析工具交回的结论记一条 kind analysis
     的台账（contract.ledger_entry，带 call_id），编号 An，交回模型的换成「【分析 An】」那一段（app/tools/analysis.py）。
@@ -938,34 +1115,87 @@ def _record_call(node_id: str, exec_no: int, call_id: str, name: str, args: dict
         entries.append(ledger_entry(found["result"], node_id=node_id, exec_no=exec_no, artifact=found["artifact"],
                                     call_id=call_id))
         return reply_text(alias, found["result"])
-    if not artifact or not is_platform_query(name):
+    if scope is not None and outcome.get("ok") and name == SOURCE_HEALTH:
+        found_health = health_payload_of(content)
+        if found_health is None:
+            return content
+        h_alias = scope.add_health(found_health["result"], found_health["artifact"])
+        record.update(alias=h_alias, health_artifact=found_health["artifact"])
+        entries.append(health_ledger_entry(found_health["result"], node_id=node_id, exec_no=exec_no,
+                                           artifact=found_health["artifact"], call_id=call_id))
+        return health_reply_text(h_alias, found_health["result"])
+    items = _called_queries(outcome, content, name)
+    if not items:
         return content
     try:
         data = json.loads(content)
     except ValueError:
         data = None
-    fields = query_entry_fields(data)
-    if fields is None:
-        return content
-    alias = f"Q{len(queries) + 1}"
-    record.update(alias=alias, artifact=artifact)
-    # 表结构快照：同一件在本节点这次执行里只记一条 schema 条目。快照是内容寻址的，重放时读到的是同一份
-    schema = fields.get("schema_artifact")
-    seen = schema and any(e.get("kind") == "schema" and e.get("artifact") == schema for e in entries)
-    frozen = None if not schema or seen else schema_ledger_entry(schema, node_id=node_id, exec_no=exec_no)
-    shaped = {"schema_artifact": schema, "tables": fields["tables"]} if seen or frozen else {}
-    entries.append({"kind": "query", "node_id": node_id, "exec": exec_no, "artifact": artifact,
-                    **({"via": snapshot} if snapshot else {}), "call_id": call_id, "tool": name,
-                    "source": fields["source"], "columns": fields["columns"], "rows": fields["rows"],
-                    "truncated": fields["truncated"], **shaped})
-    if frozen:
-        entries.append(frozen)
-    queries.append({"alias": alias, "call_id": call_id, "tool": name, "sql": str(args.get("sql") or ""),
-                    "artifact": artifact, "via": snapshot, "columns": fields["columns"],
-                    "rows": data.get("rows") or [], "truncated": fields["truncated"]})
-    if scope is not None:
-        scope.add_query(alias, input_snapshot(data, ref=alias, artifact=artifact, node_id=node_id))
-    return f"【证据 {alias}】\n{content}"
+    aliases: list[str] = []
+    for item in items:
+        alias = f"Q{len(queries) + 1}"
+        aliases.append(alias)
+        artifact = str(item["artifact"])
+        if "alias" not in record:
+            # 一次调用交回多条查询（K10 的口径查询）时，调用记录上记第一条：别的编号在同一行「【证据 Q1、Q2】」里
+            record.update(alias=alias, artifact=artifact)
+        # 表结构快照：同一件在本节点这次执行里只记一条 schema 条目。快照是内容寻址的，重放时读到的是同一份
+        schema = item.get("schema_artifact")
+        seen = bool(schema) and any(e.get("kind") == "schema" and e.get("artifact") == schema for e in entries)
+        frozen = None if not schema or seen else schema_ledger_entry(schema, node_id=node_id, exec_no=exec_no)
+        # 实际执行的执行身份（K10）：query_id 是逻辑查询、execution_id 是这一次、attempt 是第几次。口径查询那条自己
+        # 带着（K09 算好的），别的按这次调用的 id 或节点执行序号算
+        identity = {"query_id": item.get("query_id") or node_id,
+                    "execution_id": item.get("execution_id") or execution_id_of(node_id, attempt=exec_no,
+                                                                               call_id=call_id,
+                                                                               run_id=run_id),
+                    "attempt": item.get("attempt") or exec_no}
+        entries.append({"kind": "query", "node_id": node_id, "exec": exec_no, "artifact": artifact,
+                        **({"via": snapshot} if snapshot else {}), "call_id": call_id, "tool": name,
+                        "source": item.get("source"), "columns": item["columns"], "rows": item["rows"],
+                        "truncated": item["truncated"], **identity,
+                        # 口径查询那条记下它在哪一版、哪张图、哪个取数节点：数据源查询没有这一项
+                        **({"origin": dict(item["origin"])} if item.get("origin") else {}),
+                        # 复算要的材料（口径查询那条带着）：参数输入哈希与源模板哈希，值本身不进台账
+                        **({"parameters": dict(item["parameters"])} if item.get("parameters") else {}),
+                        **({"schema_artifact": schema, "tables": item.get("tables")} if seen or frozen else {})})
+        if frozen:
+            entries.append(frozen)
+        # cite_fields 的摘要里要的是行数据：这次的结果里没有（口径查询不外发结果集）就按工件读一次，读不出来留空，
+        # 出处核对仍按工件取
+        rows = data.get("rows") if isinstance(data, dict) and data.get("artifact") == artifact else None
+        queries.append({"alias": alias, "call_id": call_id, "tool": name, "sql": str(args.get("sql") or ""),
+                        "artifact": artifact, "via": snapshot, "columns": item["columns"],
+                        "rows": rows if rows is not None else _snapshot_rows(artifact),
+                        "truncated": item["truncated"]})
+        if scope is not None:
+            scope.add_query(alias, input_snapshot(data if isinstance(data, dict) else {}, ref=alias,
+                                                  artifact=artifact, node_id=node_id))
+    return f"【证据 {'、'.join(aliases)}】\n{content}"
+
+
+def _called_queries(outcome: dict[str, Any], content: Any, name: str) -> list[dict[str, Any]]:
+    """这次调用记进台账的那几条查询：优先取 tool_step 交回的那一份（K10 的口径查询是多条），老 checkpoint 上只有
+    query_artifact 一条时按结果自己摊开。非平台查询（MCP、自定义）返回空——拼一份同样形状的 JSON 不算证据。"""
+    if not is_platform_query(name):
+        return []
+    items = [item for item in (outcome.get("queries") or []) if isinstance(item, dict) and item.get("artifact")]
+    if items:
+        return items
+    if not outcome.get("query_artifact"):
+        return []
+    return query_items(content, name)
+
+
+def _snapshot_rows(artifact: str) -> list[Any]:
+    """查询快照里的行（cite_fields 的摘要用）。读不出来就空：出处核对仍按工件取，不受影响。"""
+    from app.core import artifact_store
+
+    try:
+        snapshot = artifact_store.load(artifact)
+    except ValueError:
+        return []
+    return list(snapshot.get("rows") or []) if isinstance(snapshot, dict) else []
 
 
 def _output_schema(ctx: NodeContext) -> dict[str, Any] | None:

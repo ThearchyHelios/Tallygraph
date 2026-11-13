@@ -61,9 +61,9 @@ SEALED_ORIGINS = ("launcher", "schedule", "app_entry", "app_view", "hook", "api"
 #: - app_backfill：按新口径补算的是现在才算的历史期，不是「最近一次」；趋势另经 trend_runs 按它对应的输入期排进去；
 #: - ledger_issue：问数据的答案按已治理口径正式出具（docs/design/next-round/02-口径账本.md §5），参数是从某人的提问里
 #:   绑出来的。取到它，看板、趋势、分享链接就悄悄换成了那个人问的那组数；
-#: - 其余是探索运行（问数据、画布试跑、试运行、个人应用的刷新，评测、口径对账、口径召回），本来就不是正式运行。
+#: - 其余是探索运行（问数据、画布试跑、试运行、个人应用的刷新，评测、口径对账、口径召回、口径试跑），本来就不是正式运行。
 NOT_SEALED_ORIGINS = (BACKFILL_ORIGIN, "ledger_issue", "chat", "canvas", "trial", "personal_app", "eval", "reconcile",
-                      "recall")
+                      "recall", "caliber_trial")
 
 VIEW_REFUSED = "app_view_refused"
 DAILY_LIMIT = "app_view_daily_limit"
@@ -1354,7 +1354,16 @@ async def pin_upgrade(session: AsyncSession, app_id: str, version: AppVersion,
 
 
 def _query_artifact(source: Source, node_id: str, exec_no: Any = None) -> str | None:
-    """这个节点在封存范围内交回的查询快照：默认最后一次，exec 给了取第几次（从 1 数）。"""
+    """这个节点在封存范围内交回的查询快照：默认最后一次，exec 给了取第几次（从 1 数）。
+
+    按**执行顺序**逐次取（sealed.query_records_of）：同一份快照被执行两次时内容一样、工件 id 相同，
+    按 artifact 去重会把两次并成一条，exec=2 就永远取不到第二次。
+    """
+    records = source.sealed.query_records_of(node_id)
+    if records:
+        if isinstance(exec_no, int) and not isinstance(exec_no, bool) and 1 <= exec_no <= len(records):
+            return str(records[exec_no - 1].get("artifact") or "") or None
+        return str(records[-1].get("artifact") or "") or None
     found = [a for a, info in source.sealed.queries.items() if info.get("node_id") == node_id]
     if not found:
         return None

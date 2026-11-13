@@ -29,6 +29,12 @@ from app.api import (
 )
 # 编排完善第 1 波（docs/design/orchestration-round §1）：问数据的一轮在服务端跑
 from app.api import chat_turns as chat_turns_api
+# 增量重导入（K11）：建一次导入、看工作项和冲突、接受选定字段、拒绝、人工对齐、恢复
+from app.api import caliber_import as caliber_import_api
+# 指标本体穿透（W1-a）：标准业务实体与跨口径指标关系网
+from app.api import ontology as ontology_api
+# 独立语义指标库（即存即用指标卡片与在线试算）
+from app.api import semantic_metrics as semantic_metrics_api
 from app.api.coded import CodedHTTPException, coded_handler
 from app.api.deps import chat_scope, evidence_scope, private_run_scope, require_role, role_by_method, run_scope
 from app.auth.keys import key_gate
@@ -139,13 +145,19 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     finally:
         # 先停调度，再停运行：停运行的途中不该再有新运行被发起。起草、剖析任务停下来标成中断，下次启动不会再续
         await scheduler.stop()
-        from app.data import catalog_jobs, catalog_profile_jobs, introspect_jobs
+        from app.data import catalog_jobs, catalog_profile_jobs, entity_discovery, introspect_jobs, semantic_decompose
         from app.chat import job as chat_job
         from app.eval import runner as eval_runner, snapshots as eval_snapshots
 
+        from app.ledger import jobs as draft_jobs, reimport as import_jobs
+
+        await draft_jobs.manager.shutdown()
+        await import_jobs.manager.shutdown()
         await catalog_jobs.manager.shutdown()
         await catalog_profile_jobs.manager.shutdown()
         await introspect_jobs.manager.shutdown()
+        await entity_discovery.shutdown()
+        await semantic_decompose.shutdown()
         # 问数据的一轮停下不改那几行（下次启动、或者别的进程照「属主不在了」的规矩接手），也要在运行之前停
         await chat_job.shutdown()
         # 评测要在运行之前停：它停下时会取消自己发起的作答、算期望的运行，再标中断
@@ -159,9 +171,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await relay.stop()
         await cluster.stop()
         # 应用库的连接全关掉：SQLite 最后一个连接关掉时才把 -wal 并回、删掉（copy-to-postgres 按它认服务停没停），
-        # PostgreSQL 的连接池也正常关
+        # PostgreSQL 的连接池也正常关；外部数据源缓存的连接池一并释放
+        from app.data.engine import engines
         from app.db.base import dispose_session_engine, engine as db_engine
 
+        await engines.close()
         await db_engine.dispose()
         await dispose_session_engine()
         logger.info("已停止")
@@ -240,9 +254,10 @@ def _register_reapers() -> None:
     from app.blueprints import publish_plan
     from app.chat import job as chat_job
     from app.cluster import reaper
-    from app.data import catalog_jobs, catalog_profile_jobs, introspect_jobs
+    from app.data import catalog_jobs, catalog_profile_jobs, entity_discovery, introspect_jobs, semantic_decompose
     from app.eval import runner as eval_runner, snapshots as eval_snapshots
     from app.process import actions, tasks
+    from app.ledger import jobs as draft_jobs, reimport as import_jobs
 
     async def documents(live: Any) -> int:
         return await _reap_documents(live)
@@ -250,9 +265,13 @@ def _register_reapers() -> None:
     for name, fn in (
         ("运行", run_manager.reap),
         ("处理中的文档", documents),
+        ("口径起草任务", lambda live: draft_jobs.startup(live=live)),
+        ("口径增量导入", lambda live: import_jobs.startup(live=live)),
         ("数据目录起草任务", lambda live: catalog_jobs.startup(live=live)),
         ("数据剖析任务", lambda live: catalog_profile_jobs.startup(live=live)),
         ("探查任务", lambda live: introspect_jobs.startup(live=live)),
+        ("候选实体扫描任务", lambda live: entity_discovery.startup(live=live)),
+        ("口径拆解任务", lambda live: semantic_decompose.startup(live=live)),
         ("影子起草", lambda live: eval_snapshots.startup(live=live)),
         ("评测任务", lambda live: eval_runner.startup(live=live)),
         ("问数据的一轮", _chat_reaper(chat_job)),
@@ -419,6 +438,12 @@ for router, guard in (
     (shares_api.router, []),
     (notify_api.router, _USER),
     (ledger_api.router, _BUILDER),
+    # 增量重导入（K11）：和 /api/ledger 其余写接口同一道门（搭建者）；访问密钥不开放（不登记 KEY_ROUTES）
+    (caliber_import_api.router, _BUILDER),
+    # 指标本体穿透（W1-a）：标准业务实体与指标本体图谱（搭建者及以上）
+    (ontology_api.router, _BUILDER),
+    # 独立语义指标库（即存即用指标卡片）：同口径与本体工作台权限（搭建者及以上）
+    (semantic_metrics_api.router, _BUILDER),
     # 下一轮第 2 波：评测只给搭建者；访问密钥登录即可，接口里再按本人 / 管理员判
     (evals_api.router, _BUILDER),
     # 口径账本里按答案出具、对账的（第 3 波）：登录即可，接口里按运行和应用授权判

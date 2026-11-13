@@ -49,10 +49,28 @@ export interface TaskCounts {
   latest?: string | null
 }
 
-/** 心跳间隔：连着时复用 4 秒一次的待审批轮询，不另起请求 */
+/** 心跳间隔：连着时复用 4 秒一次的待审批轮询，不另起请求；标签页切到后台时放慢到 16 秒，回到前台立即补刷 */
 const HEARTBEAT_MS = 4000
+const HIDDEN_HEARTBEAT_MS = 16_000
 /** 断开后的重试退避 */
 const BACKOFF_MS = [4000, 8000, 16000]
+
+function sameTaskCounts(a: TaskCounts | null, b: TaskCounts): boolean {
+  return !!a && a.mine === b.mine && a.apps === b.apps && a.other === b.other && (a.latest ?? null) === (b.latest ?? null)
+}
+
+function sameApprovals(a: Approval[], b: Approval[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]
+    const y = b[i]
+    if (x.id !== y.id || x.status !== y.status || x.run_id !== y.run_id
+        || x.title !== y.title || x.created_at !== y.created_at) {
+      return false
+    }
+  }
+  return true
+}
 
 /** 全局参照数据：属性面板的各种下拉都从这里取，只加载一次。 */
 export interface CatalogState {
@@ -156,6 +174,7 @@ export const useCatalog = create<CatalogState>((set, get) => {
   const applyCounts = (seq: number, counts: TaskCounts) => {
     if (seq < countApplied) return
     countApplied = seq
+    if (sameTaskCounts(get().taskCounts, counts)) return
     set({ taskCounts: counts })
   }
 
@@ -284,7 +303,12 @@ export const useCatalog = create<CatalogState>((set, get) => {
       if (approvals.status === 'fulfilled' && approvals.value) {
         // 这一拍在路上时又发起了 refresh、而且那次已经填过了：以那次为准
         const list = approvals.value
-        if (claim('approvals', seq)) set((s) => ({ approvals: list, loadedAt: { ...s.loadedAt, approvals: Date.now() } }))
+        if (claim('approvals', seq)) {
+          set((s) => ({
+            ...(sameApprovals(s.approvals, list) ? {} : { approvals: list }),
+            loadedAt: { ...s.loadedAt, approvals: Date.now() },
+          }))
+        }
       }
       // 后端回了错误码说明它还活着，列表保持原样；够不着才去确认是否断开
       const e = probe.status === 'rejected' ? probe.reason : null
@@ -324,17 +348,34 @@ export const useCatalog = create<CatalogState>((set, get) => {
       const me = Symbol('heartbeat')
       heartbeatOwner = me
       let timer: ReturnType<typeof setTimeout> | undefined
+      const nextDelay = () =>
+        (typeof document !== 'undefined' && document.visibilityState === 'hidden'
+          ? HIDDEN_HEARTBEAT_MS
+          : HEARTBEAT_MS)
       // 链式 setTimeout 而不是 setInterval：后端慢的时候上一拍没回来，不叠下一拍
       const tick = async () => {
         if (heartbeatOwner !== me) return
         await get().refreshApprovals()
         if (heartbeatOwner !== me) return
-        timer = setTimeout(() => void tick(), HEARTBEAT_MS)
+        timer = setTimeout(() => void tick(), nextDelay())
       }
-      timer = setTimeout(() => void tick(), HEARTBEAT_MS)
+      const onVisibility = () => {
+        if (heartbeatOwner !== me) return
+        if (document.visibilityState === 'visible') {
+          if (timer) clearTimeout(timer)
+          void tick()
+        }
+      }
+      if (typeof document !== 'undefined') {
+        document.addEventListener('visibilitychange', onVisibility)
+      }
+      timer = setTimeout(() => void tick(), nextDelay())
       return () => {
         if (heartbeatOwner === me) heartbeatOwner = null
         if (timer) clearTimeout(timer)
+        if (typeof document !== 'undefined') {
+          document.removeEventListener('visibilitychange', onVisibility)
+        }
       }
     },
   }
@@ -400,11 +441,11 @@ const reloading: Partial<Record<CatalogKey, Promise<void>>> = {}
  * 数据源目录（订阅版）。list 含停用的，按需自己 filter(enabled)；state 同
  * catalogListState，不是 ok 时空列表不代表「没有数据源」，别劝人去新建。
  *
- * 挂载时如果目录超过 maxAgeMs 没取过就后台重拉一次，先照旧给手上的那份。
+ * 挂载或 refreshKey（例如路由进入标识）变化时检查 maxAgeMs，过期就后台重拉一次，先展示缓存。
  * 同一时刻多处挂载只会发一个请求（reload 自己不去重，这里记着在路上的那一次）。
  * 启动的 refresh 还没落定时先不拉（那次本来就会取）；落定时这张表没取回来，就补拉一次
  */
-export function useDatasources(opts?: { maxAgeMs?: number }): { list: DataSource[]; state: CatalogListState } {
+export function useDatasources(opts?: { maxAgeMs?: number; refreshKey?: string }): { list: DataSource[]; state: CatalogListState } {
   const list = useCatalog((s) => s.datasources)
   const state = useCatalogListState('datasources')
   const loaded = useCatalog((s) => s.loaded)
@@ -416,7 +457,7 @@ export function useDatasources(opts?: { maxAgeMs?: number }): { list: DataSource
     if ((at == null || Date.now() - at > maxAge) && !reloading.datasources) {
       reloading.datasources = s.reload('datasources').finally(() => { reloading.datasources = undefined })
     }
-  }, [maxAge, loaded])
+  }, [maxAge, loaded, opts?.refreshKey])
   return { list, state }
 }
 

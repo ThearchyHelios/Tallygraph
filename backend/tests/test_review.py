@@ -495,7 +495,7 @@ def test_analysis_signals_are_registered_as_gaps_that_only_need_a_note():
         ("report_analysis_claims", rv.DEGRADED), ("analysis_refused", rv.DEGRADED),
         ("metric_comparability_skipped", rv.DEGRADED)]
     # NOTE_ONLY 另有一种不是日志代码的：分析调用写错了一直没改对（analysis_call_failed，见 tests/test_review_analysis.py）
-    assert {s.kind for s in signals} == rv.NOTE_ONLY - {rv.ANALYSIS_CALL_FAILED}
+    assert {s.kind for s in signals} == rv.NOTE_ONLY - {rv.ANALYSIS_CALL_FAILED, "investigation_incomplete"}
     assert not rv.should_retry(signals) and not rv.NOTE_ONLY & (rv.RETRYABLE | rv.REBUILD)
 
 

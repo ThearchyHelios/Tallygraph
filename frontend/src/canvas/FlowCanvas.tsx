@@ -1,11 +1,14 @@
+import './xyflow.css'
 import './surface.css'
 import {
   createContext, memo, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties,
 } from 'react'
 import {
+  addEdge, applyEdgeChanges, applyNodeChanges,
   Background, BackgroundVariant, ControlButton, Controls, MiniMap, ReactFlow, ReactFlowProvider,
   useReactFlow, useStoreApi, ViewportPortal, type AriaLabelConfig, type Edge, type MiniMapNodeProps, type Viewport,
 } from '@xyflow/react'
+import { registerFlowHelpers } from '../store/flowChanges'
 import { Crosshair, Lock, PanelRightOpen, Route as RouteIcon, Search } from 'lucide-react'
 import clsx from 'clsx'
 import { FlowEdge, MomentContext, RoutingContext, type EdgeRunState, type EdgeView } from './FlowEdge'
@@ -27,6 +30,8 @@ import {
 import { replayTraceCached } from '../run/useNodeView'
 import { EDIT_LOCK_TEXT, useStudio, type FlowNode } from '../store/studio'
 import type { NodeType } from '../types'
+
+registerFlowHelpers({ addEdge, applyEdgeChanges, applyNodeChanges })
 
 const nodeTypes = { card: NodeCard }
 const edgeTypes = { flow: FlowEdge }

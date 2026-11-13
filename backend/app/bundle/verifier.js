@@ -51,9 +51,11 @@
 
   const RESULT = { pass: '通过', fail: '不通过', na: '无法核对', partial: '部分无法核对' }
   const MARK = { pass: '✓', fail: '✗', na: '?', partial: '?' }
-  const KIND_LABEL = { report_doc: '报告文档', metric_set: '口径卡', query: '查询快照', analysis_result: '分析结论' }
+  const KIND_LABEL = { report_doc: '报告文档', metric_set: '口径卡', query: '查询快照', analysis_result: '分析结论',
+    source_health: '数据源健康' }
   /** 分析结论（app/analysis）：工件种类、目录条目种类、分析范围里的几组 */
   const ANALYSIS = 'analysis_result'
+  const SOURCE_HEALTH = 'source_health'
   const SCOPE_GROUPS = [['phenomena', '现象'], ['decomposed', '拆过'], ['excluded', '排除'], ['refused', '算不了']]
   const TIER_LABEL = { formal: '完整出具', degraded: '降档出具', withheld: '不予出具' }
   const CLASS_LABEL = { formal: '正式运行', exploratory: '探索运行' }
@@ -174,6 +176,7 @@
     srcAnalysis: (alias) => `分析结论 ${alias} 的判定语`,
     srcAnalysisValue: (alias, key) => `分析结论 ${alias} 的具名的数「${key}」`,
     srcAnalysisCell: (alias, row, column) => `分析结论 ${alias} 的结果表 · 第 ${row + 1} 行 · ${column}`,
+    srcHealth: (alias) => `数据源健康 ${alias} 的判定语`,
     srcNone: '没有出处',
     srcOther: '其他引用',
     numUncited: '该数字未使用引用标记，无法核对其来源',
@@ -191,6 +194,7 @@
     numNoCell: (why) => `快照里找不到这一格：${why}`,
     numCellDiffers: '引用的值与快照里那一格的值不一致',
     numNoPhrase: '分析结论里没有判定语',
+    numNoHealthPhrase: '数据源健康结论里没有判定语',
     numNoValue: (key) => `分析结论里没有名为「${key}」的数`,
     numValueDiffers: '引用的值与分析结论里记的值不一致',
     numNoTable: '分析结论里没有结果表',
@@ -228,7 +232,7 @@
     shownLookalike: '紧挨着长得像数字的字母或符号（l、I、O、上标数字、圈码这类），读起来可能多出一位',
     shownOdd: '紧挨着这个数的字不在常见写法里，无法确认读者看到的数',
     numNotShown: '正文里没有显示这一处：导出时不会出现这种情况，文件可能被改过',
-    numAria: (kind, text, result) => `${kind === 'value' ? '取值' : kind === 'analysis' ? '判定语' : '数字'} ${text}，${result}，查看出处`,
+    numAria: (kind, text, result) => `${kind === 'value' ? '取值' : (kind === 'analysis' || kind === SOURCE_HEALTH) ? '判定语' : '数字'} ${text}，${result}，查看出处`,
     // 数字详情里口径卡一节：指标、计算方式（原式、代入式）、输入、复算。遮罩未附带的卡没有这一节（原因见核对明细 ③）
     dMetric: '指标', dUnit: '单位', dExpression: '原式（计算方式）', dSubstituted: '代入式（代入输入后的算式）',
     dInputs: '输入', dRecompute: '复算', dSourceName: '数据源', dInputValue: '取值', dFrom: '取自',
@@ -258,14 +262,14 @@
     dResult: '核对结果', dSource: '出处', dNode: '来源节点', dCaliber: '口径', dCited: '引用的值', dCard: '口径卡里的值',
     dCell: '快照里的值', dShown: '正文显示', dShownSame: '与按显示规则渲染的结果一致', dExpected: '按显示规则应为',
     dArtifact: '所在工件', dReport: '所在报告',
-    dPhrase: '判定语', dCriterion: '判定标准', dMethod: '方法与版本', dAnalysis: '分析结论里的值', dRecheck: '复算',
+    dPhrase: '判定语', dCriterion: '判定标准', dMethod: '方法与版本', dAnalysis: '分析结论里的值', dHealth: '数据源健康核查里的值', dRecheck: '复算',
     dAnalysisInputs: '输入', dHypothesis: 'Agent 写的假设', dCardHypothesis: '分析卡上写的『在验证什么』', dCaveats: '附带说明',
     recheckBy: '导出时服务端按封存的输入复算的结论；本页只核哈希，不在浏览器里重算统计',
     recheckNone: '导出时没有复算（结论未随文件附带）',
     analysisInput: (role, alias) => `${role}${alias ? ` · ${alias}` : ''}`,
     // 分析结论输入的角色（analysis.contract.AnalysisInput.role），同证据面板的叫法
     roleLabel: { data: '数据', base: '基期', target: '本期', headline_base: '基期总数', headline_target: '本期总数',
-      parent: '上一层拆解' },
+      parent: '上一层拆解', primary: '主侧数据', counterpart: '对侧数据', driver: '上游驱动' },
     dComparability: '两期可比性', comparabilityLabel: { comparable: '两期可比', conditional: '两期有条件可比', incomparable: '两期不可比' },
     dJudged: '判定', dChecks: '各项检查', comparabilityNotAttached: '可比性结论未随文件附带（见核对明细 ③ ④），这里按口径卡的记录展示',
     scopeTitle: '分析范围', scopeNote: '这一段由系统按这次运行的分析结论写成，写作者改不了；点开编号看判定语、判定标准、输入和复算。',
@@ -1313,7 +1317,7 @@
         // 内容不随文件附带，浏览器算不出它对不对得上：导出时服务端看到自己的文件和 id 对不上（mismatch）、解析不出来
         // （unparsable）的照实说，对不上的判不通过——不然被改过的文件看起来和正常的遮罩一样，篡改的证据就丢了。报告文档
         // 只给哈希时页面上没有正文可核，总览不是绿色的通过（overallOf 按报告文档没核对上算）
-        if (a.kind !== 'query' && a.kind !== 'metric_set' && a.kind !== 'report_doc' && a.kind !== ANALYSIS) {
+        if (a.kind !== 'query' && a.kind !== 'metric_set' && a.kind !== 'report_doc' && a.kind !== ANALYSIS && a.kind !== SOURCE_HEALTH) {
           item.result = FAIL
           item.reason = T.maskedOdd
         } else if (a.mismatch) {
@@ -1453,7 +1457,7 @@
       out.docs.push({ report, art, link, doc, trusted: trusted.has(report) })
       if (!doc) continue
       for (const [seg, path] of segmentsOf(doc)) {
-        if (seg.kind !== 'number' && seg.kind !== 'value' && seg.kind !== 'analysis') continue
+        if (seg.kind !== 'number' && seg.kind !== 'value' && seg.kind !== 'analysis' && seg.kind !== SOURCE_HEALTH) continue
         // 引用的值在文档 JSON 里的原文：超过 2^53 的整数照原文写进原因和出处面板
         const citedToken = () => tokenAt(tokensOf(art), [...path, 'cite', 'value'])
         const check = trusted.has(report) ? checkNumber(seg, doc, arts, chained, citedToken)
@@ -1487,6 +1491,7 @@
     if (cite.kind === 'analysis') {
       return loc.key != null ? T.srcAnalysisValue(cite.alias, String(loc.key)) : T.srcAnalysis(cite.alias)
     }
+    if (cite.kind === SOURCE_HEALTH) return T.srcHealth(cite.alias)
     return T.srcOther
   }
 
@@ -1507,14 +1512,14 @@
         { fmt: 'plain', conv: convOf(cite) }))
       return shown.result === FAIL ? shown : { ...shown, result: NA, reason: T.numInput }
     }
-    if (cite.kind !== 'metric' && cite.kind !== 'cell' && cite.kind !== 'analysis') {
+    if (cite.kind !== 'metric' && cite.kind !== 'cell' && cite.kind !== 'analysis' && cite.kind !== SOURCE_HEALTH) {
       return { result: NA, reason: T.numOther, source }
     }
     const entry = own(doc.catalog, cite.alias)
     const info = { source, kind: cite.kind, cite }
     // 分析结论：判定语、具名的数（cite.kind analysis），和它结果表里的一格（cite.kind cell，目录条目是 analysis）
     const analysis = cite.kind === 'analysis' || (cite.kind === 'cell' && own(entry, 'kind') === 'analysis')
-    const wanted = cite.kind === 'metric' ? 'metric' : analysis ? 'analysis' : 'query'
+    const wanted = cite.kind === 'metric' ? 'metric' : analysis ? 'analysis' : cite.kind === SOURCE_HEALTH ? SOURCE_HEALTH : 'query'
     if (!isObj(entry) || entry.kind !== wanted || typeof entry.artifact !== 'string') {
       return { ...info, result: FAIL, reason: T.numNoEntry }
     }
@@ -1530,6 +1535,13 @@
     if (!chained.has(entry.artifact)) return { ...info, result: NA, reason: T.numNotChained }
     info.citedToken = citedToken()
     if (analysis) return checkAnalysis(info, seg, doc, art)
+    if (cite.kind === SOURCE_HEALTH) {
+      const phrase = isObj(art.json) ? art.json.phrase : null
+      info.health = art.json
+      if (typeof phrase !== 'string' || !phrase.trim()) return { ...info, result: FAIL, reason: T.numNoHealthPhrase }
+      info.truth = phrase
+      return checkShown(info, seg, () => renderCell(phrase, null, null, 'text', 1))
+    }
     if (cite.kind === 'metric') {
       const metricId = own(cite.locator, 'metric') ?? own(entry.locator, 'metric')
       const metrics = Array.isArray(art.json.metrics) ? art.json.metrics : []
@@ -1670,7 +1682,7 @@
     info.expected = expected
     const shown = String(seg.text ?? '')
     if (pyStrip(shown) === pyStrip(expected)) return { ...info, result: PASS, shownOk: true }
-    if (info.cite.kind === 'analysis' && !Object.prototype.hasOwnProperty.call(info.cite, 'value')) {
+    if ((info.cite.kind === 'analysis' || info.cite.kind === SOURCE_HEALTH) && !Object.prototype.hasOwnProperty.call(info.cite, 'value')) {
       return { ...info, result: FAIL, reason: T.numPhraseDiffers(shown, expected) }
     }
     const value = info.cite.value
@@ -1976,7 +1988,7 @@
       metric ? [T.dMetric, [metric.name || metric.id || '—', metric.id && metric.name ? h('span', { class: 'muted' }, `（${metric.id}）`) : null]] : null,
       metric && metric.unit ? [T.dUnit, String(metric.unit)] : null,
       cite && cite.status === 'resolved' && 'value' in cite ? [T.dCited, exactText(cite.value, number.citedToken)] : null,
-      'truth' in number ? [number.kind === 'metric' ? T.dCard : number.analysis ? T.dAnalysis : T.dCell,
+      'truth' in number ? [number.kind === 'metric' ? T.dCard : number.analysis ? T.dAnalysis : number.health ? T.dHealth : T.dCell,
         number.truthText ?? exactText(number.truth, number.truthToken)] : null,
       checked && !same ? [T.dExpected, number.expected] : null,
       // 分析范围里的编号不是正文里的字：没有「正文显示」可核
@@ -2332,7 +2344,7 @@
         refs.length ? ` ← ${T.chainFrom}${refs.join('、')}` : '']
     }))
     const values = out.numbers.filter((n) => n.seg.kind === 'value').length
-    const phrases = out.numbers.filter((n) => n.seg.kind === 'analysis').length
+    const phrases = out.numbers.filter((n) => n.seg.kind === 'analysis' || n.seg.kind === SOURCE_HEALTH).length
     root.append(checkBlock('numbers', T.checkNumbers, T.sumNumbers(out.numbers.length - values - phrases, values, phrases), out.numbers,
       (n) => h('button', { type: 'button', 'data-num-item': n.key, onclick: () => {
         if (n.button) n.button.scrollIntoView({ block: 'center' })

@@ -9,31 +9,15 @@
 // 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
 // 带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-trace.mjs
 import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { createTsLoader, ROOT } from './lib/env.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
-const root = new URL('..', import.meta.url).pathname
+const root = `${ROOT}/`
 const fixtures = JSON.parse(
-  readFileSync(`${root}frontend/src/run/__tests__/fixtures.json`, 'utf8'))
+  readFileSync(join(ROOT, 'frontend/src/run/__tests__/fixtures.json'), 'utf8'))
 
-// trace.ts 在运行时 import 了 decode.ts 和 derive.ts。data: URL 里的模块没法
-// 解析 "/src/..." 这种路径，所以把依赖也各自转成 data: URL 再替换进去
-const loaded = new Map()
-async function load(path) {
-  if (loaded.has(path)) return loaded.get(path)
-  const res = await fetch(`${WEB}${path}?t=${Date.now()}`)
-  if (!res.ok) throw new Error(`${path} → HTTP ${res.status}`)
-  let code = await res.text()
-  const deps = new Set([...code.matchAll(/from\s+["'](\/src\/[^"'?]+)(?:\?[^"']*)?["']/g)]
-    .map((m) => m[1]))
-  for (const dep of deps) {
-    const url = await load(dep)
-    const pattern = new RegExp(`(["'])${dep.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\?[^"']*)?\\1`, 'g')
-    code = code.replace(pattern, JSON.stringify(url))
-  }
-  const url = 'data:text/javascript;base64,' + Buffer.from(code).toString('base64')
-  loaded.set(path, url)
-  return url
-}
+const load = await createTsLoader(WEB)
 
 let trace, derive, decode
 try {
@@ -41,7 +25,7 @@ try {
   derive = await import(await load('/src/run/derive.ts'))
   decode = await import(await load('/src/run/decode.ts'))
 } catch (e) {
-  console.error(`✗ 拿不到转译结果（${WEB}）——前端没起？先跑 ./scripts/dev.sh\n  ${e.message}`)
+  console.error(`✗ 加载前端运行态模块失败（${WEB}）：\n  ${e.message}`)
   process.exit(1)
 }
 const { emptyTrace, foldEvent, finalizeTrace, project, isSettled } = trace

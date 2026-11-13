@@ -26,7 +26,7 @@ def checks(result):
 async def test_two_weeks_that_differ_only_in_dates_are_comparable():
     result = await compare(period("Q1", "2026-10-05", "2026-10-12"), period("Q2", "2026-10-12", "2026-10-19"),
                            probe=fixed_prober(RANGE), measure="gmv")
-    assert result["method"] == "comparable@1" and result["mode"] is None
+    assert result["method"] == "comparable@2" and result["mode"] is None
     assert result["verdict"] == {"code": "comparable", "subjects": [], "direction": None}
     assert result["phrase"] == "两期可比"
     assert checks(result) == {"同口径": "通过", "窗口长度": "通过", "整期": "通过", "星期构成": "通过", "数据问题": "通过"}
@@ -107,8 +107,8 @@ async def test_a_failed_probe_falls_back_to_profile_facts_then_says_it_cannot_ch
     assert fallback["probes"] == [{"source": "shop", "table": "orders", "column": "order_date", "min": "2025-01-01",
                                    "max": "2026-10-19", "basis": "profile", "at": "2026-10-20"}]
     nothing = await compare(base, target, measure="gmv")
-    assert nothing["verdict"]["code"] == "comparable"
-    assert nothing["phrase"] == "两期可比，整期核对不了" and nothing["probes"] == []
+    assert nothing["verdict"]["code"] == "conditional"
+    assert nothing["phrase"] == "两期有条件可比：整期核对不了" and nothing["probes"] == []
 
 
 async def test_bounds_computed_from_the_run_day_are_evaluated_in_the_database_and_recorded():
@@ -127,7 +127,7 @@ async def test_bounds_computed_from_the_run_day_are_evaluated_in_the_database_an
     assert all(p["basis"] == "live" for p in result["probes"])
     # 界算不出来：窗口核对不了，不判不可比
     blind = await compare(base, target, probe=fixed_prober(RANGE), measure="gmv")
-    assert blind["verdict"]["code"] == "comparable" and "窗口长度" in blind["phrase"]
+    assert blind["verdict"]["code"] == "conditional" and "窗口长度" in blind["phrase"]
 
 
 async def test_data_problems_on_the_snapshots():
@@ -180,7 +180,7 @@ async def test_a_masked_date_column_is_neither_used_nor_probed():
     result = await compare(period("Q1", "2026-10-05", "2026-10-12", masked=["order_date"]),
                            period("Q2", "2026-10-12", "2026-10-19", masked=["order_date"]), probe=probe, measure="gmv")
     assert probe.calls == [] and result["probes"] == []
-    assert result["verdict"]["code"] == "comparable" and "窗口长度" in result["phrase"]
+    assert result["verdict"]["code"] == "conditional" and "窗口长度" in result["phrase"]
 
 
 async def test_one_snapshot_of_sqlite_weeks_uses_the_real_days_of_each_week():
@@ -203,7 +203,8 @@ async def test_one_snapshot_of_sqlite_weeks_uses_the_real_days_of_each_week():
     # 不知道方言（认不出周号算法）：窗口、整期、星期构成都核对不了，不判可比以外的结论
     plain = snap("Q1", sql, ["week", "orders"], rows, types={"week": "text", "orders": "number"})
     unknown = await analyze("comparable", snaps=[plain], query="Q1", period="week", base="2026-W41", target="2026-W42")
-    assert unknown["phrase"] == "两期可比，窗口长度、整期、星期构成核对不了"
+    assert unknown["verdict"]["code"] == "conditional"
+    assert unknown["phrase"] == "两期有条件可比：窗口长度、整期、星期构成核对不了"
 
 
 def _same(a, b):

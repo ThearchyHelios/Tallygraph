@@ -13,7 +13,7 @@ from app.analysis.testing import fake_result
 
 #: 每个算子缺省给的判定（fake_result 有现成判定语的那几个）
 VERDICT = {"decompose": "driver", "baseline": "outside_band", "trend": "rising", "differ": "no_evidence",
-           "comparable": "comparable"}
+           "comparable": "comparable", "reconcile": "diverged", "cochange": "co_anomalous"}
 
 
 class FakeOps:

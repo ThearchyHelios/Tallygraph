@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import type { ReactNode, RefObject } from 'react'
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { Bell, BellOff, LogOut, Moon, RotateCw, Sun, UserRound } from 'lucide-react'
@@ -9,37 +9,12 @@ import type { CatalogCheck } from './store/catalog'
 import { useStudio } from './store/studio'
 import { useChat } from './store/chat'
 import { useConversations } from './store/conversations'
-import { ChatPage } from './pages/ChatPage'
-import { StudioPage } from './pages/StudioPage'
-import { RunsPage } from './pages/RunsPage'
-import { ComparePage } from './pages/runs/ComparePage'
-import { DataPage } from './pages/DataPage'
-import { CatalogPage } from './pages/catalog/CatalogPage'
-import { ToolsPage } from './pages/ToolsPage'
-import { KnowledgePage } from './pages/KnowledgePage'
-import { SettingsPage } from './pages/SettingsPage'
-import { SchedulesPage } from './pages/schedules/SchedulesPage'
-// 评测（下一轮第 4 波，评测-D8）：顶级导航，搭建者以上可见
-import { EvalsPage } from './pages/evals/EvalsPage'
-import { NotFound } from './pages/NotFound'
-// 应用平台：使用面（FE-5）、搭建面的应用编辑（FE-6）
-import { AppsHome } from './pages/apps/AppsHome'
-import { AppPage } from './pages/apps/AppPage'
-import { EntryPage } from './pages/apps/EntryPage'
-import { InstancePage } from './pages/apps/InstancePage'
-import { TaskPage } from './pages/apps/TaskPage'
-import { AppEditor } from './pages/apps/edit/AppEditor'
-// 普通用户建应用：新建应用的起点、蓝图页（F5）
-import { NewAppStart } from './pages/blueprints/NewAppStart'
-import { BlueprintPage } from './pages/blueprints/BlueprintPage'
 import { personalAppsOn } from './pages/blueprints/shared'
-import { LoginPage } from './pages/LoginPage'
-import { SharePage } from './pages/apps/SharePage'
 import { Logo } from './components/Logo'
 import {
-  CommandPalette, PAGES, ShortcutHelp, flushThemePref, openShortcutHelp, toggleCommandPalette, toggleNotify,
-  toggleTheme, usePages, useTheme, visiblePages, waitedFor,
-} from './components/CommandPalette'
+  PAGES, flushThemePref, openShortcutHelp, toggleCommandPalette, toggleNotify,
+  toggleTheme, usePages, useShellOverlay, useTheme, visiblePages, waitedFor,
+} from './components/shellCommands'
 import { atLeast, authSettled, loginOn, loginUrl, needsLogin, prefsLocalOnly, principalName, useAuth } from './store/auth'
 import { ErrorBoundary, Kbd, OfflineBanner, Spinner, StatusBadge, isComposing, toast, useTicker } from './components/ui'
 import { applyTheme, normalizeTheme } from './lib/theme'
@@ -56,6 +31,43 @@ import { useLeaveBlocker } from './lib/leave'
 import { useLocalActor } from './lib/actor'
 import { APP_TEXT, AUTH_MODE_LABEL, AUTH_TEXT, ROLE_LABEL, RUN_COMPARE_TEXT, TASK_NOTIFY_TEXT, runName } from './lib/terms'
 
+
+// 页面按需加载；外壳和导航始终可用，加载失败由现有错误边界提供恢复入口。
+const ChatPage = lazy(() => import('./pages/ChatPage').then((module) => ({ default: module.ChatPage })))
+const StudioPage = lazy(() => import('./pages/StudioPage').then((module) => ({ default: module.StudioPage })))
+const RunsPage = lazy(() => import('./pages/RunsPage').then((module) => ({ default: module.RunsPage })))
+const ComparePage = lazy(() => import('./pages/runs/ComparePage').then((module) => ({ default: module.ComparePage })))
+const DataPage = lazy(() => import('./pages/DataPage').then((module) => ({ default: module.DataPage })))
+const CatalogPage = lazy(() => import('./pages/catalog/CatalogPage').then((module) => ({ default: module.CatalogPage })))
+const ToolsPage = lazy(() => import('./pages/ToolsPage').then((module) => ({ default: module.ToolsPage })))
+const KnowledgePage = lazy(() => import('./pages/KnowledgePage').then((module) => ({ default: module.KnowledgePage })))
+const SettingsPage = lazy(() => import('./pages/SettingsPage').then((module) => ({ default: module.SettingsPage })))
+const SchedulesPage = lazy(() => import('./pages/schedules/SchedulesPage').then((module) => ({ default: module.SchedulesPage })))
+const EvalsPage = lazy(() => import('./pages/evals/EvalsPage').then((module) => ({ default: module.EvalsPage })))
+const CaliberCatalog = lazy(() => import('./pages/ledger/CaliberCatalog').then((module) => ({ default: module.CaliberCatalog })))
+const CaliberDrafts = lazy(() => import('./pages/ledger/CaliberDrafts').then((module) => ({ default: module.CaliberDrafts })))
+const NotFound = lazy(() => import('./pages/NotFound').then((module) => ({ default: module.NotFound })))
+const AppsHome = lazy(() => import('./pages/apps/AppsHome').then((module) => ({ default: module.AppsHome })))
+const AppPage = lazy(() => import('./pages/apps/AppPage').then((module) => ({ default: module.AppPage })))
+const EntryPage = lazy(() => import('./pages/apps/EntryPage').then((module) => ({ default: module.EntryPage })))
+const InstancePage = lazy(() => import('./pages/apps/InstancePage').then((module) => ({ default: module.InstancePage })))
+const TaskPage = lazy(() => import('./pages/apps/TaskPage').then((module) => ({ default: module.TaskPage })))
+const AppEditor = lazy(() => import('./pages/apps/edit/AppEditor').then((module) => ({ default: module.AppEditor })))
+const NewAppStart = lazy(() => import('./pages/blueprints/NewAppStart').then((module) => ({ default: module.NewAppStart })))
+const BlueprintPage = lazy(() => import('./pages/blueprints/BlueprintPage').then((module) => ({ default: module.BlueprintPage })))
+const LoginPage = lazy(() => import('./pages/LoginPage').then((module) => ({ default: module.LoginPage })))
+const SharePage = lazy(() => import('./pages/apps/SharePage').then((module) => ({ default: module.SharePage })))
+const LazyShellOverlays = lazy(() => import('./components/CommandPalette').then((m) => ({
+  default: function Overlays() {
+    return (
+      <>
+        <m.CommandPalette />
+        <m.ShortcutHelp />
+      </>
+    )
+  },
+})))
+
 /** 启动时认人（/auth/me）最多等多久再取目录 */
 const AUTH_WAIT_MS = 2500
 
@@ -66,7 +78,13 @@ const AUTH_WAIT_MS = 2500
 const SHARE_PAGE = typeof window !== 'undefined' && window.location.pathname === '/s'
 
 export default function App() {
-  return SHARE_PAGE ? <SharePage /> : <Shell />
+  return <Suspense fallback={<PageLoading />}>{SHARE_PAGE ? <SharePage /> : <Shell />}</Suspense>
+}
+
+function PageLoading() {
+  return <div role="status" aria-live="polite" className="flex h-full min-h-40 items-center justify-center gap-2 text-sm text-dim">
+    <Spinner />正在加载页面…
+  </div>
 }
 
 function Shell() {
@@ -166,7 +184,7 @@ function Shell() {
           <ErrorBoundary resetKey={location.pathname}>
             {/* 开了登录的使用者只到得了「应用」和「设置」：别的地址（旧书签、手输）送回应用首页 */}
             {roleRedirect ? <Navigate to={roleRedirect} replace /> : (
-            <Routes>
+            <Suspense fallback={<PageLoading />}><Routes>
               {/* 默认落到对话页：多数人要的是答案，画布留给要自己编排的人。使用者落到应用首页 */}
               <Route path="/" element={<HomeRedirect />} />
               <Route path="/chat" element={<ChatPage />} />
@@ -194,6 +212,9 @@ function Shell() {
               <Route path="/evals" element={<EvalsPage />} />
               <Route path="/evals/:section" element={<EvalsPage />} />
               <Route path="/evals/:section/:id" element={<EvalsPage />} />
+              <Route path="/ledger/calibers" element={<CaliberCatalog />} />
+              {/* 从业务文档起草口径：草稿只到定义为止，取数路径接一次真实运行 */}
+              <Route path="/ledger/drafts" element={<CaliberDrafts />} />
               {/* 应用：固定路径（inbox）写在 /apps/:appId 前面，读的人一眼看出它不是应用 id */}
               <Route path="/apps" element={<AppsHome />} />
               {/* 要在 /apps/:appId 之前：create 不是应用 id */}
@@ -213,18 +234,31 @@ function Shell() {
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/settings/:tab" element={<SettingsPage />} />
               <Route path="*" element={<NotFound />} />
-            </Routes>
+            </Routes></Suspense>
             )}
           </ErrorBoundary>
         </div>
       </main>
 
-      <CommandPalette />
-      <ShortcutHelp />
+      <ShellOverlays />
       <ShellKeys />
       <ShellSignals />
       <LeaveBlocker />
     </div>
+  )
+}
+
+function ShellOverlays() {
+  const open = useShellOverlay()
+  const [everOpened, setEverOpened] = useState(false)
+  useEffect(() => {
+    if (open) setEverOpened(true)
+  }, [open])
+  if (!open && !everOpened) return null
+  return (
+    <Suspense fallback={null}>
+      <LazyShellOverlays />
+    </Suspense>
   )
 }
 
@@ -353,17 +387,15 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
   const live = studio.startsWith('run') || chat === 'run'
 
   const pages = usePages()
-  // 整条导航约 690px 高（十个导航项），窗口再矮，最底下的遥测点和署名就被切掉、够不着。
-  // 矮窗口（521–660px）按高度收紧到 540px 左右（导航项 36px），≤520px 再收一档到 470px 左右（导航项 30px、
-  // 图标和字之间只留 2px：17px 图标 + 2px + 11px 字正好放下），而不是让导航滚动：导航一旦 overflow，挂在右侧的
-  // 悬停提示和遥测浮层也会被一起裁掉。加导航项时在 600px、520px、480px 高的窗口里量一遍（check-shell 的「窗口高 …px」）。
-  // 第十项「评测」加进来时量过：≤520px 那档还是 32px 的话，480px 高的窗口里遥测点超出视口 12px，所以收到 30px
+  // 11 项导航在中等高度用 36px，在 ≤520px 用 28px；最矮档图标和文字紧排，logo 同步收紧。
+  // 保留所有入口，且不在 nav 上加 overflow，以免裁掉侧向提示和遥测浮层。
+  // 增加入口后检查 700、600、520、480px：遥测和底部 padding 都必须留在视口内。
   return (
     <nav aria-label="主导航" className="relative z-30 flex w-16 shrink-0 flex-col border-r bg-panel">
       <Link
         to="/"
         aria-label={live ? 'AgentLab 首页（有运行正在进行）' : 'AgentLab 首页'}
-        className="group relative mx-auto mb-2 mt-3 flex h-10 w-10 shrink-0 items-center justify-center rounded-lg outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-[var(--accent)] [@media(max-height:660px)]:mb-1 [@media(max-height:660px)]:mt-2 [@media(max-height:660px)]:h-9"
+        className="group relative mx-auto mb-2 mt-3 flex h-10 w-10 shrink-0 items-center justify-center rounded-lg outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-[var(--accent)] [@media(max-height:760px)]:mb-1 [@media(max-height:760px)]:mt-2 [@media(min-height:521px)_and_(max-height:760px)]:h-9 [@media(max-height:520px)]:h-7"
       >
         <Logo size={22} live={live} className="text-accent" title="" />
         <Tip>
@@ -371,7 +403,7 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
           <span className="text-faint">受限动态编排{live ? ' · 有运行正在进行' : ''}</span>
         </Tip>
       </Link>
-      <div aria-hidden className="mx-4 mb-2 h-px shrink-0 bg-hairline [@media(max-height:660px)]:mb-1" />
+      <div aria-hidden className="mx-4 mb-2 h-px shrink-0 bg-hairline [@media(max-height:760px)]:mb-1" />
 
       <ul className="flex flex-col gap-0.5">
         {pages.map((p) => (
@@ -381,9 +413,8 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
               aria-keyshortcuts={ariaShortcut(p.shortcut)}
               className={({ isActive }) => clsx(
                 'group relative flex h-12 w-full flex-col items-center justify-center gap-1 rounded-md text-2xs leading-none outline-none',
-                // 两档的高度不能叠在同一个窗口高度上：同时命中时后出的那条赢，而 Tailwind 把 660 那条排在后面，
-                // ≤520px 的那一档就一直没生效（九项在 480px 高的窗口里放不下）。所以 36px 那档只管 521–660px
-                '[@media(min-height:521px)_and_(max-height:660px)]:h-9 [@media(max-height:520px)]:h-[30px] [@media(max-height:520px)]:gap-0.5',
+                // 两档媒体条件互斥，避免 Tailwind 排序让中等高度规则覆盖最矮档。
+                '[@media(min-height:521px)_and_(max-height:760px)]:h-9 [@media(max-height:520px)]:h-7 [@media(max-height:520px)]:gap-0',
                 'transition-colors focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
                 isActive ? 'bg-hover font-medium text-fg' : 'text-dim hover:bg-hover hover:text-fg',
               )}
@@ -408,7 +439,7 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
         ))}
       </ul>
 
-      <div className="mt-auto flex flex-col items-center gap-1.5 pb-2 pt-3 [@media(max-height:660px)]:gap-1 [@media(max-height:660px)]:pb-1 [@media(max-height:660px)]:pt-2">
+      <div className="mt-auto flex flex-col items-center gap-1.5 pb-2 pt-3 [@media(max-height:760px)]:gap-1 [@media(max-height:760px)]:pb-1 [@media(max-height:760px)]:pt-2">
         <div className="flex items-center gap-0.5">
           <NotifyToggle />
           <ThemeToggle />
@@ -425,7 +456,7 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
 /** 导航项右上角的徽标：图标右上角外侧，外圈一道面板底色的描边把它从图标上抠开 */
 const BADGE_CLASS = clsx(
   'group/badge absolute left-[calc(50%+7px)] top-[3px] z-10 flex h-4 min-w-4 items-center justify-center rounded-full px-1',
-  '[@media(max-height:660px)]:top-0',
+  '[@media(max-height:760px)]:top-0',
   'bg-warn-solid text-[10px] font-semibold leading-none text-on-warn tnum ring-2 ring-[var(--bg-panel)]',
   'outline-none focus-visible:ring-[var(--accent)]',
 )

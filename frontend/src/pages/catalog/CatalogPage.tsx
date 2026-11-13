@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
-  ArrowLeft, BookMarked, Clock, Database, Download, ListFilter as ListFilterIcon, ScanSearch, Sparkles, Upload,
+  ArrowLeft, BookMarked, Clock, Database, Download, ListFilter as ListFilterIcon, Network, ScanSearch, Sparkles, Upload,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { ApiError, api } from '../../api/client'
@@ -38,6 +38,7 @@ import { ChangeDetail, ChangesOverview } from './ChangeDetail'
 import { changesParamsOf, clearChanges, isChangesView, writeChangesParams, writtenTables } from './changes'
 import { JobStrip, stripItems, useSourceJobs } from './JobStrip'
 import type { StripItem } from './JobStrip'
+import { CanonicalEntitiesView } from './CanonicalEntitiesView'
 import type { SourceChangeCategory, SourceChangeCounts, SourceChangeResolveOut, SourceChangeStatusFilter } from '../../typesSource'
 import { dueCount, filterCounts, listParamsOf, progressOf, rowFromDetail, usageSummary, visibleRows, writeListParams } from './model'
 import type { ListFilter, ListParams, ListSort } from './model'
@@ -147,6 +148,7 @@ export function CatalogPage() {
   const review = useMemo(() => reviewParamsOf(params), [params])
   /** 变化视图：view=changes 时左栏是变化列表；cstatus、ccat 是筛选；change 是右栏打开的那一条 */
   const inChanges = isChangesView(params)
+  const inEntities = params.get('view') === 'entities'
   const changesParams = useMemo(() => changesParamsOf(params), [params])
   const pageView: PageView = inChanges ? 'changes' : review.view
   const inReview = pageView === 'review'
@@ -474,6 +476,20 @@ export function CatalogPage() {
       ? writeChangesParams(writeReviewParams(prev, { item: '' }), { open: true })
       : clearChanges(writeReviewParams(prev, { view: v, item: '' }))))
   }, [patchSearch])
+  const openEntities = useCallback(() => {
+    patchSearch((prev) => {
+      const next = clearChanges(writeReviewParams(prev, { view: 'list', item: '' }))
+      next.set('view', 'entities')
+      return next
+    })
+  }, [patchSearch])
+  const closeEntities = useCallback(() => {
+    patchSearch((prev) => {
+      const next = new URLSearchParams(prev)
+      if (next.get('view') === 'entities') next.delete('view')
+      return next
+    })
+  }, [patchSearch])
   /** 变化视图的筛选：替换当前这条历史 */
   const setChangesFilter = useCallback((p: { status?: SourceChangeStatusFilter; category?: SourceChangeCategory | null }) => {
     patchSearch((prev) => writeChangesParams(prev, p), { replace: true })
@@ -586,7 +602,17 @@ export function CatalogPage() {
   )
 
   let body: ReactNode
-  if (!data) {
+  if (inEntities) {
+    body = (
+      <CanonicalEntitiesView
+        sourceId={sourceId}
+        sourceName={source?.name ?? sourceId}
+        sources={sources}
+        tables={rows.map((r) => r.table_name)}
+        onBack={closeEntities}
+      />
+    )
+  } else if (!data) {
     body = loadError
       ? (loadError instanceof ApiError && loadError.status === 404
         ? <EmptyState icon={<BookMarked size={22} />} title={CT.sourceMissing} body={CT.sourceMissingBody} offline={false}
@@ -699,6 +725,16 @@ export function CatalogPage() {
           <div className="flex shrink-0 items-center gap-1.5">
             {hasTables && headerProfile}
             {hasTables && headerDraft}
+            <button
+              type="button"
+              className={clsx('btn btn-sm', inEntities && 'btn-primary')}
+              onClick={() => (inEntities ? closeEntities() : openEntities())}
+              aria-label="业务实体"
+              title="管理跨源对齐的标准业务实体与编码映射"
+              data-catalog-entities=""
+            >
+              <Network size={11} aria-hidden /> <span className="hidden md:inline">业务实体</span>
+            </button>
             {hasTables && (
               <button type="button" className="btn btn-sm" onClick={() => void exportCatalog()} disabled={exporting} aria-label={XT.export}
                       title={XT.exportHint} data-catalog-export="">

@@ -290,8 +290,6 @@ class MicroVMSandbox(Sandbox):
         env: dict[str, str] | None = None,
         files: dict[str, str] | None = None,
     ) -> ExecResult:
-        import microsandbox as ms
-
         limits = limits or SandboxLimits()
         language = (language or "python").lower()
         if language not in _LANG:
@@ -299,6 +297,8 @@ class MicroVMSandbox(Sandbox):
         if not self.available():
             reason = self.unavailable_reason() or "运行时未就绪"
             return ExecResult(ok=False, backend=self.name, error=f"microVM 不可用：{reason}")
+
+        import microsandbox as ms
 
         ext, cmd = _LANG[language]
         entry = entry_name(ext)

@@ -184,7 +184,8 @@ async def test_check_rewrites_once_flags_the_wrong_source_and_keeps_the_tier(mon
 
     # 出口独立复核：核出来的是同一处，只写进出具声明，档位和写对了的那次一样
     issuance = row.output["_issuance"]
-    assert issuance["tier"] == clean.output["_issuance"]["tier"] == "formal"
+    assert issuance["tier"] == clean.output["_issuance"]["tier"] == "degraded"
+    assert any("异常调查未完成" in gap for gap in issuance["gaps"])
     assert _analysis_gaps(issuance) == []
     declared = issuance["analysis_claims"]
     assert (declared["mode"], declared["counted"], declared["counts"]) == ("check", False, {ac.MISMATCH: 1})

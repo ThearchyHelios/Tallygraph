@@ -79,7 +79,8 @@ _STATE_CLASS = {
     "deterministic": "ok", "none": "na", "suspect": "bad", "unverified": "bad",
     "unjudged": "na", "candidate": "na",
 }
-_KIND_LABEL = {"number": "数字", "value": "取值", "entity": "名称", "quote": "引文", "analysis": "判定"}
+_KIND_LABEL = {"number": "数字", "value": "取值", "entity": "名称", "quote": "引文", "analysis": "判定",
+               "source_health": "健康"}
 
 
 def _esc(text: Any) -> str:

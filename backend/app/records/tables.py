@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -187,7 +188,7 @@ async def _free_name(session: AsyncSession, base: str) -> str:
 async def _register(session: AsyncSession, *, key: str, version: int, columns: list[Column], label: str,
                     app_id: str | None, blueprint_id: str | None) -> RecordsTable:
     path = store.table_path(key, version)
-    async with store.write_lock():
+    async with store.write_lock(key):
         await asyncio.to_thread(store.create_file, path, columns)
     base = f"{SOURCE_PREFIX}{re.sub(r'[^a-z0-9]', '', key.lower())[:12] or 'table'}"
     name = await _free_name(session, base if version == 1 else f"{base}_v{version}")
@@ -372,7 +373,7 @@ async def _sync_registration(session: AsyncSession, row: RecordsTable, wanted: l
     have = columns_of(row)
     known = {h.name.lower() for h in have}
     added = [c for c in wanted if c.name.lower() not in known]
-    async with store.write_lock():
+    async with store.write_lock(row.table_key):
         await asyncio.to_thread(store.add_columns, store.table_path(row.table_key, row.version), added)
     by_name = {w.name.lower(): w for w in wanted}
     # 列的顺序：原有的在前（照原来的顺序），新加的在后——和文件里的列序一致。删掉的列（只在不兼容时出现）这里不会有
@@ -397,6 +398,15 @@ async def _sync_registration(session: AsyncSession, row: RecordsTable, wanted: l
     source.options = {**options, **({MASK_COLUMNS_OPTION: masked} if masked else {})}
     source.schema_cache = schema_cache_of(merged, row.name)
     source.schema_synced_at = utcnow()
+    if add:
+        # 新加的敏感列成了遮罩列：清掉目录里这几列留下的取值类历史（码值、含义、备注、确认依据）。只 flush、不提交，
+        # 跟随调用方的事务；清理是尽力而为，冲突时 scrub 自己跳过，出错也不能挡住发布或起草
+        from app.data import catalog as data_catalog
+
+        try:
+            await data_catalog.scrub_masked_columns(session, source.id, add, actor=None, commit=False)
+        except Exception:  # noqa: BLE001 - 清理失败不影响登记本身
+            logging.getLogger(__name__).warning("设置遮罩列后清理数据目录失败（数据源 %s）", source.id, exc_info=True)
 
 
 def columns_of(row: RecordsTable) -> list[Column]:

@@ -47,7 +47,7 @@ from langchain_core.tracers.context import register_configure_hook
 #: 取不到模型名的调用记在这个名下
 UNKNOWN_MODEL = "unknown"
 #: 每个模型累计的几项（unreported 用量没报全的次数、unfinished 没做完的次数）
-_COUNTERS = ("input_tokens", "output_tokens", "calls", "unreported", "unfinished")
+_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "calls", "unreported", "unfinished")
 
 
 def _abandoned(error: BaseException) -> bool:
@@ -112,6 +112,10 @@ class Meter(BaseCallbackHandler):
             if usage:
                 row["input_tokens"] += int(usage.get("input_tokens") or 0)
                 row["output_tokens"] += int(usage.get("output_tokens") or 0)
+                details = usage.get("input_token_details") or {}
+                if isinstance(details, dict):
+                    row["cache_read_tokens"] += int(details.get("cache_read") or 0)
+                    row["cache_creation_tokens"] += int(details.get("cache_creation") or 0)
             else:
                 row["unreported"] += 1
 
@@ -141,6 +145,10 @@ class Meter(BaseCallbackHandler):
             reported = getattr(partial, "usage_metadata", None) or {}
             row["input_tokens"] += int(reported.get("input_tokens") or 0)
             row["output_tokens"] += int(reported.get("output_tokens") or 0)
+            details = reported.get("input_token_details") or {}
+            if isinstance(details, dict):
+                row["cache_read_tokens"] += int(details.get("cache_read") or 0)
+                row["cache_creation_tokens"] += int(details.get("cache_creation") or 0)
 
     def _rows(self) -> dict[str, dict[str, int]]:
         """累计的一份拷贝，开始了还没结束回调的调用算成没做完的（调用方持锁）。"""
@@ -180,9 +188,21 @@ class Meter(BaseCallbackHandler):
                 unpriced = row["calls"]
             else:
                 unpriced = 0 if free else row["unreported"]
+            cache_read = int(row.get("cache_read_tokens") or 0)
+            cache_create = int(row.get("cache_creation_tokens") or 0)
+            if cache_read > 0 or cache_create > 0:
+                try:
+                    raw_cost = estimate_cost(
+                        model, row["input_tokens"], row["output_tokens"],
+                        cache_read_tokens=cache_read, cache_creation_tokens=cache_create,
+                    )
+                except TypeError:
+                    raw_cost = estimate_cost(model, row["input_tokens"], row["output_tokens"])
+            else:
+                raw_cost = estimate_cost(model, row["input_tokens"], row["output_tokens"])
             by_model[model] = {"input_tokens": row["input_tokens"], "output_tokens": row["output_tokens"],
                                "calls": row["calls"],
-                               "cost_usd": round(estimate_cost(model, row["input_tokens"], row["output_tokens"]), 6),
+                               "cost_usd": round(raw_cost, 6),
                                "unpriced_calls": unpriced, "unfinished_calls": row["unfinished"]}
         total = {key: sum(r[key] for r in by_model.values())
                  for key in ("input_tokens", "output_tokens", "calls", "unpriced_calls", "unfinished_calls")}

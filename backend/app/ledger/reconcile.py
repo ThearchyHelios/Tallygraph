@@ -22,8 +22,9 @@
 上的指标 id}），这个选择记进对账运行的 origin。
 
 **多行结果**（这次的结果不止一行）：被报告引用了的那几行（最多 MAX_ROWS 行），按维度列（不是数的列）经合并查询和口径
-取数的结果按键对齐（LEFT JOIN，按引用的先后排），每个被引用的行、每个被引用的列出一组对账指标。两边的列按位置配（列数
-不同时不猜，照实拒绝）。维度列是遮罩列、或者这次的结果里合并键不唯一时照实拒绝：前者对齐要用到遮住的值，后者对不准
+取数的结果按键对齐（LEFT JOIN，按引用的先后排），每个被引用的行、每个被引用的列出一组对账指标。对齐语句由服务端按维度值
+拼成字面 SQL，值里可能带 `{{ }}`：那个节点带参数契约（ledger/params 的 marker），运行时不再当模板渲染一遍。两边的列按位置配
+（列数不同时不猜，照实拒绝）。维度列是遮罩列、或者这次的结果里合并键不唯一时照实拒绝：前者对齐要用到遮住的值，后者对不准
 是哪一行。被引用的列是遮罩列的同样不对账。
 
 只读：派生图只查库、不写；使用者发起时带上 MASK_RESULTS / READ_ONLY（同问数据），搭建者也带 READ_ONLY。对账运行记在
@@ -33,6 +34,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -110,14 +112,39 @@ def _needs_check(cand: dict[str, Any], fields: list[dict[str, Any]], hide: Any) 
     return None
 
 
-def actions_of(content: dict[str, Any], names: dict[str, str], hide: Any = None) -> list[dict[str, Any]]:
+async def actions_of(session: Any, content: dict[str, Any], names: dict[str, str], hide: Any = None, *,
+                     actor: Any = None) -> list[dict[str, Any]]:
     """比对工件里每条有相关口径的查询、每份相关口径一项「看差多少」：{kind: reconcile, query, workflow_id, version, node_id,
-    needs_check, check_reason?, binding（遮过的）, fields}。界面据此摆按钮、要不要先核对参数；fields 是那一版口径的入口字段
-    （名字、必填、有没有缺省值，比对工件里记的那一份），核对参数的表单照它画（缺的参数也写得出是哪一项）。"""
+    needs_check, check_reason?, binding（遮过的）, fields, available}。界面据此摆按钮、要不要先核对参数；fields 是那一版口径的
+    入口字段（名字、必填、有没有缺省值，比对工件里记的那一份），核对参数的表单照它画（缺的参数也写得出是哪一项）。
+
+    `available`：这一项**当前这个人能不能真的执行**——按同一份资产授权判（`apps/access.caliber_role` 到 use 及以上，和
+    QueryCore 固定执行、对账入口发起时那一道同一个判定），builder / admin / 关登录显式放行（全部为真）。`actor` 不给就取当前
+    请求的身份。账本投影按它决定留不留请求要用的身份（api 里 `POST /api/ledger/answers/{run_id}/reconcile` 要 `workflow_id`
+    + `version`）：**只有 available 的那一项留着**——无权的那几项只是说明，不带身份也就发不出去；真发出去入口照样 403
+    `querycore_not_authorized`（app/api/ledger.ensure_caliber_use）。"""
+    from app.apps.access import at_least, caliber_role
+    from app.auth.chat_policy import effective_actor, restricted_actor
     from app.ledger.labels import LEVEL_TEXT, binding_view
 
     hide = hide or (lambda _value: False)
     fields = {c.get("caliber"): c.get("fields") or [] for c in content.get("calibers") or []}
+    who = effective_actor(actor)
+    narrowed = await restricted_actor(session, who)
+    # 同一（工作流、版本）只判一次：一份工件里同一版口径常出现在好几十条候选里
+    roles: dict[tuple[str, int], bool] = {}
+
+    async def usable(cand: Mapping[str, Any]) -> bool:
+        if not narrowed:
+            return True
+        try:
+            key = (str(cand.get("workflow_id") or ""), int(cand.get("version")))
+        except (TypeError, ValueError):        # 版本认不成整数：这一项谁也用不了（发起时同样过不去）
+            return False
+        if key not in roles:
+            roles[key] = at_least(await caliber_role(session, who, key[0], key[1]), "use")
+        return roles[key]
+
     out: list[dict[str, Any]] = []
     for query in content.get("queries") or []:
         if query.get("status") not in ("related",):
@@ -130,6 +157,7 @@ def actions_of(content: dict[str, Any], names: dict[str, str], hide: Any = None)
                     "workflow_id": cand.get("workflow_id"), "version": cand.get("version"),
                     "node_id": cand.get("node_id"), "workflow_name": names.get(str(cand.get("workflow_id") or "")),
                     "level_text": LEVEL_TEXT.get(str(cand.get("level") or ""), ""),
+                    "available": await usable(cand),
                     "needs_check": why is not None, "binding": binding_view(cand.get("binding"), hide),
                     "fallback": bool((cand.get("diff") or {}).get("fallback")),
                     "fields": [{"name": str(f.get("name")), "required": bool(f.get("required")),
@@ -281,6 +309,7 @@ def _four(n: str, label: str, ours: str, theirs: str, pair: Pair) -> list[dict[s
 
 def tail_nodes(plan: Plan, *, card_id: str, fetch_id: str) -> list[dict[str, Any]]:
     """派生图的 tail：（多行时）对齐的合并查询 + 对账卡。card_id、fetch_id 是图里口径卡、口径取数节点的 id。"""
+    from app.ledger import params
     from app.ledger.derive import ALIGN_ID, OURS_ID, RECONCILE_CARD, _node
 
     metrics: list[dict[str, Any]] = []
@@ -292,8 +321,12 @@ def tail_nodes(plan: Plan, *, card_id: str, fetch_id: str) -> list[dict[str, Any
                       else f"cell(nodes.{fetch_id}, 0, {pair.column!r})")
             metrics += _four(str(j), pair.name or pair.ours, ours, theirs, pair)
     else:
-        nodes.append(_node(ALIGN_ID, "merge", "按维度对齐", inputs={"o": OURS_ID, "c": fetch_id},
-                           sql=align_sql(plan.keys, plan.pairs, plan.key_values)))
+        # 对齐语句由服务端按维度值拼成字面 SQL（值来自查询结果，可能带 {{ }}）：带参数契约（与这条语句绑定哈希），
+        # 运行时不再当模板渲染一遍
+        align = align_sql(plan.keys, plan.pairs, plan.key_values)
+        nodes.append(_node(ALIGN_ID, "merge", "按维度对齐", inputs={"o": OURS_ID, "c": fetch_id}, sql=align,
+                           **{params.KEY: params.marker(rendered=align,
+                                                        source={"kind": "reconcile", "node_id": ALIGN_ID})}))
         for i, row in enumerate(plan.key_values):
             where = "，".join(f"{ours}={v}" for (ours, _), v in zip(plan.keys, row))
             # 先核对第 i 行就是这一组的维度：重跑时这次的结果缺了一行、某个维度多出一行（口径那边重复），合并结果会错位，
@@ -486,8 +519,8 @@ def _plan_rows(ours_columns: list[str], rows: list[Any], hidden: set[str], calib
 
 def _referenced(sealed: Any, artifact: str) -> list[tuple[int, str]]:
     """报告里引用了这条查询的哪几格：[(行, 列)]，按正文的先后（单元格、表格里的格）。"""
-    from app.api.evidence import _reports
     from app.engine.evidence import iter_units
+    from app.engine.evidence_reader import reports_of as _reports
 
     out: list[tuple[int, str]] = []
     for report in _reports(sealed):
@@ -533,11 +566,22 @@ class Request:
     pairs: Any = None
 
 
+def pinned_effective(pinned: Any) -> list[dict[str, Any]]:
+    """这张口径卡**这次真正会算出的**指标数组（唯一一份解释，见 engine/nodes/metrics.pinned_effective）。
+
+    ``nodes.<卡>.metrics[i]`` 的 i 落在这一份上，所以按位置配列、建 ``nodes.<卡>.metrics[i].value`` 引用时只用它：卡带了
+    指标选择（caliber_from.metrics，K08）时，全量定义里的下标和运行时算出来那份对不上，照全量定下标会静默取到别的指标。
+    没有选择时就是全量定义，行为一字不变。"""
+    from app.engine.nodes.metrics import pinned_effective as _pinned_effective
+
+    return _pinned_effective(pinned)
+
+
 async def reconcile(run_id: str, req: Request, *, principal: Any) -> Run:
     """对这次运行的一条查询和一份相关口径对一次账：派生只读图、发起探索运行（来源 reconcile）。不能对的抛 ReconcileRefused。"""
     from app.api.deps import can_read_run
-    from app.api.evidence import _Masks, _sealed
     from app.core.artifact_store import load
+    from app.engine.evidence_reader import load_sealed as _sealed, open_masks as _Masks
     from app.engine.launch import LaunchRefused, launch_run
     from app.ledger import compose, derive, store
     from app.ledger.issue import _conversation_of
@@ -618,7 +662,7 @@ async def reconcile(run_id: str, req: Request, *, principal: Any) -> Run:
     template = str(((fetch.get("data") or {}).get("config") or {}).get("args", {}).get("sql") or "")
     plan = plan_pairs(ours_columns=columns, ours_rows=rows, hidden=hidden,
                       caliber_columns=_caliber_columns(template, inputs, list(pinned.entry_fields), kind, schema),
-                      metrics=pinned.metrics, fetch=str(fetch["id"]), card=pinned.card_title,
+                      metrics=pinned_effective(pinned), fetch=str(fetch["id"]), card=pinned.card_title,
                       fallback=bool((cand.get("diff") or {}).get("fallback")), chosen=req.pairs,
                       referenced=_referenced(sealed, req.query), projected=cand.get("projection"),
                       cells=query.get("cells"), caliber=key)
@@ -653,5 +697,5 @@ def build(pinned: Any, *, sql: str, tool: str, plan: Plan, inputs: dict[str, Any
 
 
 __all__ = ["CHECK_INPUTS", "MAX_COLUMNS", "MAX_ROWS", "NEEDS_PAIRS", "ORIGIN", "REFUSED", "Pair", "Plan",
-           "ReconcileRefused", "Request", "actions_of", "align_sql", "build", "plan_pairs", "reconcile",
-           "reconcile_groups", "reconciled_runs", "reconciled_view", "tail_nodes"]
+           "ReconcileRefused", "Request", "actions_of", "align_sql", "build", "pinned_effective", "plan_pairs",
+           "reconcile", "reconcile_groups", "reconciled_runs", "reconciled_view", "tail_nodes"]

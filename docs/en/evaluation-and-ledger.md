@@ -31,12 +31,13 @@ Rules:
 
 ### Run an evaluation
 
-1. Choose the variants: Copilot model, writing model, judge on or off, catalog (current / snapshot / verified only / off), analysis tools (on / off, on by default), and how many repetitions.
-2. Check the estimated cost, then start. The Catalog contribution preset runs "current vs. off" in one go, and the Analysis tools contribution preset runs "analysis tools on vs. off".
+1. Choose the variants: Copilot model, writing model, judge on or off, catalog (current / snapshot / verified only / off), analysis tools (on / off, on by default), ontology penetration (on / off, on by default), and how many repetitions.
+2. Check the estimated cost, then start. The Catalog contribution preset runs "current vs. off" in one go, the Analysis tools contribution preset runs "analysis tools on vs. off", and the Ontology penetration contribution preset runs "ontology penetration on vs. off".
 
 - Evaluations run in the background, and each question goes exactly the way a user's question would in Ask Data (graph building, run, review). Questions that stop at an approval aren't approved on anyone's behalf and are recorded as they are.
 - When Copilot returns only thinking and no operations, the question is retried once automatically.
-- In an arm with analysis tools off, Copilot doesn't see the analysis tools or the analysis card when building the graph, and a graph that still binds analysis tools is sent back to be fixed; workflow questions (which test a pinned version of a published workflow) build no graph and aren't affected. Analysis tools on and off count as different variants, and a comparison with the previous evaluation shows "Analysis tools: on → off".
+- In an arm with analysis tools off, Copilot doesn't see the analysis tools or the analysis card when building the graph, and a graph that still binds analysis tools is sent back to be fixed; in an arm with ontology penetration off, Copilot doesn't see `ontology_neighbors`, `source_health`, or cross-source ontology neighbor hints, and any graph binding those tools is likewise sent back to be fixed. Workflow questions (which test a pinned version of a published workflow) build no graph and aren't affected. On and off count as different variants, and comparisons with a previous evaluation report "Analysis tools: on -> off" or "Ontology penetration: on -> off".
+- Cross-source diagnostic suites can declare `investigation` expectations (`require_source_health`, `min_ontology_hops`, `diagnosis_stage`) alongside `reconcile` and `cochange` verdict expectations; the repository includes the deterministic three-source manufacturing fixture `tests.fixtures.acceptance.multi_source_ontology` and `tests/fixtures/eval/ontology_suite.json`.
 - Concurrency, per-question time limits, and per-evaluation and daily spending all have caps, set under Settings → Preferences → Evaluation. Evaluation spending is tallied separately.
 - A question's time limit doesn't include time spent queuing. Under full load, evaluations queue behind Ask Data (see [Run concurrency](postgresql-and-scaling.md#run-concurrency)).
 - An evaluation can be stopped, and you can retry only the unfinished questions. A service restart marks it interrupted, and it doesn't resume by itself.
@@ -128,3 +129,10 @@ After a new version of a governed caliber is published, the system looks up, in 
 Four statistics are computed live by `GET /api/ledger/stats`: equivalence hits, reconciliation, question repetition, and recall (E1–E4). The Caliber hits & repetition tab on the evaluation page plots their trends.
 
 Evaluations, caliber reconciliations, and caliber recalls are runs the system starts on someone's behalf; they are left out of usage statistics, and the Records page doesn't list them by default.
+
+### Metric ontology topology
+
+Each caliber detail page includes a collapsible Metric Ontology and Cross-Source Lineage panel:
+
+- **Three link kinds and DAG validation**: metrics can declare `factor` links (validated as a directed acyclic graph whenever links are saved or change-request patches are applied), `reconciles_with` mirror links, and `upstream_driver` links, while backing physical table and column lineage is derived automatically from caliber card expressions.
+- **Draft extraction and topology review**: drafting calibers from documentation emits candidate links as `proposed`; maintainers can inspect the interactive one-hop SVG topology, confirm or reject `proposed` links, or submit `/links` change requests so confirmed links become active for cross-source Ask Data penetration upon publication.

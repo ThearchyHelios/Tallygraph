@@ -99,13 +99,15 @@ def test_scores_compare_and_catalog_modes():
 
 
 def test_analysis_tools_and_presets_follow_the_server():
-    """变体的分析工具开、关和预设对照（api/evals.PRESETS）：前端的取值和服务端一一对上。叫法写「开」「关」，和服务端
+    """变体的分析工具与本体穿透开、关及预设对照（api/evals.PRESETS）：前端的取值和服务端一一对上。叫法写「开」「关」，和服务端
     describe、对比里写的同一种说法。"""
     from app.api.evals import PRESETS
-    from app.eval.variants import ANALYSIS_TOOLS, ANALYSIS_TOOLS_LABEL
+    from app.eval.variants import ANALYSIS_TOOLS, ANALYSIS_TOOLS_LABEL, ONTOLOGY_TOOLS, ONTOLOGY_TOOLS_LABEL
 
     assert _union("EvalAnalysisTools") == list(ANALYSIS_TOOLS)
     assert _pairs("start.analysisToolsMode") == list(ANALYSIS_TOOLS_LABEL.items())
+    assert _union("EvalOntologyTools") == list(ONTOLOGY_TOOLS)
+    assert _pairs("start.ontologyToolsMode") == list(ONTOLOGY_TOOLS_LABEL.items())
     assert _union("EvalPreset") == list(PRESETS)
 
 

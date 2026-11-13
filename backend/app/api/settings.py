@@ -24,6 +24,16 @@ from app.engine.judge import SETTING_GROUP as JUDGE_GROUP, SETTING_LABEL as JUDG
 from app.engine.judge import daily_spend, judge_model_spec, judge_settings
 from app.engine.judge import sanitize_settings as judge_values, settings_problem as judge_problem
 from app.engine.spend import SPEND_KEY as VERIFY_SPEND, daily_spend as verify_daily_spend
+from app.ledger.settings import (
+    LEDGER_DEFAULTS,
+    LEDGER_GROUP,
+    LEDGER_RECALL_MAX,
+    LEDGER_SETTING_LABEL,
+    LEDGER_TIMEOUT_RANGE,
+    ledger_problem,
+    ledger_settings,
+    ledger_values,
+)
 from app.providers import catalog
 from app.providers.factory import (
     ModelSpec, ProviderNotConfigured, _resolve_key, assistant_unavailable, build_chat_model,
@@ -736,71 +746,8 @@ async def apps_settings(session: AsyncSession) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# 口径账本：按口径自动正式出具的开关、每日上限，口径比对的时限（docs/design/next-round/02-口径账本.md 做法 5、2）
+# 口径账本：默认项、范围与校验定义在 app/ledger/settings.py（此处直接透出供设置接口使用）
 # --------------------------------------------------------------------------
-
-#: 设置里 ledger 这一组。auto_issue：问数据的答案整题等价于受管口径（Agent 独立写的 SQL 被证明等价、版本受管、图里没有人工
-#: 节点和写入）时自动按口径发起一次正式运行（拍板 L1；不满足的只给一键）。issue_daily_limit：每天最多按口径正式出具几次
-#: （自动的、一键的合计，0 表示不再出具）：正式运行含报告撰写的模型费用。match_timeout_s：一次运行的口径比对最多算几秒，
-#: 超时的照实记没比完（ledger/match.py）。recall_limit：口径发布新版本后，一次最多自动重算几组受影响的答案（02 做法 7、拍板 L6，
-#: 缺省 50；超出的照实写「另有 M 组未重算」，可以手动接着算；0 表示发布后不自动重算，只列出受影响的答案）。只有管理员能改
-#: （整个设置接口的改动都要管理员）
-LEDGER_GROUP = "ledger"
-LEDGER_DEFAULTS: dict[str, Any] = {"auto_issue": True, "issue_daily_limit": 20, "match_timeout_s": 8, "recall_limit": 50}
-LEDGER_SETTING_LABEL = {"auto_issue": "自动按口径正式出具", "issue_daily_limit": "按口径正式出具每日上限",
-                        "match_timeout_s": "口径比对时限（秒）", "recall_limit": "口径升版后每次最多重算几组"}
-#: 一次发布最多自动重算几组：召回只跑口径的数据部分、不调模型，但每组都查业务库
-LEDGER_RECALL_MAX = 1000
-#: 时限的范围：太短比不完一份口径，太长占着比对的线程
-LEDGER_TIMEOUT_RANGE = (1, 60)
-
-
-def _timeout_ok(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) \
-        and LEDGER_TIMEOUT_RANGE[0] <= value <= LEDGER_TIMEOUT_RANGE[1]
-
-
-def _recall_limit_ok(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= LEDGER_RECALL_MAX
-
-
-def ledger_problem(value: Any) -> str | None:
-    """设置页写进来的 ledger 这一组有什么问题，没问题返回 None。"""
-    if not isinstance(value, dict):
-        return f"「口径账本」设置格式有误，需要是一个对象，当前为「{value}」"
-    for key, item in value.items():
-        if key not in LEDGER_DEFAULTS:
-            return (f"「口径账本」设置中不支持「{key}」，可设置的项："
-                    + "、".join(f"「{LEDGER_SETTING_LABEL[k]}」" for k in LEDGER_DEFAULTS))
-        if key == "auto_issue" and not isinstance(item, bool):
-            return f"「{LEDGER_SETTING_LABEL[key]}」只能是开或关，当前为「{item}」"
-        if key == "issue_daily_limit" and not _daily_limit_ok(item):
-            return (f"「{LEDGER_SETTING_LABEL[key]}」需要是 0 到 {APPS_DAILY_LIMIT_MAX:,} 之间的整数（0 表示不再按口径出具），"
-                    f"当前为「{item}」")
-        if key == "recall_limit" and not _recall_limit_ok(item):
-            return (f"「{LEDGER_SETTING_LABEL[key]}」需要是 0 到 {LEDGER_RECALL_MAX:,} 之间的整数（0 表示发布后不自动重算），"
-                    f"当前为「{item}」")
-        if key == "match_timeout_s" and not _timeout_ok(item):
-            return (f"「{LEDGER_SETTING_LABEL[key]}」需要是 {LEDGER_TIMEOUT_RANGE[0]} 到 {LEDGER_TIMEOUT_RANGE[1]} 之间的数，"
-                    f"当前为「{item}」")
-    return None
-
-
-def ledger_values(stored: Any) -> dict[str, Any]:
-    """库里存的（或刚写进来的）ledger 一组 → 补齐默认；存坏了的项按默认（自动出具的开关存坏了按关，宁可少出具）。"""
-    stored = stored if isinstance(stored, dict) else {}
-    auto, limit, timeout = stored.get("auto_issue"), stored.get("issue_daily_limit"), stored.get("match_timeout_s")
-    recall = stored.get("recall_limit")
-    return {"auto_issue": auto if isinstance(auto, bool) else (LEDGER_DEFAULTS["auto_issue"] if auto is None else False),
-            "issue_daily_limit": limit if _daily_limit_ok(limit) else LEDGER_DEFAULTS["issue_daily_limit"],
-            "match_timeout_s": timeout if _timeout_ok(timeout) else LEDGER_DEFAULTS["match_timeout_s"],
-            "recall_limit": recall if _recall_limit_ok(recall) else LEDGER_DEFAULTS["recall_limit"]}
-
-
-async def ledger_settings(session: AsyncSession) -> dict[str, Any]:
-    """设置里的 ledger 一组，没存过的补默认。按口径出具、比对从这里读。"""
-    row = await session.get(Setting, LEDGER_GROUP)
-    return ledger_values(row.value if row else None)
 
 
 # --------------------------------------------------------------------------
@@ -988,6 +935,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "agent_max_steps": 100,
         "agent_budget_tokens": 2_000_000,
         "agent_budget_usd": None,
+        # 问数简单查询撞上硬异常信号时的处置策略（P1）：prompt（默认，正常交付并提示一键本体排查）/ auto（自动升级最多 1 轮）
+        "anomaly_escalation_mode": "prompt",
     },
     "limits": {
         "max_graph_steps": app_settings.max_graph_steps,
@@ -1018,6 +967,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 
+ANOMALY_ESCALATION_MODES = ("prompt", "auto")
+
+
 async def run_defaults(session: AsyncSession) -> dict[str, Any]:
     """设置里 run 这一组，没存过的键补内置默认。
 
@@ -1026,6 +978,12 @@ async def run_defaults(session: AsyncSession) -> dict[str, Any]:
     """
     row = await session.get(Setting, "run")
     return {**DEFAULT_SETTINGS["run"], **((row.value if row else None) or {})}
+
+
+async def anomaly_escalation_mode(session: AsyncSession) -> str:
+    """问数简单查数命中硬异常时的本体排查升级策略：默认 prompt，明确设为 auto 时自动发起最多 1 轮诊断升级。"""
+    raw = (await run_defaults(session)).get("anomaly_escalation_mode")
+    return str(raw) if raw in ANOMALY_ESCALATION_MODES else "prompt"
 
 
 def tool_approval_default(run: dict[str, Any]) -> str:
@@ -1163,6 +1121,14 @@ async def put_settings(
     from app.tools.trust import SETTING_KEY as TRUST_KEY
 
     # 先查后写：一组里有一项不对就整个请求不落库，免得存下半组
+    if "run" in payload.values and isinstance(payload.values["run"], dict):
+        if "anomaly_escalation_mode" in payload.values["run"]:
+            mode = payload.values["run"]["anomaly_escalation_mode"]
+            if mode is not None and mode not in ANOMALY_ESCALATION_MODES:
+                raise HTTPException(
+                    422,
+                    f"异常升级策略（run.anomaly_escalation_mode）只能是 {' 或 '.join(ANOMALY_ESCALATION_MODES)}，当前为「{mode}」",
+                )
     if JUDGE_GROUP in payload.values and (problem := judge_problem(payload.values[JUDGE_GROUP])):
         raise HTTPException(422, problem)
     if VERIFY_GROUP in payload.values and (problem := verify_problem(payload.values[VERIFY_GROUP])):

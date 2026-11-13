@@ -12,16 +12,18 @@ from langgraph.func import task
 from app.core.artifact_store import canonical_json, content_hash
 from app.engine.approval import read_decision
 from app.engine.context import NodeContext, NodeError, NodeRejected
-from app.engine.evidence import ledger_enabled, next_exec, query_entry_fields, schema_ledger_entry
+from app.engine.evidence import ledger_enabled, next_exec, schema_ledger_entry
+from app.engine.expressions import render_deep
 from app.engine.replay import ask, once
-from app.engine.state import GraphState
+from app.engine.state import GraphState, template_context
 from app.engine.toolcalls import ToolTimeout, limit_fields, limit_of, run_bounded
 from app.sandbox.base import SandboxLimits
 from app.sandbox.manager import sandbox_manager
 from app.engine.sql_problems import event_checks
-from app.capabilities.registry import is_platform_query, snapshot_owned
+from app.capabilities.registry import is_platform_query, query_items, snapshot_owned
 from app.data import catalog_view
-from app.tools.datasource import (DATA_UNAVAILABLE, SCHEMA_PREFIX, run_masks_results, run_reads_only,
+from app.ledger import params as sql_params
+from app.tools.datasource import (DATA_UNAVAILABLE, QUERY_PREFIX, SCHEMA_PREFIX, run_masks_results, run_reads_only,
                                   run_scope_fixed, run_versions)
 from app.tools.registry import (
     ToolArgsError,
@@ -30,6 +32,7 @@ from app.tools.registry import (
     build_tools,
     call_is_dangerous,
     call_tool,
+    execution_id_of,
     get_spec,
 )
 from app.tools.trust import ask_gate, asks_trustable, call_policy, node_task
@@ -40,11 +43,62 @@ from app.tools.trust import ask_gate, asks_trustable, call_policy, node_task
 QUERY_FAILED = ("查询失败：", "SQL 被拒绝：", DATA_UNAVAILABLE)
 #: code 节点在证据链里的角色：取数（产出本身就是源数据）还是计算。缺省按计算算
 EVIDENCE_ROLES = ("source", "compute")
+#: 参数不完整（缺参数 / 未声明 / 认不出的写法）时的说法：说出来，并且明确没发出查询（ledger/params 的机器码在 reason 里）
+PARAMETER_INCOMPLETE = "工具 {tool} 的 SQL 参数不完整，没有发出查询：{reason}"
+
+
+def _entry_fields(ctx: NodeContext) -> dict[str, dict[str, Any]]:
+    """这张图的入口节点声明的字段（名字 → 字段）。运行时判「未声明参数」和记参数类型都用它。"""
+    from app.engine.schema import NodeType
+
+    out: dict[str, dict[str, Any]] = {}
+    for node in ctx.run.spec.nodes:
+        if node.type != NodeType.INPUT:
+            continue
+        for f in node.config.get("fields") or []:
+            if isinstance(f, dict) and isinstance(f.get("name"), str) and f["name"].strip():
+                out.setdefault(f["name"].strip(), dict(f))
+    return out
+
+
+def _tool_args(ctx: NodeContext, state: GraphState, name: str) -> tuple[Any, dict[str, Any] | None]:
+    """这一次调用工具的参数，以及查询快照要记的参数材料（ledger/params）。
+
+    带参数契约的节点（组合式问数、对账图写，见 ledger/params 的 marker）：args 里已经是渲染好的字面语句——值渲染进去的
+    那一次已经发生过——运行时的模板渲染一概不碰它，材料直接取节点上那一份（源模板哈希、参数类型）。不然值里的
+    `{{ vars.question }}` 会被当成模板替换成那个变量的值，SQL 被数据改掉（K01 的二次渲染反例）。契约要**核对过哈希**才算
+    （is_literal）：节点被复制、改过 args 之后，契约作废，这里照别的节点一样正常渲染、正常判参数。
+
+    别的节点照旧：用当前状态渲染。数据源查询在发出前过一遍参数完整性：模板里的 {{ input.字段 }} 这次取不到值（没给、
+    也没缺省值；或压根没声明）就不发查询。以前这种情况渲染成空串照发，`AND region = ''` 从哪来都看不出来。
+    """
+    config = ctx.config if isinstance(ctx.config, dict) else {}
+    raw = ctx.cfg("args", {}) or {}
+    if sql_params.is_literal(config, str(ctx.node.type)):
+        # 契约核对过（args 还是服务端渲染好的那一条）：不再渲染，材料照契约记
+        return raw, sql_params.marker_material(config, str(ctx.node.type))
+    values = dict(state.get("input") or {})
+    template = str(raw.get("sql") or "") if isinstance(raw, dict) else ""
+    material: dict[str, Any] | None = None
+    # 按 input 取值的地方要过参数完整性：认得出字段的（点号/合法下标）判缺参、未声明，认不出的写法（会渲染成空串）
+    # 直接拒——两种都不能漏掉，所以门是 mentions_input 而不是「有没有认得出的字段」
+    if template and sql_params.mentions_input(template):
+        fields = _entry_fields(ctx)
+        if name.startswith(QUERY_PREFIX):
+            if problems := sql_params.runtime_problems(template, values=values, declared=fields):
+                raise ToolArgsError(PARAMETER_INCOMPLETE.format(tool=name, reason=sql_params.describe(problems)))
+            material = sql_params.material(template, values=values, declared_fields=fields)
+    return render_deep(raw, {**template_context(state), "input": values}), material
 
 
 def _tool_ctx(ctx: NodeContext) -> ToolContext:
     # 遮罩、只读的运行：记忆范围、知识库只认运行定下的，节点配置、图级 defaults 里写的都不算（tools/registry.ToolContext.fixed_scope）
     fixed = run_scope_fixed(ctx.run)
+    # K10：这次运行的类别、发起人与来源（发起时定下，恢复、接着跑沿用同一份）。caliber_query 按 run_class 选用途、
+    # 用发起人当主体，并把来源带进派生的子运行；节点配置改不了这三样
+    from app.engine.runner import RUN_OPTIONS_KEY
+    from app.tools.registry import RUN_CLASS_KEY, RUN_ORIGIN_KEY, RUN_STARTED_BY_KEY
+
     return ToolContext(
         run_id=ctx.run.run_id,
         node_id=ctx.node.id,
@@ -59,6 +113,10 @@ def _tool_ctx(ctx: NodeContext) -> ToolContext:
         catalog_view=catalog_view.of_run(ctx.run),
         # 数据源工具运行中途补固定版本时经它留一条事件（tools/datasource.py 的 _pin_late）
         emit=ctx.emit,
+        run_class=ctx.run.extra.get(RUN_CLASS_KEY),
+        started_by=ctx.run.extra.get(RUN_STARTED_BY_KEY),
+        run_options=dict(ctx.run.extra.get(RUN_OPTIONS_KEY) or {}),
+        origin=ctx.run.extra.get(RUN_ORIGIN_KEY),
     )
 
 
@@ -80,14 +138,28 @@ async def _dynamic_tool(name: str, ctx: NodeContext) -> Any:
 
 
 async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
-    """直接调用一个工具。参数里的 {{ }} 会先用当前状态渲染。"""
+    """直接调用一个工具。参数里的 {{ }} 会先用当前状态渲染（写了一份参数契约的节点按契约渲染，见 _tool_args）。"""
     name = ctx.cfg("tool", "")
     if not name:
         raise NodeError(ctx.node.id, "「调用工具」节点尚未选择工具")
 
-    args = ctx.render(ctx.cfg("args", {}) or {}, state)
+    try:
+        args, material = _tool_args(ctx, state, name)
+    except ToolArgsError as e:
+        # 参数不完整（ledger/params）：查询根本没发出去，按调用工具节点一贯的失败处理
+        ctx.emit(EventType.TOOL_ERROR, tool=name, error=str(e))
+        if ctx.cfg("fail_fast", True):
+            raise NodeError(ctx.node.id, str(e)) from e
+        return _arg_updates(ctx, str(e))
     if not isinstance(args, dict):
         raise NodeError(ctx.node.id, "工具参数必须是 JSON 对象")
+    # K04：这个节点上的受控绑定材料（这条 SQL 是哪份绑定的哪一次展开）。核的是**节点配置里那条 SQL**（受控模板
+    # 展开出来的那一条，{{ input.* }} 还在里面，归 K01），不是这一次渲染完的字面语句——值渲染进去之后就不再是
+    # 模板展开的样子了。对不上就不写，不拿一份过时的绑定去解释实际执行过的语句
+    from app.ledger import bindings as caliber_bindings
+
+    binding_material = caliber_bindings.snapshot_material(
+        ctx.config or {}, (ctx.config or {}).get("args") if isinstance(ctx.config, dict) else None)
 
     # 能力治理后效果为写入的：走动作的路径（先留生效记录再发送，app/process/actions.py）。登记里没有、或不是写入的，
     # 照以前的路径执行
@@ -145,7 +217,14 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
 
     async def _call() -> Any:
         async with SessionLocal() as session:
-            return await call_tool(name, args, _tool_ctx(ctx), session=session, on_fix=_fixed)
+            tool_ctx = _tool_ctx(ctx)
+            if material is not None:
+                # 参数材料进这一次调用的查询快照（tools/datasource._run）：源模板、哈希、参数类型与写在哪儿
+                tool_ctx.extra[sql_params.SNAPSHOT_KEY] = material
+            if binding_material is not None:
+                # K04 的绑定材料：这条 SQL 是哪份受控绑定的哪一次展开（业务值 + 绑定指纹）
+                tool_ctx.extra[caliber_bindings.SNAPSHOT_KEY] = binding_material
+            return await call_tool(name, args, tool_ctx, session=session, on_fix=_fixed)
 
     try:
         result = await run_bounded(_call(), limit, name)
@@ -203,36 +282,68 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         )
     except Exception:  # noqa: BLE001
         snapshot_id = None
-    # 只认平台执行的查询（数据源查询、登记里声明了 tabular 的端点读取，capabilities.registry.is_platform_query）：
-    # 别的工具（MCP、自定义）拼出同样形状的 JSON，里面的工件 id 不是我们落的。按身份认，不看结果长得像不像（F11）
-    query = query_entry_fields(result) if evidence_on and is_platform_query(name) else None
-    # 端点读取另核一道（同 nodes/llm.py）：名字对了，交回的工件还得是这次运行落下的端点快照。数据源查询的快照由数据层
-    # 自己落，snapshot_owned 对它们直接放行
-    if query and not await snapshot_owned(query["artifact"], ctx.run.run_id, name):
-        query = None
-    schema = query.get("schema_artifact") if query else None
+    # 只认平台执行的查询（数据源查询、K10 的口径查询 caliber_query、登记里声明了 tabular 的端点读取，
+    # capabilities.registry.is_platform_query）：别的工具（MCP、自定义）拼出同样形状的 JSON，里面的工件 id 不是我们落
+    # 的。按身份认，不看结果长得像不像（F11）。口径查询一次交回**多条**（queries 数组），这里逐条摊开、逐条认工件，
+    # 不把它当成只有一条。
+    queries: list[dict[str, Any]] = []
+    if evidence_on and is_platform_query(name):
+        for item in query_items(result, name):
+            artifact = str(item.get("artifact") or "")
+            # 端点读取、口径查询另核一道（同 nodes/llm.py）：名字对了，交回的工件还得是这次运行（或它明确派生的子运行）
+            # 落下的那一种快照。数据源查询的快照由数据层自己落，snapshot_owned 对它们直接放行
+            if artifact and await snapshot_owned(artifact, ctx.run.run_id, name):
+                queries.append(item)
+    first = queries[0] if queries else None
+    schema = first.get("schema_artifact") if first else None
     # 这次查询的 SQL 检查结果单独带上：preview 只有前 2000 个字符，checks 排在 rows 后面，通常被截掉
     checks = event_checks(result) if is_platform_query(name) else []
+    health: dict[str, Any] | None = None
+    if name == "source_health":
+        from app.tools.analysis import health_event_view, health_payload_of
+
+        health = health_payload_of(result)
     ctx.emit(EventType.TOOL_END, tool=name, duration_ms=elapsed,
              preview=json.dumps(result, ensure_ascii=False, default=str)[:2000],
-             artifact=snapshot_id, **({"query_artifact": query["artifact"]} if query else {}),
+             artifact=snapshot_id, **({"query_artifact": first["artifact"]} if first else {}),
+             # 一次调用交回多条查询（caliber_query）时把工件 id 全列出来：只给第一条，界面上剩下的就点不开
+             **({"query_artifacts": [q["artifact"] for q in queries]} if len(queries) > 1 else {}),
+             **({"health_artifact": health["artifact"], "source_health": health_event_view(health["result"])}
+                if health else {}),
              **({"schema_artifact": schema} if schema else {}), **({"checks": checks} if checks else {}))
 
     updates: dict[str, Any] = {"nodes": {ctx.node.id: result}}
     if evidence_on:
-        # 证据台账：工具快照一条；查库的再记一条查询快照（外面包着的是工具快照）。报告按台账编 Q1…
+        # 证据台账：工具快照一条；查库的再逐条记查询快照（外面包着的是工具快照）。报告按台账编 Q1…
         exec_no = next_exec(state, ctx.node.id)
         entries: list[dict[str, Any]] = []
         if snapshot_id:
             entries.append({"kind": "tool", "node_id": ctx.node.id, "exec": exec_no, "artifact": snapshot_id,
                             "tool": name})
-        if query:
+        if health:
+            from app.data.source_health import ledger_entry as health_ledger_entry
+
+            entries.append(health_ledger_entry(health["result"], node_id=ctx.node.id, exec_no=exec_no,
+                                               artifact=health["artifact"]))
+        for item in queries:
+            # 实际执行的执行身份（K10）：query_id 是逻辑查询、execution_id 是这一次、attempt 是第几次。
+            # 口径查询那条自己带着（K09 算好的），别的按这次节点执行的序号算
+            identity = {"query_id": item.get("query_id") or ctx.node.id,
+                        "execution_id": item.get("execution_id") or execution_id_of(ctx.node.id, attempt=exec_no,
+                                                                                   run_id=ctx.run.run_id),
+                        "attempt": item.get("attempt") or exec_no}
+            item_schema = item.get("schema_artifact")
             # 查询当时的表结构快照另记一条 schema 条目；取不回来的话查询条目也不带它（不启用实体核对）
-            frozen = schema_ledger_entry(schema, node_id=ctx.node.id, exec_no=exec_no) if schema else None
-            entries.append({"kind": "query", "node_id": ctx.node.id, "exec": exec_no, "artifact": query["artifact"],
-                            **({"via": snapshot_id} if snapshot_id else {}), "tool": name, "source": query["source"],
-                            "columns": query["columns"], "rows": query["rows"], "truncated": query["truncated"],
-                            **({"schema_artifact": schema, "tables": query["tables"]} if frozen else {})})
+            frozen = schema_ledger_entry(item_schema, node_id=ctx.node.id, exec_no=exec_no) if item_schema else None
+            entries.append({"kind": "query", "node_id": ctx.node.id, "exec": exec_no, "artifact": item["artifact"],
+                            **({"via": snapshot_id} if snapshot_id else {}), "tool": name, "source": item["source"],
+                            "columns": item["columns"], "rows": item["rows"], "truncated": item["truncated"],
+                            **identity,
+                            # 口径查询那条记下它在哪一版、哪张图、哪个取数节点：数据源查询没有这一项
+                            **({"origin": dict(item["origin"])} if item.get("origin") else {}),
+                            # 复算要的材料（口径查询那条带着）：这次参数输入的哈希与源模板的哈希，值本身不进台账
+                            **({"parameters": dict(item["parameters"])} if item.get("parameters") else {}),
+                            **({"schema_artifact": item_schema, "tables": item.get("tables")} if frozen else {})})
             if frozen:
                 entries.append(frozen)
         if entries:
@@ -353,6 +464,11 @@ def _write_updates(ctx: NodeContext, result: dict[str, Any]) -> dict[str, Any]:
     if var_name := ctx.cfg("assign_to", ""):
         updates["vars"] = {var_name: result}
     return updates
+
+
+def _arg_updates(ctx: NodeContext, reason: str) -> dict[str, Any]:
+    """参数不完整、没发查询时的节点产出：原因交给下游（fail_fast=False 的节点照旧往下走）。不落查询快照——没有查询。"""
+    return _write_updates(ctx, {"error": reason})
 
 
 def _query_failure(name: str, result: str) -> str:

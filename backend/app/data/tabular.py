@@ -28,6 +28,7 @@ _ALWAYS_DENIED 里有 create，那是对的——模型不该能建表。而导�
 
 from __future__ import annotations
 
+import codecs
 import csv
 import datetime as _dt
 import io
@@ -865,33 +866,64 @@ def _close(it: Any) -> None:
 _ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "latin-1")
 
 
-def _decode_csv(raw: bytes) -> str:
-    # 带 BOM 的 UTF-16（Excel 的「Unicode 文本」）：按 latin-1 读会混进 NUL，列名全乱
-    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        try:
-            return raw.decode("utf-16")
-        except UnicodeDecodeError:
-            pass
+_CSV_DECODE_CHUNK = 1024 * 1024
+
+
+def _can_decode_csv(raw: bytes, enc: str) -> bool:
+    dec = codecs.getincrementaldecoder(enc)()
+    mv = memoryview(raw)
+    try:
+        for offset in range(0, len(mv), _CSV_DECODE_CHUNK):
+            end = offset + _CSV_DECODE_CHUNK
+            dec.decode(mv[offset:end], final=end >= len(mv))
+        if not len(mv):
+            dec.decode(b"", final=True)
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
+def _detect_csv_encoding(raw: bytes) -> tuple[str, str]:
+    """增量分块探测 CSV 编码，避免为判编码而一次性物化整份全量字符串。"""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff") and _can_decode_csv(raw, "utf-16"):
+        return "utf-16", "strict"
     for enc in _ENCODINGS:
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("latin-1", errors="replace")
+        if _can_decode_csv(raw, enc):
+            return enc, "strict"
+    return "latin-1", "replace"
+
+
+def _open_csv_text(
+    raw: bytes,
+    *,
+    encoding: str | None = None,
+    errors: str = "strict",
+    newline: str | None = "",
+) -> io.TextIOWrapper:
+    if encoding is None:
+        encoding, errors = _detect_csv_encoding(raw)
+    return io.TextIOWrapper(io.BytesIO(raw), encoding=encoding, errors=errors, newline=newline)
+
+
+def _decode_csv(raw: bytes) -> str:
+    enc, errors = _detect_csv_encoding(raw)
+    return raw.decode(enc, errors=errors)
 
 
 def _csv_sources(raw: bytes, filename: str, header_row: int) -> list[_Source]:
-    text = _decode_csv(raw)
+    enc, errors = _detect_csv_encoding(raw)
     delimiter = "\t" if _ext(filename) == ".tsv" else None
     if delimiter is None:
+        with _open_csv_text(raw, encoding=enc, errors=errors, newline="") as probe_stream:
+            head = probe_stream.read(8192)
         try:
-            delimiter = csv.Sniffer().sniff(text[:8192], delimiters=",;\t|").delimiter
+            delimiter = csv.Sniffer().sniff(head, delimiters=",;\t|").delimiter
         except csv.Error:
             delimiter = ","      # 嗅不出来就按最常见的来
 
     def rows() -> Iterator[Sequence[Any]]:
-        reader = csv.reader(io.StringIO(text), delimiter=delimiter)
-        return itertools.islice(reader, header_row - 1, None)
+        with _open_csv_text(raw, encoding=enc, errors=errors, newline="") as stream:
+            yield from itertools.islice(csv.reader(stream, delimiter=delimiter), header_row - 1, None)
 
     stem = filename.rsplit("/", 1)[-1].rsplit(".", 1)[0]
     # 分号分隔是欧洲区域设置的 CSV：那里逗号是小数点，「1,500」是 1.5 而不是一千五

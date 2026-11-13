@@ -18,6 +18,16 @@ const CACHE_DIR = process.env.AGENTLAB_VITE_CACHE_DIR || (NO_WATCH ? 'node_modul
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   ...(CACHE_DIR ? { cacheDir: CACHE_DIR } : {}),
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules/@xyflow/') || id.includes('node_modules/d3-')) return 'xyflow'
+          if (id.includes('node_modules/lucide-react/')) return 'icons'
+        },
+      },
+    },
+  },
   server: {
     // 5173 太容易和别的项目撞车，挪开一点
     port: 5273,

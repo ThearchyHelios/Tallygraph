@@ -36,6 +36,14 @@ When the question asks why, how something changed, what dragged it down, what co
 - During its self-check, Copilot recognizes analytical questions with a fixed lexicon that collects only explicit phrasings. When the question is analytical but the agent that queries data has no analysis tools, the problem goes back to Copilot for one round of fixes; if the tools are still missing after that round, the graph runs as usual with a warning.
 - When an analysis couldn't be done (not enough history, the current period isn't over, and so on), or judgment words still don't cite a matching conclusion after the rewrite, the review only writes a note and doesn't start over automatically (see [Output review](#output-review)).
 
+### Cross-source ontology penetration and anomaly escalation
+
+When a metric hits a contract violation, empty query or metric data, cross-source reconciliation divergence, or an anomalous related data source, Ask Data can investigate across data sources along confirmed business ontology links:
+
+- **Three-stage diagnostic discipline**: the agent first calls `ontology_neighbors` to inspect confirmed one-hop metric links and canonical entity bridges, and calls `source_health` to check external tables for stalled dates, date gaps, volume drops, or unrecognized new codes. When source health or cross-source reconciliation (`analysis_reconcile`) already explains the anomaly, the report cites `[[h:H1]]` or `[[a:A1]]` and stops early instead of breaking down business dimensions on faulty data. Only when source health passes does the agent localize the driving slice in the primary source and query neighbor calibers through `caliber_query` (with deterministic entity-code translation in `inputs`) for co-movement checks (`analysis_cochange`).
+- **Anomaly escalation (prompt by default)**: when a simple lookup turn triggers a hard anomaly signal, it adds zero extra overhead by default and surfaces a one-click escalation button in the turn review actions (`mode: "escalate"`). Under Settings -> Preferences, cross-source anomaly investigation can also be switched to automatic escalation (at most 1 automatic retry).
+- **Status and role gates**: runtime penetration traverses only `confirmed` / `verified` ontology links and canonical entity bindings (`proposed` candidates never fire at runtime). Restricted users see and invoke only neighbor calibers pinned by apps they are authorized to use, with zero exposure of unauthorized workflow IDs or physical table and column names.
+
 ## Output review
 
 After a run ends, rules scan the event stream first, and a model review runs only when they find an anomaly. The review may restructure the answer, but it **must not introduce numbers that aren't in the original answer**.

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import logging
 import math
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -76,7 +78,8 @@ def _scope_note(rows: list[Any], scoped: bool) -> str:
             "db_schema__ 工具；前几轮用过别的库，这一轮也不要沿用")
 
 
-def _tool_catalog(rows: list[Any], *, builtins: frozenset[str] | None = None, analysis_tools: bool = True) -> str:
+def _tool_catalog(rows: list[Any], *, builtins: frozenset[str] | None = None, analysis_tools: bool = True,
+                  ontology_tools: bool = True) -> str:
     """给助手看的工具清单。
 
     all_specs() 只有静态注册的内置工具，数据源工具是运行时按库动态生成的
@@ -86,14 +89,18 @@ def _tool_catalog(rows: list[Any], *, builtins: frozenset[str] | None = None, an
     不列表名（look 文档 D3）：以前每个库列前 12 个表名，和这一轮要做什么无关，闲聊也带着；表数写一句，字段要用时 look。
 
     builtins 给了的话内置工具只列这几个：使用者的问数据（_CHAT_USER_PROMPT）只能用只读的那几个，列出来用不了的工具，
-    模型照样会绑。analysis_tools 为假（评测「关掉分析工具」那一臂，answer_ops）时不列五个分析工具。
+    模型照样会绑。analysis_tools 为假（评测「关掉分析工具」那一臂，answer_ops）时不列分析工具；ontology_tools 为假
+    （评测「关掉本体穿透」那一臂）时不列 ontology_neighbors、source_health。
     """
     from app.tools.analysis import ANALYSIS_TOOLS
+    from app.tools.ontology import ONTOLOGY_TOOLS
 
     lines = [
         f"- {name}（{spec.category}）：{spec.description}"
         for name, spec in sorted(all_specs().items())
-        if (builtins is None or name in builtins) and (analysis_tools or name not in ANALYSIS_TOOLS)
+        if (builtins is None or name in builtins)
+        and (analysis_tools or name not in ANALYSIS_TOOLS)
+        and (ontology_tools or name not in ONTOLOGY_TOOLS)
     ]
 
     from app.data import introspect as _introspect
@@ -114,14 +121,19 @@ def _tool_catalog(rows: list[Any], *, builtins: frozenset[str] | None = None, an
 
 async def _look_service(session: AsyncSession, payload: GenerateIn, sources: list[Any], *,
                         graph: dict[str, Any] | None, kinds: tuple[str, ...] = ("table", "capability"),
-                        catalog_view: Any = None) -> Any:
+                        catalog_view: Any = None, caliber: str = copilot_context.CALIBER_LOOK,
+                        actor: Any = None, ontology: bool = True) -> Any:
     """这一轮的查看服务（copilot_context.look_service）。挑选模型用同一个助手模型，第一次要挑时才拿。catalog_view：表详情
-    里给哪一份数据目录（data/catalog_view.py），不给是当前目录。"""
+    里给哪一份数据目录（data/catalog_view.py），不给是当前目录。
+
+    caliber 是这一轮口径这一档怎么用（copilot_context.CALIBER_*）：问数据里搭建者及以上是 compose（look 之后 use_caliber）、
+    普通使用者是 query（look 之后让 agent 调口径查询工具，K14）。actor 是这次是谁：口径清单按资产授权收窄（普通使用者只看
+    得到有授权的版本）。"""
     spec = await copilot_model_spec(session, payload, max_tokens=copilot_context.PICK_MAX_TOKENS)
     return await copilot_context.look_service(sources, spec=spec, graph=graph, kinds=kinds,
                                               answer=payload.intent == "answer", catalog_view=catalog_view,
                                               trail={"conversation_id": getattr(payload, "conversation_id", None)},
-                                              session=session)
+                                              session=session, actor=actor, caliber=caliber, ontology=ontology)
 
 
 NODE_REFERENCE = """\
@@ -141,11 +153,15 @@ NODE_REFERENCE = """\
   单引号（那是字符串）。只给最外层 SELECT 的结果列起别名，WHERE、JOIN、GROUP BY 里照旧写原列名；Oracle 旧版本
   的标识符最长 30 字节，别名不超过 10 个字
   **问题问的是为什么、怎么变了、哪里拖累、谁贡献最大、是否异常、波动、趋势、是不是真的更高这类分析问题时**，查库的 agent
-  除了 db_query__ / db_schema__ 再绑上五个分析工具（analysis_comparable、analysis_baseline、analysis_trend、
-  analysis_decompose、analysis_differ）：变化从哪来、算不算异常、是不是持续在变、差异站不站得住由平台按固定的方法和阈值算，
-  判定语由系统写好，报告引用它；agent 只决定算什么（比哪两期、拆哪个维度、往哪一段下钻）。绑了任一个，平台就把分析方法
-  注入 agent 的 system，prompt 里不用再教方法，也不要写阈值。分析工具只分析这个 agent 自己查过的结果，所以只绑给同时绑了
-  db_query__ 的 agent；不能放进 tool 节点（模板里每次都要做的固定分析用 analysis 分析卡）
+  除了 db_query__ / db_schema__ 再绑上分析工具（analysis_comparable、analysis_baseline、analysis_trend、
+  analysis_decompose、analysis_differ、analysis_reconcile、analysis_cochange），涉及已发布口径异常或跨源排查时一并绑上
+  ontology_neighbors、source_health 和 caliber_query：变化从哪来、算不算异常、是不是持续在变、差异站不站得住、跨源对账是否
+  背离、上游指标是否伴随异动由平台按固定的方法和阈值算，判定语由系统写好，报告引用它；agent 只决定算什么（先验数据源健康与
+  跨源对账、发现断更或缺口即早停，通过后再拆维度或沿本体穿透）。跨源穿透以 caliber_query（在 inputs 中传对侧编码或标准实体键自动对齐实体编码）
+  为主路径；搭建者在 look 看到已确认的跨源标准实体桥时，可在对齐粒度后额外绑 1 跳关联源的 db_query__<关联源> 核查主数据或明细。
+  绑了任一个分析或本体工具，平台就把分析方法（含三段式穿透与健康检查规则）注入 agent 的 system，prompt 里不用再教方法，也不要写阈值。分析工具只分析这个
+  agent 自己查过的结果，所以只绑给同时绑了 db_query__ 或 caliber_query 的 agent；不能放进 tool 节点（模板里每次都要做的
+  固定分析用 analysis 分析卡）
   **默认不要写 max_steps、budget_tokens、budget_usd**。平台用的是护栏而不是固定步数：
   步数只是很高的兜底（跟随设置，默认 100），重复调用、连续几步没有新信息、预算用完、
   上下文快满时，它会按查到的部分收尾。写死一个小数字（见过 8）会让它查完表结构就没额度回答了。
@@ -228,7 +244,7 @@ NODE_REFERENCE = """\
   这周的变化在不在常规波动范围内、主要来自哪个地区）。问数据里要看了数才知道拆哪个维度的不用它，给查库的 agent 绑分析工具。
   config: {items:[{id, op, mode, from, params, hypothesis}], overrides, assign_to}
   · op：decompose（变化拆解，mode 选 additive 可加 / ratio 比率 / factor 乘积）、baseline（波动基线）、trend（趋势）、
-    differ（差异检验，mode 选 rate / mean / rows）、comparable（可比性检查）；hypothesis 一句话写这一项在验证什么
+    differ（差异检验，mode 选 rate / mean / rows）、comparable（可比性检查）、reconcile（跨源对账）、cochange（伴随异动）；hypothesis 一句话写这一项在验证什么
   · from 是要分析的上游查询节点 id：只能是调用 db_query__ 的 tool 节点或 merge 节点，而且连在分析卡之前；agent 不能当
     输入（它可能查了好几次）。基期、本期是两份查询时不写 from，在 params 里写 base_query、target_query 两个节点 id
   · params 和同名分析工具的参数一样（period、measure、by、base、target、headline……，不写 query），可以用 {{ input.x }}
@@ -271,10 +287,11 @@ NODE_REFERENCE = """\
     「根据 [[see:…]]」这样把它当成句子成分的示例，模型照着写会留下「以 为依据」这样的断句
   - 分析结论：[[a:A1]] 渲染成 A1 的判定语（系统按判定写好的一句，连同里面的数）；[[a:A1.top_share|pct]] 是它的一个具名的数
     （换算后缀同 [[m:]]）；[[v:A1.r0.share]]、[[table:A1 cols=地区,delta,share rows=0-4]] 取它的结果表；句末的 [[see:A1]]
-    把它当这句的依据。「主要来自」「集中在」「拖累」「异常」「大幅」「持续上升」「趋势」「显著高于」这类判断只能照分析结论的
-    判定写、挂它当依据（最好直接引用判定语），没有对应的分析结论就只陈述数字和变化；拆解只说明变化来自哪里、说明不了为什么，
-    写原因要有知识库原话或运行输入作依据，否则写成待核实的推测。这些规矩系统会告诉写作者，instructions 里写「按分析结论写、
-    判断引用判定语」就够了，不要替它把判断写好
+    把它当这句的依据；数据源健康探查（source_health）编成 H1、H2…，用 [[h:H1]] 渲染健康判定语、句末挂 [[see:H1]] 作数据断更或
+    缺口的依据。「主要来自」「集中在」「拖累」「异常」「大幅」「持续上升」「趋势」「显著高于」「伴随同步异动」这类判断只能照分析或
+    健康结论的判定写、挂它当依据（最好直接引用判定语），没有对应的分析结论就只陈述数字和变化；拆解与伴随异动（cochange）只说明
+    变化来自哪里或统计上同步异动、说明不了为什么，写「由于…导致」要有知识库原话或运行输入作依据，否则写伴随异动或待核实的推测。
+    这些规矩系统会告诉写作者，instructions 里写「按分析结论写、判断引用判定语」就够了，不要替它把判断写好
   - 涉及码值（状态、类型这类用数字编码的取值）时，instructions 里让模型写它的含义（「作废记录」），不要写码值本身：
     码值是没有出处的数字，会被数字核对打回重写
   metrics_from 不写就取所有上游口径卡；on_violation 不写时探索运行是 flag（标出来、照常产出），正式运行是 fail；
@@ -420,17 +437,27 @@ _ANALYSIS_PROMPT_CUTS = (
 )
 
 
-def node_reference(*, analysis_tools: bool = True) -> str:
+_ONTOLOGY_PROMPT_EDITS = (
+    ("，涉及已发布口径异常或跨源排查时一并绑上\n  ontology_neighbors、source_health 和 caliber_query", ""),
+    ("绑了任一个分析或本体工具，平台就把分析方法（含三段式穿透与健康检查规则）注入 agent 的 system，", "绑了任一个分析工具，平台就把分析方法注入 agent 的 system，"),
+    ("；数据源健康探查（source_health）编成 H1、H2…，用 [[h:H1]] 渲染健康判定语、句末挂 [[see:H1]] 作数据断更或\n    缺口的依据", ""),
+)
+
+
+def node_reference(*, analysis_tools: bool = True, ontology_tools: bool = True) -> str:
     """给助手的节点手册。analysis_tools 为假时去掉讲分析能力的那几段（_ANALYSIS_PROMPT_SPANS、_ANALYSIS_PROMPT_CUTS），
-    改写顺带提到它的几句（_ANALYSIS_PROMPT_EDITS）：手册里不再出现分析卡、分析工具和分析相关的配置键。"""
-    if analysis_tools:
-        return NODE_REFERENCE
+    改写顺带提到它的几句（_ANALYSIS_PROMPT_EDITS）：手册里不再出现分析卡、分析工具和分析相关的配置键；ontology_tools 为假时
+    去掉提到本体穿透与数据源健康工具的几处。"""
     text = NODE_REFERENCE
-    for start, end in (*_ANALYSIS_PROMPT_SPANS, *_ANALYSIS_PROMPT_CUTS):
-        i = text.index(start)
-        text = text[:i] + text[text.index(end, i):]
-    for old, new in _ANALYSIS_PROMPT_EDITS:
-        text = text.replace(old, new, 1)
+    if not analysis_tools:
+        for start, end in (*_ANALYSIS_PROMPT_SPANS, *_ANALYSIS_PROMPT_CUTS):
+            i = text.index(start)
+            text = text[:i] + text[text.index(end, i):]
+        for old, new in _ANALYSIS_PROMPT_EDITS:
+            text = text.replace(old, new, 1)
+    if not ontology_tools:
+        for old, new in _ONTOLOGY_PROMPT_EDITS:
+            text = text.replace(old, new, 1)
     return text
 
 
@@ -445,9 +472,15 @@ class GenerateIn(BaseModel):
     conversation_id: str | None = None
     #: 这一轮只查这几个数据源（id 或名字）。不传或空表示不限
     datasource_ids: list[str] | None = None
+    #: 这一轮在对话里是哪一轮（问数据那一轮：conversations.ConversationTurn.id）。固定执行起的那次运行要用它记来源
+    #: （和问数据自己发起的运行记同一份：chat/job.ChatDriver.generate_in）；画布、评测没有这一项
+    turn_id: str | None = None
     #: 问数据里用户原本问的那句话。自动重来、重试本轮时 instruction 是带着原因的那段话（「上一次运行没有成功：…」），
     #: 自查按问题判分析意图（app/analysis/intent）时用这一句；不传就用 instruction
     question: str | None = None
+    #: Ask Data 的固定请求（K12，app/ledger/nlchange.py）：已经明确 workflow/card/metric_ids/inputs 的请求直接进
+    #: QueryCore，不经模型的解析/规划；没匹配口径就进探索、含糊业务条件先澄清，不静默换计算规则。不传就是原来的问数据路径
+    fixed_request: dict[str, Any] | None = None
 
 
 def _question_of(payload: GenerateIn) -> str | None:
@@ -460,17 +493,29 @@ def _question_of(payload: GenerateIn) -> str | None:
 #: 问数据的包装里「分析类问题」那一条形状（00-总方案 §3.7）：问原因、来源、异常、趋势、差异的，判定由平台的分析工具算、系统写
 #: 判定语，报告引用它。问题意图另由自查按 app/analysis/intent 的词表再核一遍：分析类问题而查库的 agent 没绑分析工具时交回改一轮
 ANALYSIS_SHAPE_PROMPT = (
-    "- 问的是为什么、怎么变了、哪里拖累、谁贡献最大、是否异常、正常吗、波动、趋势、是不是真的更高这类分析问题时，搭 "
-    "input → agent → report → output：agent 绑 db_query__、db_schema__ 和五个分析工具（analysis_comparable、"
-    "analysis_baseline、analysis_trend、analysis_decompose、analysis_differ），prompt 里写清要回答的问题、比哪两期"
-    "（问题没说就比上一个整期），不用教分析方法（平台会注入）、不写阈值；report 的 instructions 写「回答：{{ input.question }}。"
-    "按分析结论写，判断直接引用判定语；没有分析结论的判断不下，原因没有依据的写成待核实的推测」（可以附上 "
-    "{{ nodes.agent的id.text }} 当分析思路）：数引用 agent 查过的单元格，判定引用它做过的分析结论。analysis_claims "
-    "用默认，不要关\n"
+    "- 问的是为什么、怎么变了、哪里拖累、谁贡献最大、是否异常、正常吗、波动、趋势、是不是真的更高、指标为什么越界或两套账对不上这类分析问题时，搭 "
+    "input → agent → report → output：agent 绑 db_query__、db_schema__、分析工具（analysis_comparable、"
+    "analysis_baseline、analysis_trend、analysis_decompose、analysis_differ、analysis_reconcile、analysis_cochange）以及 "
+    "ontology_neighbors、source_health、caliber_query（跨源穿透优先走 caliber_query 在 inputs 中自动对齐实体编码，搭建者有已确认跨源标准实体桥时可辅以 1 跳关联源 db_query__），"
+    "prompt 里写清要回答的问题、比哪两期（问题没说就比上一个整期），不用教分析方法（平台会注入三段式穿透与健康检查规则）、不写阈值；"
+    "report 的 instructions 写「回答：{{ input.question }}。按分析结论写（含数据源健康结论），判断直接引用判定语（[[a:]] / [[h:]]）；"
+    "没有分析结论的判断不下，伴随异动只写统计共变、原因没有依据的写成待核实的推测」（可以附上 {{ nodes.agent的id.text }} 当分析思路）："
+    "数引用 agent 查过的单元格，判定引用它做过的分析或源健康结论。analysis_claims 用默认，不要关\n"
 )
 
 
-def _user_message(payload: GenerateIn, *, patch: bool, analysis_tools: bool = True) -> str:
+ANALYSIS_SHAPE_NO_ONTOLOGY_PROMPT = (
+    "- 问的是为什么、怎么变了、哪里拖累、谁贡献最大、是否异常、正常吗、波动、趋势、是不是真的更高、指标为什么越界或两套账对不上这类分析问题时，搭 "
+    "input → agent → report → output：agent 绑 db_query__、db_schema__、分析工具（analysis_comparable、"
+    "analysis_baseline、analysis_trend、analysis_decompose、analysis_differ、analysis_reconcile、analysis_cochange），"
+    "prompt 里写清要回答的问题、比哪两期（问题没说就比上一个整期），不用教分析方法、不写阈值；"
+    "report 的 instructions 写「回答：{{ input.question }}。按分析结论写，判断直接引用判定语（[[a:]]）；"
+    "没有分析结论的判断不下，伴随异动只写统计共变、原因没有依据的写成待核实的推测」（可以附上 {{ nodes.agent的id.text }} 当分析思路）："
+    "数引用 agent 查过的单元格，判定引用它做过的分析结论。analysis_claims 用默认，不要关\n"
+)
+
+
+def _user_message(payload: GenerateIn, *, patch: bool, analysis_tools: bool = True, ontology_tools: bool = True) -> str:
     """把用户说的话包成给模型的请求。analysis_tools 为假（评测「关掉分析工具」那一臂）时不给分析类问题那一条形状。
 
     两个入口的语义完全不同，包法必须跟着变：
@@ -498,17 +543,18 @@ def _user_message(payload: GenerateIn, *, patch: bool, analysis_tools: bool = Tr
             # 而模板取不到值不报错，于是模型一本正经地基于空内容编一段回答
             "- 问题已经由系统注入成 `{{ input.question }}`，要用就写这一个。"
             "入口节点**不要声明任何字段**，也不会有人再填一次表单\n"
-            "- 涉及数据的问题必须用 db_query__* / db_schema__* 去真查，"
+            "- 涉及数据的问题先查已发布口径；已匹配且参数齐全时用 use_caliber 或已授权的 caliber_query 真查，"
+            "不要重复发现表结构。没有适用口径、需要探索时才用 db_query__* / db_schema__*，"
             "不要只对问题本身做文字加工（改写、摘要、分类都不是回答）\n"
             "- 出口节点给出的应当是这个问题的答案本身\n"
             # 二期起报告能直接引用 agent 查过的单元格：答案里的每个数都点得开出处，不必为问数硬塞一张口径卡。
             # 只问表结构、清单的没有数要核对，多一次写作调用只是多等十几秒
-            "- 答案里有数字时，搭 input → agent → report → output：agent 绑 db_query__ 去查，report 的 instructions 写"
+            "- 没有适用的已发布口径、需要探索且答案里有数字时，搭 input → agent → report → output：agent 绑 db_query__ 去查，report 的 instructions 写"
             "「回答：{{ input.question }}」（可以附上 {{ nodes.agent的id.text }} 当分析思路），数用 [[v:Q1.r0.列名]] "
             "直接引用 agent 查过的单元格，不必经过口径卡；要比率、增幅再在 agent 和 report 之间加口径卡，agent 配 "
             "output_schema + cite_fields，口径卡读 vars.<assign_to>.字段。出口字段写 {{ nodes.report的id.text }}\n"
-            # 分析类问题那一条形状（ANALYSIS_SHAPE_PROMPT）：评测「关掉分析工具」那一臂不给
-            + (ANALYSIS_SHAPE_PROMPT if analysis_tools else "")
+            # 分析类问题那一条形状（ANALYSIS_SHAPE_PROMPT）：评测「关掉分析工具」那一臂不给；「关掉本体穿透」那一臂去掉本体工具指引
+            + ((ANALYSIS_SHAPE_PROMPT if ontology_tools else ANALYSIS_SHAPE_NO_ONTOLOGY_PROMPT) if analysis_tools else "")
             + "- 只问表结构、清单（有哪些表、有哪些字段、列出名单）的，不加 report，agent → output 就行\n"
             # 三期起报告会核对写出来的表名、字段名：instructions 里让它「列出用到的表」时，编出来的名字会被标出来
             "- report 提到表名、字段名时写 [[t:表名]] / [[c:表名.字段名]]（英文名也可以放进反引号，中文名不行："
@@ -927,18 +973,24 @@ GRAPH_SCHEMA: dict[str, Any] = {
 
 
 def _graph_system(sources: list[Any], scope: set[str] | None, datasources: str, looks: Any, *,
-                  chat_user: bool = False, analysis_tools: bool = True) -> str:
+                  chat_user: bool = False, analysis_tools: bool = True, ontology_tools: bool = True) -> str:
     """画布、问数据（流式和非流式）共用的 system：节点手册、工具清单、数据源概览、结构要求、输出协议、查看的用法。
     这一份一直用到自查修正结束（接着写、修正轮都不换），模型前后看到的是同一套说法。
 
     chat_user：开登录后 user 角色的问数据（D-c）。内置工具只列只读的那几个，结构要求后面再加一段使用者的约束。
-    analysis_tools 为假（评测「关掉分析工具」那一臂）：节点手册去掉只讲分析能力的几段，工具清单不列分析工具。"""
+    analysis_tools 为假（评测「关掉分析工具」那一臂）：节点手册去掉只讲分析能力的几段，工具清单不列分析工具。
+    ontology_tools 为假（评测「关掉本体穿透」那一臂）：工具清单与手册去掉本体穿透工具。"""
     from app.auth.chat_policy import CHAT_BUILTIN_TOOLS
 
-    catalog = _tool_catalog(sources, builtins=CHAT_BUILTIN_TOOLS if chat_user else None, analysis_tools=analysis_tools)
+    catalog = _tool_catalog(sources, builtins=CHAT_BUILTIN_TOOLS if chat_user else None,
+                            analysis_tools=analysis_tools, ontology_tools=ontology_tools)
+    user_prompt = _CHAT_USER_PROMPT if ontology_tools else _CHAT_USER_PROMPT.replace(
+        "；指标异常或要跨系统排查关联指标时，给 agent 绑上 ontology_neighbors、source_health 和 caliber_query（跨源对齐切片写在 inputs 里），只在已授权口径范围内穿透排查",
+        "",
+    )
     return (
         "你是一个 agent 工作流编排专家。根据用户需求，以操作流的方式逐步搭出一张可执行的工作流图。\n\n"
-        f"{node_reference(analysis_tools=analysis_tools)}\n\n可用工具：\n{catalog}"
+        f"{node_reference(analysis_tools=analysis_tools, ontology_tools=ontology_tools)}\n\n可用工具：\n{catalog}"
         f"{datasources}{_scope_note(sources, scope is not None)}\n\n"
         "结构要求：\n"
         "1. 必须有且只有一个 input 节点和至少一个 output 节点\n"
@@ -946,7 +998,7 @@ def _graph_system(sources: list[Any], scope: set[str] | None, datasources: str, 
         "3. 用 assign_to 传结果，下游 {{ vars.变量名 }} 引用\n"
         "4. 只能用上面列出的工具名\n"
         "5. 能用 3 个节点解决就别堆 8 个"
-        f"{_CHAT_USER_PROMPT if chat_user else ''}\n\n"
+        f"{user_prompt if chat_user else ''}\n\n"
         f"{_STREAM_PROTOCOL}"
         # 问数据里能选用已发布口径时（next-round 02 做法 4）：协议多一段 use_caliber，「什么时候该看」换成问数据那一份
         + (f"\n{copilot_context.USE_CALIBER_PROMPT}" if copilot_context.composing(looks) else "")
@@ -971,8 +1023,12 @@ _CHAT_USER_PROMPT = (
     "2. tool 节点和 agent 都只能用 db_query__<数据源>、db_schema__<数据源> 和上面列出的内置工具：取数用 tool 节点"
     "（tool 写 db_query__<数据源>，args.sql 写好 SQL）或 agent（tools 里绑定这两种数据源工具）。不要用 http_request、"
     "records_append 这类写入或连外部的工具，工具名不要用 {{ }} 拼\n"
-    "3. 查询一律只读，不要写改数据的 SQL\n"
-    "4. 任何节点、图级 defaults、tool 节点的 args 里都不要写 memory_scope、collection：记忆范围和知识库由平台定"
+    "3. 上面工具清单里有 caliber_query（口径查询）：用户问的数只要在已发布口径里对得上，就照 look 交回的「取数写法」调它"
+    "取数（在 agent 的 prompt 里写清要调它、参数照抄），交回的指标值写进报告；指标异常或要跨系统排查关联指标时，给 agent 绑上 "
+    "ontology_neighbors、source_health 和 caliber_query（跨源对齐切片写在 inputs 里），只在已授权口径范围内穿透排查。"
+    "**不要**自己拿 db_query__ 拼一份差不多的 SQL 或直查未授权关联库的物理表，口径的 SQL 你也看不到、不要照着抄；没有对得上的口径时才自己查表\n"
+    "4. 查询一律只读，不要写改数据的 SQL\n"
+    "5. 任何节点、图级 defaults、tool 节点的 args 里都不要写 memory_scope、collection：记忆范围和知识库由平台定"
 )
 
 
@@ -1065,7 +1121,38 @@ def _analysis_off_issues(nodes: dict[str, dict[str, Any]], subgraphs: set[str] |
     return out
 
 
-def _graph_request(payload: GenerateIn, *, analysis_tools: bool = True) -> str:
+ONTOLOGY_TOOLS_OFF = "ontology_tools_off"
+
+
+def _ontology_off_issues(nodes: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """评测「关掉本体穿透」那一臂：图里绑定了 ontology_neighbors 或 source_health 的挡回模型去掉。"""
+    from app.tools.ontology import ONTOLOGY_TOOLS
+
+    out: list[dict[str, Any]] = []
+    for nid, node in nodes.items():
+        cfg = ((node or {}).get("data") or {}).get("config") or {}
+        ntype = (node or {}).get("type")
+        title = str(((node or {}).get("data") or {}).get("label") or "").strip() or nid
+        if ntype == NodeType.TOOL:
+            names = [cfg.get("tool")]
+        elif ntype == NodeType.AGENT:
+            names = list(cfg.get("tools") or [])
+        elif ntype == NodeType.SUPERVISOR:
+            names = [t for m in cfg.get("agents") or [] if isinstance(m, dict) for t in m.get("tools") or []]
+        else:
+            continue
+        bound = list(dict.fromkeys(n.strip() for n in names if isinstance(n, str) and n.strip() in ONTOLOGY_TOOLS))
+        if not bound:
+            continue
+        field = "tool" if ntype == NodeType.TOOL else "agents" if ntype == NodeType.SUPERVISOR else "tools"
+        out.append({"level": "error", "node_id": nid, "edge_id": None, "field": field, "code": ONTOLOGY_TOOLS_OFF,
+                    "message": f"绑定的工具不存在：「{title}」绑定的 {'、'.join(bound)}。这一轮没有本体穿透工具可用，请在节点中去掉它们",
+                    "for_model": f"「{nid}」绑定的 {'、'.join(bound)} 不在这一轮的工具清单里：从它的工具里去掉这几个，只用上面"
+                                 "列出的工具"})
+    return out
+
+
+def _graph_request(payload: GenerateIn, *, analysis_tools: bool = True, ontology_tools: bool = True) -> str:
     """这一轮的请求：改现有图时附上原图、只要改动操作；新建时按入口包好（_user_message）。"""
     if payload.base_graph and payload.base_graph.get("nodes"):
         return (
@@ -1073,7 +1160,7 @@ def _graph_request(payload: GenerateIn, *, analysis_tools: bool = True) -> str:
             f"{json.dumps(_slim(payload.base_graph), ensure_ascii=False, indent=2)}\n\n"
             f"请按下面的要求修改它（只输出改动操作）：\n{payload.instruction}"
         )
-    return _user_message(payload, patch=False, analysis_tools=analysis_tools)
+    return _user_message(payload, patch=False, analysis_tools=analysis_tools, ontology_tools=ontology_tools)
 
 
 def _start_graph(payload: GenerateIn) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
@@ -1337,7 +1424,7 @@ def _blocking_issues(
     *, sources: list[Any] | None = None, baseline: list[dict[str, Any]] | None = None,
     level: str | None = None, defaults: dict[str, Any] | None = None,
     checkers: dict[str, Any] | None = None, chat_user: bool = False, analysis_tools: bool = True,
-    off_subgraphs: set[str] | frozenset[str] = frozenset(),
+    ontology_tools: bool = True, off_subgraphs: set[str] | frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]] | None:
     """按运行时同一套校验，挑出会挡住运行的问题。图本身不成形时返回 None。
 
@@ -1375,7 +1462,8 @@ def _blocking_issues(
            + _issue_dicts(scope_issues(list(nodes.values()), scope), "datasource_out_of_scope")
            + [i for i in authored if i["level"] == "error"]
            + (_chat_user_issues(nodes, edges) if chat_user else [])
-           + ([] if analysis_tools else _analysis_off_issues(nodes, off_subgraphs)))
+           + ([] if analysis_tools else _analysis_off_issues(nodes, off_subgraphs))
+           + ([] if ontology_tools else _ontology_off_issues(nodes)))
     if level:
         from app.engine.governance import lint_for_publish
 
@@ -1870,7 +1958,308 @@ async def generate_stream(payload: GenerateIn):
     )
 
 
-async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_tools: bool = True):
+#: 这次执行走的是哪条路（final / error 的 execution.via）
+FIXED_VIA = "querycore"
+#: 这一次跑完了、但没算成（遮罩、空值、部分结果、超时）时给普通 user 的机器码
+RESULT_FAILED = "caliber_result_failed"
+#: 普通 user 看到的安全白话：内部的失败原话可能带着卡 id / 版本号 / 工作流引用与查询细节，不原样外发
+USER_FAILED = "这次没能按这份固定口径算出可用的数：可以换一种问法，或让搭建者检查这份口径是不是能用了"
+#: 普通 user 看得到的指标字段（id、质量检查、参数、查询引用这些内部材料一律不给）
+_USER_METRIC_KEYS = ("name", "value", "value_type", "rendered", "unit", "status", "masked", "decimals", "format")
+#: 结果摊平时认的属性名（两种实现交回的对象都按这一份读，见 _outcome_data）
+_OUTCOME_KEYS = ("run_id", "status", "ok", "workflow_id", "card_id", "version", "purpose", "publication",
+                 "selection", "parameters", "metrics", "queries", "data", "quality", "problems")
+
+
+def _outcome_data(outcome: Any) -> dict[str, Any]:
+    """这次固定执行的结果摊平成一份字典：两条路（搭建者的进程内固定执行、普通 user 的父图口径工具那条路）都认。"""
+    made = getattr(outcome, "as_dict", None)
+    if callable(made):
+        return dict(made())
+    if isinstance(outcome, Mapping):
+        return dict(outcome)
+    return {key: value for key in _OUTCOME_KEYS if (value := getattr(outcome, key, None)) is not None}
+
+
+def _user_metrics(data: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """普通 user 看到的指标值：只留业务上的名字与值，不留 id 与内部材料。"""
+    out: list[dict[str, Any]] = []
+    for metric in data.get("metrics") or ():
+        if isinstance(metric, Mapping):
+            out.append({key: metric[key] for key in _USER_METRIC_KEYS if metric.get(key) is not None})
+    return out
+
+
+def _user_execution(data: Mapping[str, Any]) -> dict[str, Any]:
+    """普通 user 看得到的那一段回执：via / run_id / status 与必要指标值。
+
+    没有卡 id、工作流 id、版本号、发布清单、选择、表、参数与查询引用（「不要让用户看到内部 ID」）。"""
+    made: dict[str, Any] = {"via": FIXED_VIA}
+    for key in ("run_id", "status"):
+        if data.get(key) is not None:
+            made[key] = data[key]
+    metrics = _user_metrics(data)
+    if metrics:
+        made["metrics"] = metrics
+    return made
+
+
+def _as_text(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def _user_error(message: str, code: str, data: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """普通 user 的失败结局：一句安全白话 + via / run_id / status + 已经拿到的指标值，不带任何内部引用。"""
+    failed = {"op": "error", "message": message, "code": code, "reason": message}
+    if data:
+        failed["execution"] = _user_execution(data)
+    return failed
+
+
+def _terminal(failed: dict[str, Any]) -> list[dict[str, Any]]:
+    """终止型结局：error（必要时带 execution）+ next。命中了但没授权、或者命中了执行失败，都走这里——不换路、不重来。"""
+    from app.chat import turn
+
+    return [{**failed, "next": turn.next_step(failed)}]
+
+
+def _not_permitted_ops(code: str) -> list[dict[str, Any]]:
+    """命中但没授权：终止型结局（error + next=fail），照实说没有授权，**不回退旧的 Agent 路径**。
+
+    说法和 `nlchange.auto_route` 的拒绝同一条（nlchange.NOT_PERMITTED）：两个字面出口共用一句，不出现任何内部引用。"""
+    from app.ledger import nlchange
+
+    return _terminal(_user_error(nlchange.NOT_PERMITTED, code))
+
+
+def _failed_ops(code: str, *, detail: str, ordinary: bool, data: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+    """命中之后的失败（清单、参数、绑定、超时……）：终止型结局。
+
+    搭建者及以上照实给内部原话（detail）；普通 user 只给安全白话——detail 里可能带着卡 id、版本号、工作流引用与查询
+    细节，一概不外发（投影点在这里）。"""
+    if ordinary:
+        return _terminal(_user_error(USER_FAILED, code, data))
+    return _terminal({"op": "error", "message": detail, "code": code, "reason": detail})
+
+
+def _builder_final(payload: GenerateIn, data: Mapping[str, Any]) -> dict[str, Any]:
+    """搭建者及以上看到的那条 final：全部依据（via / workflow / card / version / manifest / selection 引用）。"""
+    graph = payload.base_graph or {"nodes": [], "edges": []}
+    values = "、".join(f"{m.get('name') or m.get('id')} {_as_text(m.get('rendered'))}".strip()
+                      for m in data.get("metrics") or ())
+    return {"op": "final", "graph": graph, "issues": [], "autorun": False, "layout": {},
+            "explanation": f"QueryCore 按固定口径（v{data.get('version')}）算好了" + (f"：{values}" if values else ""),
+            "run_id": data.get("run_id"),
+            "execution": {"via": FIXED_VIA, "run_id": data.get("run_id"), "ok": data.get("ok"),
+                          "status": data.get("status"), "workflow_id": data.get("workflow_id"),
+                          "card_id": data.get("card_id"), "version": data.get("version"),
+                          "metrics": [dict(m) for m in data.get("metrics") or ()],
+                          "problems": [dict(p) for p in data.get("problems") or ()],
+                          "publication": dict(data.get("publication") or {}),
+                          "selection": dict(data.get("selection") or {})}}
+
+
+def _user_final(payload: GenerateIn, data: Mapping[str, Any]) -> dict[str, Any]:
+    """普通 user 看到的那条 final：安全白话 + via / run_id / status + 必要指标值。
+
+    这是投影点：口径身份（工作流 / 卡 / 版本）、发布清单与选择、表、参数、查询与哈希一概不出这个门——使用者看到的数是
+    「按这份口径算出来的」，不是「哪一版哪张卡哪条 SQL」（遮罩由执行那条路在工具边界保证）。"""
+    metrics = _user_metrics(data)
+    values = "、".join(text for text in (
+        f"{m.get('name') or ''} {_as_text(m.get('rendered') if m.get('rendered') is not None else m.get('value'))}"
+        .strip() for m in metrics) if text)
+    final = {"op": "final", "graph": payload.base_graph or {"nodes": [], "edges": []}, "issues": [],
+             "autorun": False, "layout": {},
+             "explanation": "按这份固定口径算好了" + (f"：{values}" if values else ""),
+             "execution": _user_execution(data)}
+    if data.get("run_id") is not None:
+        final["run_id"] = data["run_id"]
+    return final
+
+
+def _querycore_final(payload: GenerateIn, outcome: Any) -> dict[str, Any]:
+    """按固定口径算成之后的那条 final——固定请求接缝与自动路由**共用同一形状**（前端不必为多一条路改）。
+
+    搭建者及以上照旧清楚标出这是 QueryCore 的固定执行（via / workflow / card / version / manifest / selection 引用）和
+    这次的 run_id；普通 user 只给安全白话与 via / run_id / status / 必要指标值（见 _user_final）。autorun=false（运行
+    已经发生）。"""
+    from app.api.deps import restricted
+    from app.chat import turn
+
+    data = _outcome_data(outcome)
+    final = _user_final(payload, data) if restricted() else _builder_final(payload, data)
+    final["next"] = turn.next_step(final)
+    return final
+
+
+def _caller() -> tuple[Any, str | None]:
+    """这次请求的人：完整身份 + 主体名（关登录时是自报署名，可能为空）。"""
+    from app.api.deps import current_principal
+
+    principal = current_principal()
+    return principal, (principal.username or None)
+
+
+async def _allowed_calibers(session: AsyncSession, principal: Any) -> Any:
+    """这个人按**资产授权**能用的口径版本：{(工作流, 版本): 角色}；搭建者及以上不限（None）。
+
+    普通 user 只看「授权给它的应用当前版本钉住的那些口径版本」（app/apps/access.usable_calibers：AppGrant 的 use 及以上
+    加上当前 AppVersion.pins）。builder / admin / 关登录由调用方**显式放行**：它们本来就能直接按口径执行，不按资产授权
+    收窄，也不把它们的角色写进那个只认授权的函数里。"""
+    from app.api.deps import restricted
+    from app.apps import access
+
+    if not restricted():
+        return None
+    return await access.usable_calibers(session, principal)
+
+
+def _run_origin(payload: GenerateIn) -> dict[str, Any]:
+    """这条固定执行起的那次运行记在**哪一轮问数据**上（execute_prepared 的 origin）：对话 + 这一轮，和问数据自己发起的
+    运行记同一份（chat/job.ChatDriver.launch_args）。
+
+    运行靠它回溯到哪一轮（ledger/issue._conversation_of 取出具来源、证据与页面重载按它认「这次运行是哪一轮的」）；
+    没有对话时（画布上直接调、评测）不留空键，origin_kind 那一项照样是 chat（这次是问数据来源）。"""
+    origin = {"conversation_id": payload.conversation_id, "turn_id": payload.turn_id}
+    return {key: value for key, value in origin.items() if value}
+
+
+async def _prepared_execute(session: AsyncSession, *, request: Mapping[str, Any], purpose: str,
+                            actor: str | None, origin: Mapping[str, Any] | None = None) -> Any:
+    """普通 user 的执行：走 prepare 好的父图 + 真实 `caliber_query` 工具那条路（`querycore.execute_prepared`）。
+
+    遮罩与只读由那条路保证（父图按使用者的那一档发起，同他自己发起的问数据运行）：这里把这次的口径身份、指标与入口取值，
+    **当前认证主体**（记进运行来源，遮罩按它判）与**这次是哪段对话的哪一轮**（origin，见 `_run_origin`）交过去——那次运行
+    因此归属这一轮、能重载查看，不是一条来路不明的运行。purpose 是宿主常量那一档（普通问数 = compose，不要求正式验证
+    审阅）。按它的形参表筛一遍再调：那一边不收的键（比如 purpose，那条路自己固定成 compose）不塞进去——**只筛一次，
+    不重试**：重试等于再发一次运行。"""
+    from app.ledger import querycore
+
+    given: dict[str, Any] = {"workflow_id": request.get("workflow_id"), "card_id": request.get("card_id"),
+                             "metric_ids": list(request.get("metric_ids") or []),
+                             "inputs": dict(request.get("inputs") or {}), "version": request.get("version"),
+                             "purpose": purpose, "actor": actor, "origin_kind": "chat",
+                             "origin": dict(origin or {})}
+    parameters = inspect.signature(querycore.execute_prepared).parameters
+    if not any(item.kind == item.VAR_KEYWORD for item in parameters.values()):
+        given = {key: value for key, value in given.items() if key in parameters}
+    if not given.get("origin"):
+        given.pop("origin", None)          # 那一边不收空 origin（没有对话时不留一个空壳来源）
+    return await querycore.execute_prepared(session, **given)
+
+
+async def _execute_route(session: AsyncSession, *, request: Mapping[str, Any], purpose: str, actor: str | None,
+                         prepared: bool, payload: GenerateIn) -> Any:
+    """按一条已经定下来的固定请求执行：普通 user 走父图 + 真实 caliber_query 工具那条路，搭建者及以上直接固定执行。"""
+    if prepared:
+        return await _prepared_execute(session, request=request, purpose=purpose, actor=actor,
+                                       origin=_run_origin(payload))
+    from app.ledger import querycore
+
+    return await querycore.execute(session, purpose=purpose, **request)
+
+
+async def _fixed_request_ops(payload: GenerateIn):
+    """K12 的固定请求路由接缝（Ask Data）：确定请求**直接按固定口径执行**（内部 LLM 仍为 0），不经模型的解析/规划。
+
+    含糊业务条件先澄清（reply）、没有匹配口径就进探索（reply），绝不静默换计算规则；能确定的直接按固定口径执行一次，
+    交一条 final（autorun=false，运行已经发生）。普通 user 走**同一道授权闸**（app/apps/access.caliber_role：授权给它的
+    应用当前版本钉住的那些口径版本）与同一条执行路：没授权、或者执行失败（清单/参数/绑定/超时）都照实回一条终止型
+    结局（error + next=fail），**不降级成 Agent 路径**，也不绕过遮罩；数和说法只给安全白话。这一段不取助手模型、不读
+    目录、不拼历史——路由本身零模型。"""
+    from app.api.deps import restricted
+    from app.apps import access
+    from app.db.base import SessionLocal
+    from app.ledger import nlchange, querycore
+
+    ordinary = restricted()
+    principal, actor = _caller()
+    async with SessionLocal() as session:
+        routed = await nlchange.route(session, request=payload.fixed_request or {})
+        if routed.mode != nlchange.ROUTE_EXECUTE:
+            lines = [routed.reason]
+            lines += [item.question for item in routed.clarifications]
+            yield {"op": "reply", "text": "\n".join(line for line in lines if line)}
+            return
+        if ordinary:
+            # 和自动路由同一道闸：授权范围里没有这一版就到此为止，既不执行也不换路
+            role = await access.caliber_role(session, principal, str(routed.request.get("workflow_id") or ""),
+                                             int(routed.request.get("version") or 0))
+            if not access.at_least(role, "use"):
+                for op in _not_permitted_ops(nlchange.ROUTE_NOT_PERMITTED):
+                    yield op
+                return
+        request = {key: value for key, value in routed.request.items() if key != "purpose"}
+        purpose = str(routed.request.get("purpose") or querycore.DEFAULT_PURPOSE)
+        try:
+            outcome = await _execute_route(session, request=request, purpose=purpose, actor=actor, prepared=ordinary,
+                                     payload=payload)
+        except querycore.QueryCoreRefused as e:
+            for op in _failed_ops(e.code, detail=e.message, ordinary=ordinary):
+                yield op
+            return
+    data = _outcome_data(outcome)
+    if ordinary and data.get("ok") is False:
+        for op in _failed_ops(RESULT_FAILED, detail=USER_FAILED, ordinary=True, data=data):
+            yield op
+        return
+    yield _querycore_final(payload, outcome)
+
+
+async def _auto_route_ops(payload: GenerateIn) -> list[dict[str, Any]] | None:
+    """普通问数（intent=answer）的**保守默认路由**：高置信确定的请求直接按固定口径执行，未经模型。
+
+    搭建者及以上匹配之后直接进程内固定执行；普通 user 先过**资产授权**这道闸（app/apps/access.usable_calibers：授权给它
+    的应用当前版本钉住的那些口径版本）——命中了但没授权是**终止型结局**（照实说没有授权，不回退旧的 Agent 路径：那条路
+    会去翻底表），有权则走 prepare 好的父图 + 真实 caliber_query 工具那条路（遮罩与只读由它保证）。命中之后执行失败
+    （清单/权限/参数/绑定/超时等）**原样报错、绝不静默回退旧 Agent**。已知口径缺语义、参数不足或歧义直接澄清；
+    没匹配到或分析问题交回 None，继续探索。用户限定的数据源同样要检查。判定本身不调用模型。"""
+    from app.api.deps import restricted
+    from app.db.base import SessionLocal
+    from app.ledger import nlchange, querycore
+
+    ordinary = restricted()
+    principal, actor = _caller()
+    async with SessionLocal() as session:
+        # 和旧路径同一道门：请求带的对话读不了先照旧拒（不因为要自动路由就少判一次）
+        await _ensure_conversation_access(session, payload.conversation_id)
+        selected_sources = await _sources(session, payload.datasource_ids)
+        allowed_tools = {f"db_query__{source.name}" for source in selected_sources}
+        allowed = await _allowed_calibers(session, principal)
+        routed = await nlchange.auto_route(session, question=_question_of(payload) or payload.instruction,
+                                           allowed=allowed, source_tools=allowed_tools if payload.datasource_ids else None)
+        if routed is None:
+            return None
+        if routed.mode == nlchange.ROUTE_REFUSED:
+            return _not_permitted_ops(routed.code)
+        if routed.mode == nlchange.ROUTE_CLARIFY:
+            return [{"op": "reply", "text": routed.reason, "route": {"mode": routed.mode, "code": routed.code}}]
+        request = {key: value for key, value in routed.request.items() if key != "purpose"}
+        purpose = str(routed.request.get("purpose") or querycore.DEFAULT_PURPOSE)
+        if payload.datasource_ids:
+            from app.ledger import derive
+
+            try:
+                pinned = await derive.read_pinned(session, request["workflow_id"], request["version"], request["card_id"])
+                chosen = derive.select_pinned(pinned, metric_ids=request["metric_ids"])
+            except derive.NotDerivable:
+                return _failed_ops("caliber_unavailable", detail="口径取数依赖尚未就绪", ordinary=ordinary)
+            if any(tool not in allowed_tools for _, tool, _ in chosen.reads):
+                return [{"op": "reply", "text": "匹配到的口径使用了当前选择范围之外的数据源，请调整数据源范围或选择其他口径。",
+                         "route": {"mode": "clarify", "code": "source_scope_mismatch"}}]
+        try:
+            outcome = await _execute_route(session, request=request, purpose=purpose, actor=actor, prepared=ordinary,
+                                     payload=payload)
+        except querycore.QueryCoreRefused as e:
+            return _failed_ops(e.code, detail=e.message, ordinary=ordinary)
+    data = _outcome_data(outcome)
+    if ordinary and data.get("ok") is False:
+        return _failed_ops(RESULT_FAILED, detail=USER_FAILED, ordinary=True, data=data)
+    return [_querycore_final(payload, outcome)]
+
+
+async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_tools: bool = True,
+                     ontology_tools: bool = True):
     """生成过程：按需求起草、按需查看、自查修正、排版校验，逐条交出操作（op dict）。问数据页（经 SSE）和评测（直接迭代）
     走的是这同一条路（细案 01 做法 2）。
 
@@ -1887,17 +2276,41 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_
     的、有分析卡的、嵌套的子工作流里用了分析能力的，照「绑定的工具不存在」那一套挡回去改（_analysis_off_issues）。缺省为真，
     和以前一字不差。
 
-    final 带 next（chat/turn.next_step：run 运行、ready 只建不跑、fail 判失败），问数据页照它走。最后多交一条 usage
-    （providers/usage.py）：{op: usage, by_model, input_tokens, output_tokens, calls, cost_usd,
+    final 带 next（chat/turn.next_step：run 运行、ready 只建不跑、done 这一轮已经有了跑完的运行、fail 判失败），问数据页
+    照它走；运行不在这里发生（本函数只建图），固定执行那两条接缝的 final 带 execution，由 driver 收下那次运行。最后多交一条
+    usage（providers/usage.py）：{op: usage, by_model, input_tokens, output_tokens, calls, cost_usd,
     unpriced_calls}——这一轮助手建图（含挑表、接着写、自查修正）花了多少。前面每一条和抽出来之前逐条一样。运行不在这里，
     不计。
+
+    K12 两条接缝在取模型之前：带了 fixed_request 就按它走（见 _fixed_request_ops）；intent=answer、没带 fixed_request 时，
+    先试一次**保守默认路由**（app/ledger/nlchange.auto_route）——高置信确定的请求直接按固定口径执行，命中就交一条与固定
+    请求同形状的 final（见 _auto_route_ops），未命中什么都不做、照旧走下面那条路。普通 user 也走这条接缝，只是先过资产
+    授权那道闸（见 _allowed_calibers）：命中了但没授权是终止型结局，不回退、也不替它翻底表。
+
+    「什么时候该看」「看什么」按身份分（K14）：搭建者及以上的问数据能看已发布口径并用 use_caliber 选用；**普通使用者也
+    能看**（只列它有授权的版本），但用的是口径查询工具那条路（见 look 那一段与 copilot_context.LOOK_WHEN_QUERY_PROMPT）。
     """
-    from app.api.deps import restricted
+    from app.api.deps import current_principal, restricted
     from app.chat import turn
     from app.data.catalog_view import CatalogView
     from app.data.sqlcheck import load_checkers
     from app.db.base import SessionLocal
     from app.providers import usage
+
+    # K12 固定请求接缝：带了固定请求就按它走，不取模型、不读目录、不拼历史（见 _fixed_request_ops）
+    if payload.fixed_request:
+        async for op in _fixed_request_ops(payload):
+            yield op
+        return
+
+    # K12 保守默认路由：普通问数里高置信确定的请求直接按固定口径执行，不经模型。未命中什么都不做，照旧走下面那条路；
+    # 普通 user 也试，但先过资产授权那道闸——命中了但没权是终止型结局，不回退旧的 Agent 路径（见 _auto_route_ops）
+    if payload.intent == "answer":
+        auto = await _auto_route_ops(payload)
+        if auto is not None:
+            for op in auto:
+                yield op
+            return
 
     view = CatalogView.parse(catalog_view)
     async with SessionLocal() as session:
@@ -1918,29 +2331,67 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_
         except ProviderNotConfigured as e:
             raise HTTPException(400, _unconfigured(e)) from e
 
-        human = _with_history(_graph_request(payload, analysis_tools=analysis_tools),
-                              await _history_section(session, payload.conversation_id))
+        human = _with_history(
+            _graph_request(payload, analysis_tools=analysis_tools, ontology_tools=ontology_tools),
+            await _history_section(session, payload.conversation_id),
+        )
         # 兜底用：模型只发了改动操作时，把它们重放到这张图上
         prev_graph = await _previous_graph(session, payload.conversation_id)
         # 比对工具绑定的基准：画布上是改之前的图；问数据页是上一轮的图（沿用它的节点 id）
         baseline = copy.deepcopy(
             (payload.base_graph or {}).get("nodes") or (prev_graph or {}).get("nodes") or [])
         # 查看服务：读目录、读能力登记在开流之前做完。现有工作流（画布上的原图、问数据追问时上一轮的图）查过的表列在概览里。
-        # 问数据另看已发布口径、可以 use_caliber 选用（next-round 02 做法 4）：只给搭建者及以上——使用者的图里看得到拷进来的
-        # 取数 SQL（口径的 SQL 可能写着遮罩值），这一波不给
-        kinds = ("table", "capability", "caliber") if payload.intent == "answer" and not chat_user \
-            else ("table", "capability")
+        # 问数据另看已发布口径（next-round 02 做法 4），两档按身份分（K14）：搭建者及以上 look 之后可以用 use_caliber 把口径
+        # 带进图（服务端把它的取数节点拷过来，图里因此看得到拷进来的 SQL）；**普通使用者也看**，但只列它有授权的那些版本
+        # （look/calibers 按 actor 收窄），且不给 use_caliber——改用口径查询工具，提示与工具绑定都引导到 caliber_query
+        kinds = ("table", "capability", "caliber") if payload.intent == "answer" else ("table", "capability")
+        caliber = copilot_context.CALIBER_QUERY if chat_user else copilot_context.CALIBER_COMPOSE
         looks = await _look_service(session, payload, sources, graph=payload.base_graph if (
-            payload.base_graph or {}).get("nodes") else prev_graph, catalog_view=view, kinds=kinds)
+            payload.base_graph or {}).get("nodes") else prev_graph, catalog_view=view, kinds=kinds,
+            caliber=caliber if payload.intent == "answer" else copilot_context.CALIBER_LOOK,
+            actor=current_principal(), ontology=ontology_tools)
+        deep_grounding_note = ""
+        if payload.intent == "answer" and not chat_user:
+            from app.chat.grounding import ground_question
+
+            gb = await ground_question(
+                session,
+                _question_of(payload),
+                datasource_ids=payload.datasource_ids,
+                restricted=False,
+            )
+            extra_blocks: list[str] = []
+            if gb.matched_metrics:
+                m_lines = ["【预命中的独立语义指标卡片（可在 agent 节点的 tools 中绑定 `metric_query` 直接调用）】"]
+                for mm in gb.matched_metrics:
+                    m_lines.append(
+                        f"- `{mm['key']}`（{mm['name']}，数据源 `{mm['source_name']}`，底表 `{mm['table_name']}`）："
+                        f"表达式 `{mm['sql_expression']}`"
+                        + (f"，时间列 `{mm['date_column']}`" if mm["date_column"] else "")
+                    )
+                extra_blocks.append("\n".join(m_lines))
+            if gb.matched_entities:
+                e_lines = ["【预命中的标准业务实体与底层编码映射（写 SQL 或调工具时直接使用）】"]
+                for me in gb.matched_entities:
+                    binds = "；".join(f"`{b['source_name']}.{b['table_name']}.{b['column_name']}`" for b in me["bindings"])
+                    e_lines.append(f"- `{me['key']}`（{me['label']}）：绑定列 {binds}")
+                    for mem in me["matched_members"]:
+                        codes = "，".join(f"{s}=`{c}`" for s, c in mem["resolved_codes"].items())
+                        if codes:
+                            e_lines.append(f"  · 「{mem['matched_term']}」→ 标准成员「{mem['label']}」→ {codes}")
+                extra_blocks.append("\n".join(e_lines))
+            if extra_blocks:
+                deep_grounding_note = "\n\n" + "\n\n".join(extra_blocks)
     # 这一份 system 一直用到最后：接着写、自查修正都沿用，不换
     system = _graph_system(sources, scope, await copilot_context.section(looks), looks, chat_user=chat_user,
-                           analysis_tools=analysis_tools)
-    applier = GraphApplier(nodes, edges, composer=copilot_context.composer(looks))
+                           analysis_tools=analysis_tools, ontology_tools=ontology_tools) + deep_grounding_note
+    # 使用者看得见口径但不能选用（K14）：模型发了 use_caliber 时照实拒收、自查交回它改用口径查询工具（见 GraphApplier）
+    applier = GraphApplier(nodes, edges, composer=copilot_context.composer(looks), no_compose=chat_user)
     started = time.monotonic()
     gen = Generation(model, system=system, applier=applier, looks=looks, started=started,
                      checker=GraphChecker(applier, scope=scope, sources=sources, baseline=baseline, checkers=checkers,
                                           chat_user=chat_user, question=_question_of(payload),
-                                          analysis_tools=analysis_tools))
+                                          analysis_tools=analysis_tools, ontology_tools=ontology_tools))
 
     async def steps():
         yield {"op": "model", "model": model_id}
@@ -2008,7 +2459,8 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_
             yield op
         off_subgraphs = set() if analysis_tools else await analysis_off_subgraphs(nodes)
         remaining = _blocking_issues(nodes, edges, scope, sources=sources, baseline=baseline, checkers=checkers,
-                                     chat_user=chat_user, analysis_tools=analysis_tools, off_subgraphs=off_subgraphs)
+                                     chat_user=chat_user, analysis_tools=analysis_tools, ontology_tools=ontology_tools,
+                                     off_subgraphs=off_subgraphs)
         # 工具绑定变化不挡运行，但要在自查这一步就说出来：工具被改没了的图照样
         # 能跑，只是跑出来的是模型「假设」查过库的答案
         changes = tool_changes(baseline, list(nodes.values()))
@@ -2046,6 +2498,7 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_
             issues += _chat_user_issues(nodes, edges) if chat_user else []
             # 关掉分析工具的那一臂里还绑着分析工具的（自查没改好）：同上，照实列出，不运行
             issues += [] if analysis_tools else _analysis_off_issues(nodes, off_subgraphs)
+            issues += [] if ontology_tools else _ontology_off_issues(nodes)
             # 跳过的节点要说出来，不能安静地少一步。code 给前端认：这一类要单独
             # 提示「少了一步」，不能和普通校验警告混在一起
             issues += [
@@ -2054,9 +2507,11 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_
                  "message": f"模型使用了不存在的节点类型「{t}」，已跳过这一步"}
                 for t in dict.fromkeys(applier.skipped_types)
             ]
+            from app.chat.optimization import prepare as prepare_ask_data
+
             final = {
                 "op": "final",
-                "graph": spec.model_dump(mode="json"),
+                "graph": prepare_ask_data(spec.model_dump(mode="json"), _question_of(payload) or payload.instruction),
                 "issues": issues + warnings,
                 "explanation": applier.explanation,
                 "autorun": autorun,
@@ -2076,6 +2531,14 @@ async def answer_ops(payload: GenerateIn, *, catalog_view: Any = None, analysis_
     spent = usage.meter()
     async for op in usage.metered(steps(), spent):
         yield op
+    if applier.caliber_uses:
+        # 调用审计（caliber.use）：这一轮选用了哪几版口径、带什么参数。只记指纹，不落参数值；失败不影响这一轮交付
+        from app.ledger.usage import audit_composed_uses
+
+        try:
+            await audit_composed_uses(applier.caliber_uses, conversation_id=payload.conversation_id)
+        except Exception:  # noqa: BLE001 - 审计是附加记录，不能挡住已经生成的图
+            logger.warning("记录口径调用审计失败", exc_info=True)
     yield {"op": "usage", **spent.summary()}
 
 
@@ -2963,6 +3426,30 @@ async def review_run(
                                model=payload.model, always=payload.always, attempt=payload.attempt)
 
 
+async def _has_ontology_penetration_candidates(session: AsyncSession, rows: list[Any]) -> bool:
+    """这次运行若还没走本体穿透（未调用 ontology_neighbors），且工作区存在已确认的已发布本体关联或跨源标准实体桥，则允许提示/升级本体排查。"""
+    from app.core.events import EventType
+    from app.data.entities import confirmed_bindings, list_entities
+    from app.ledger.ontology import build_published_ontology_graph
+
+    for e in rows:
+        etype = str(getattr(e, "type", "") if not isinstance(e, Mapping) else e.get("type", ""))
+        data = (getattr(e, "data", None) if not isinstance(e, Mapping) else e.get("data")) or {}
+        if etype in (EventType.TOOL_START, EventType.TOOL_END) and data.get("tool") == "ontology_neighbors":
+            return False
+    try:
+        ont = await build_published_ontology_graph(session, include_proposed=False)
+        if ont.get("edges"):
+            return True
+        for ent in await list_entities(session):
+            active = confirmed_bindings(ent)
+            if len({str(b.get("source_name") or "").lower() for b in active if b.get("source_name")}) >= 2:
+                return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
 async def review_of_run(session: AsyncSession, run: Any, *, question: str, provider: str | None = None,
                         model: str | None = None, always: bool = False, attempt: int = 0) -> dict[str, Any]:
     """复核一次运行（问数据页经 /copilot/review、评测直接调，同一个函数）。
@@ -2979,6 +3466,7 @@ async def review_of_run(session: AsyncSession, run: Any, *, question: str, provi
       是交给助手的那句话（chat/turn.retry_instruction），不要是 null。问数据页照它走；
     - usage：复核这一次模型调用花了多少（providers/usage.py 的汇总，没调模型时是全 0），这一轮的花费 = 助手 + 运行 + 复核。
     """
+    from app.api.settings import anomaly_escalation_mode
     from app.chat import turn
     from app.db.models import RunEvent
     from app.engine import review as rv
@@ -2992,12 +3480,35 @@ async def review_of_run(session: AsyncSession, run: Any, *, question: str, provi
     signals = rv.scan(rows, output)
     answer = rv.answer_text(output)
     spent = usage.meter()
+    hit_escalation = [s for s in signals if s.kind in rv.ESCALATION_SIGNALS]
+    can_escalate = bool(hit_escalation) and await _has_ontology_penetration_candidates(session, rows)
+    esc_mode = await anomaly_escalation_mode(session) if can_escalate else "prompt"
 
     def done(result: Any) -> dict[str, Any]:
         out = result.as_dict()
+        has_base = turn.has_nodes(run.graph)
         out["retry_instruction"] = (
-            turn.retry_instruction(question, turn.review_reason(out), turn.has_nodes(run.graph))
+            turn.retry_instruction(question, turn.review_reason(out), has_base)
             if turn.retry_after_review(out, attempt) else None)
+        if can_escalate:
+            esc_reason = "；".join(s.detail for s in hit_escalation if s.detail) or turn.review_reason(out)
+            follow_up = turn.escalation_instruction(question, esc_reason, has_base)
+            auto_esc = esc_mode == "auto" and attempt == 0
+            out["anomaly_escalation"] = {
+                "available": True,
+                "mode": esc_mode,
+                "auto_escalate": auto_esc,
+                "button_label": turn.ESCALATION_BUTTON_LABEL,
+                "signals": [s.kind for s in hit_escalation],
+                "reason": esc_reason,
+                "follow_up_instruction": follow_up,
+            }
+            if auto_esc:
+                out["retry_instruction"] = follow_up
+                out["escalation"] = True
+            elif esc_mode == "prompt" and all(s.kind in rv.ESCALATION_SIGNALS for s in signals):
+                # P1：默认 prompt 模式下，简单查数命中硬异常信号只提示用户一键本体排查，不自动烧额外一轮重跑
+                out["retry_instruction"] = None
         out["usage"] = spent.summary()
         return out
 

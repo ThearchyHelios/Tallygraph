@@ -286,6 +286,12 @@ def plain_day(sql: str, column: str, dialect: str | None) -> bool:
     if isinstance(value, (exp.Date, exp.TsOrDsToDate)):
         extra = [v for k, v in value.args.items() if k != "this" and v not in (None, [], False)]
         value = cf._unwrap(value.this) if not extra else None
+    elif isinstance(value, (exp.Cast, exp.TryCast)):
+        to_type = value.args.get("to")
+        if isinstance(to_type, exp.DataType) and to_type.this == exp.DataType.Type.DATE:
+            value = cf._unwrap(value.this)
+        else:
+            value = None
     return isinstance(value, exp.Column) and not isinstance(value.this, exp.Star)
 
 

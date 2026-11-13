@@ -26,7 +26,8 @@ import { useAtLeast, useLoginOn } from '../store/auth'
 import { useCatalog } from '../store/catalog'
 import { askKey, segmentKey, useEvidence, useExplore, useVerdicts } from '../store/evidence'
 import type {
-  ApprovalReport, EvidenceAnalysisStep, EvidenceBlock, EvidenceChallengeVerdicts, EvidenceDocData, EvidenceDualCheck, EvidenceInput, EvidenceMerge,
+  ApprovalReport, EvidenceAnalysisStep, EvidenceBlock, EvidenceChallengeVerdicts, EvidenceDocData, EvidenceDualCheck, EvidenceHealthStep,
+  EvidenceInput, EvidenceMerge,
   EvidenceOnDemand, EvidenceQuoteSource, EvidenceSeal, EvidenceSegment, EvidenceSegmentDetail, EvidenceStep, EvidenceUnit,
   EvidenceUnitChallenge, EvidenceUntraced, EvidenceVerdict, EvidenceViolation,
 } from '../types'
@@ -354,13 +355,15 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
   // 后面接输入快照的查询步骤
   const analysisChain = chain.filter((s) => s.step.startsWith('analysis')) as unknown as EvidenceAnalysisStep[]
   const isAnalysis = cite?.kind === 'analysis' || entry?.kind === 'analysis' || analysisChain.some((s) => s.step === 'analysis')
-  const isMetric = !isAnalysis && (cite?.kind === 'metric' || entry?.kind === 'metric' || !!metricStep)
-  const isInput = !isAnalysis && (cite?.kind === 'input' || entry?.kind === 'input' || !!inputStep)
+  const healthChain = chain.filter((s) => s.step === 'source_health' || s.step === 'health_seal') as unknown as EvidenceHealthStep[]
+  const isHealth = !isAnalysis && (cite?.kind === 'source_health' || entry?.kind === 'source_health' || healthChain.some((s) => s.step === 'source_health'))
+  const isMetric = !isAnalysis && !isHealth && (cite?.kind === 'metric' || entry?.kind === 'metric' || !!metricStep)
+  const isInput = !isAnalysis && !isHealth && (cite?.kind === 'input' || entry?.kind === 'input' || !!inputStep)
   // 三期：有出处的表名字段名、引文（原话对不上的引文也画这一节：说清原文在哪、对不上）
-  const isEntity = !isAnalysis && !isMetric && !isInput && seg.kind === 'entity' && state === 'deterministic'
-  const isQuote = !isAnalysis && !isMetric && !isInput && seg.kind === 'quote'
+  const isEntity = !isAnalysis && !isHealth && !isMetric && !isInput && seg.kind === 'entity' && state === 'deterministic'
+  const isQuote = !isAnalysis && !isHealth && !isMetric && !isInput && seg.kind === 'quote'
   // 报告直接引用的查询单元格（[[v:Q3.r5.amount]]、整表里的一格）：证据链就是那一次查询
-  const isCell = !isAnalysis && !isMetric && !isInput && !isEntity && !isQuote
+  const isCell = !isAnalysis && !isHealth && !isMetric && !isInput && !isEntity && !isQuote
     && (cite?.kind === 'cell' || entry?.kind === 'query' || !!queries.length)
   const bad = state === 'none' || state === 'suspect' || state === 'unverified'
   const closest = closestNames(detail?.closest ?? entityStep?.closest)
@@ -533,6 +536,10 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
         <AnalysisChain chain={analysisChain} seal={seal} pending={pending} failed={chainFailed} onQuery={jumpToQuery} />
       )}
 
+      {isHealth && (
+        <HealthPart chain={healthChain} entry={entry} alias={cite?.alias} seal={seal} pending={pending} failed={chainFailed} />
+      )}
+
       {isEntity && (
         <EntityPart step={entityStep} entry={entry} cite={cite} seal={seal} pending={pending}
                     failed={chainFailed} catalog={doc.catalog} />
@@ -602,7 +609,7 @@ function SegmentBody({ panelId, doc, artifact, runId, runClass, seg, unit, block
 
       {provenanceOn && runId && <EvidenceProvenance runId={runId} segId={seg.id} report={report} />}
 
-      {state === 'deterministic' && !isAnalysis && !isMetric && !isInput && !isCell && !isEntity && !isQuote && (
+      {state === 'deterministic' && !isAnalysis && !isHealth && !isMetric && !isInput && !isCell && !isEntity && !isQuote && (
         <p className="text-dim">{sourceOf(seg, doc) || detail?.note}</p>
       )}
 
@@ -2085,6 +2092,104 @@ function MergeTraces({ alias, merge }: { alias: string; merge: EvidenceMerge }) 
         ))}
       </ul>
     </div>
+  )
+}
+
+const HEALTH_VERDICT_LABEL: Record<string, { label: string; color: string }> = {
+  healthy: { label: '正常', color: 'var(--st-done)' },
+  ok: { label: '正常', color: 'var(--st-done)' },
+  degraded: { label: '存在缺口', color: 'var(--st-waiting)' },
+  gap: { label: '存在缺口', color: 'var(--st-waiting)' },
+  anomalous: { label: '异常', color: 'var(--st-failed)' },
+  error: { label: '核查出错', color: 'var(--st-failed)' },
+}
+
+function HealthPart({ chain, entry, alias, seal, pending, failed }: {
+  chain: EvidenceHealthStep[]
+  entry?: Record<string, any>
+  alias?: string
+  seal?: EvidenceSeal
+  pending: boolean
+  failed: string
+}) {
+  const step = chain.find((s) => s.step === 'source_health')
+  const hSeal = chain.find((s) => s.step === 'health_seal')
+  const shownAlias = step?.alias ?? alias ?? (typeof entry?.alias === 'string' ? entry.alias : '')
+  const verdictCode = step?.verdict ?? (typeof entry?.verdict === 'string' ? entry.verdict : '')
+  const verdictMeta = verdictCode ? HEALTH_VERDICT_LABEL[verdictCode] : undefined
+  const phrase = step?.phrase ?? (typeof entry?.phrase === 'string' ? entry.phrase : '')
+  const sources = Array.isArray(step?.sources) ? step.sources.filter(Boolean)
+    : Array.isArray(entry?.sources) ? entry.sources.map(String).filter(Boolean) : []
+  const tables = Array.isArray(step?.tables) ? step.tables : []
+  const issues = Array.isArray(step?.issues) ? step.issues : []
+  const trusted = !!seal?.sealed && seal.ok !== false
+  const problems = [
+    step?.eid_ok === false ? EVIDENCE_TEXT.integrity.eid : '',
+    step?.hash_ok === false ? '健康核查快照与已记录哈希不一致' : '',
+    step?.render_ok === false && step?.hash_ok !== false ? '正文显示的健康核查结论与快照记录不一致' : '',
+    step?.note ?? '',
+    trusted && hSeal && hSeal.sealed === false && hSeal.note ? hSeal.note : '',
+  ].filter(Boolean)
+
+  return (
+    <Part title={`数据源健康核查${shownAlias ? ` · ${shownAlias}` : ''}`} data-ev-health={shownAlias}>
+      <div className="flex flex-wrap items-center gap-1.5">
+        {verdictMeta ? (
+          <span className="chip" style={{ color: verdictMeta.color, borderColor: verdictMeta.color }}
+                data-ev-health-verdict={verdictCode}>
+            {verdictMeta.label}
+          </span>
+        ) : verdictCode ? (
+          <span className="chip mono" data-ev-health-verdict={verdictCode}>{verdictCode}</span>
+        ) : null}
+        {sources.map((src) => (
+          <span key={src} className="chip mono text-2xs" data-ev-health-source={src}>{src}</span>
+        ))}
+      </div>
+      {phrase && <p className="mt-1 font-medium" data-ev-health-phrase="">{phrase}</p>}
+      {tables.length > 0 && (
+        <div className="mt-1.5 space-y-1">
+          <div className="text-2xs font-medium text-faint">已核查的数据表</div>
+          <ul className="space-y-1 rounded bg-bg px-2 py-1.5 text-2xs" data-ev-health-tables="">
+            {tables.map((tb, idx) => {
+              const name = [tb.source, tb.table].filter(Boolean).join('.') || NONE
+              const min = Array.isArray(tb.data_range) ? tb.data_range[0] : null
+              const max = Array.isArray(tb.data_range) ? tb.data_range[1] : null
+              const range = min || max ? `${min || '—'} ~ ${max || '—'}` : ''
+              const gapCount = typeof tb.gaps === 'number' && tb.gaps > 0 ? tb.gaps : 0
+              return (
+                <li key={`${name}-${idx}`} className="min-w-0 [overflow-wrap:anywhere]" data-ev-health-table={name}>
+                  <span className="mono font-medium">{name}</span>
+                  {tb.status && <span className="ml-1.5 text-dim">· {tb.status}</span>}
+                  {tb.date_column && <span className="mono ml-1.5 text-faint">· {tb.date_column}</span>}
+                  {range && <span className="mono ml-1.5 text-dim">（{range}）</span>}
+                  {gapCount > 0 && (
+                    <span className="ml-1.5" style={{ color: 'var(--st-waiting)' }}>
+                      · 断档 {formatNumber(gapCount)} 处
+                    </span>
+                  )}
+                </li>
+              )
+            })}
+          </ul>
+        </div>
+      )}
+      {issues.length > 0 && (
+        <ul className="mt-1.5 space-y-0.5 text-2xs" style={{ color: 'var(--st-waiting)' }} data-ev-health-issues="">
+          {issues.map((iss, idx) => (
+            <li key={`${iss.code ?? ''}-${idx}`}>
+              · {iss.message || iss.code || NONE}
+            </li>
+          ))}
+        </ul>
+      )}
+      <IntegrityList code="health" items={problems} />
+      {!step && (
+        <p className="mt-1.5 text-2xs text-faint" data-ev-chain={pending ? 'loading' : 'missing'}>
+          {pending ? '正在加载健康核查记录…' : failed || '未能获取健康核查记录'}
+        </p>
+      )}
+    </Part>
   )
 }
 

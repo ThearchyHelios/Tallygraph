@@ -12,7 +12,7 @@ import {
   confirmDialog, DeleteButton, EmptyState, ErrorState, Field, HealthPill, isComposing, Modal, PageHeader,
   promptDialog, SectionBar, Skeleton, Spinner, TabPanel, Tabs, toast, useRadioGroup, useTabRoute,
 } from '../components/ui'
-import { setThemePref, useTheme } from '../components/CommandPalette'
+import { setThemePref, useTheme } from '../components/shellCommands'
 import { errorMessage } from '../lib/errors'
 import { formatNumber, shortLabel } from '../lib/format'
 import { checkHealth, forgetHealth, healthFromServer, setHealth, useHealth } from '../lib/health'
@@ -694,6 +694,8 @@ function PrefsTab() {
     appsPersonal: boolean
     // 允许建分享链接（服务端 apps.share_links，04 细案 C2，默认关）
     appsShare: boolean
+    // 问数异常跨源排查策略（服务端 investigation.auto_escalate_on_anomaly，默认 prompt）
+    autoEscalate: 'prompt' | 'auto'
   } | null>(null)
   const [spend, setSpend] = useState<{ usd?: number; calls?: number; unpriced_calls?: number } | null>(null)
   // 核查一组（双盲复算、反方审稿、审批质询）的草稿另放一份，和上面的共用保存条；verifySaves 是存过几次，今日核查花费跟着再取
@@ -752,6 +754,7 @@ function PrefsTab() {
     appsDaily: String(values?.apps?.on_demand_daily_limit ?? APPS_DAILY_DEFAULT),
     appsPersonal: values?.apps?.user_personal_apps === true,
     appsShare: values?.apps?.share_links === true,
+    autoEscalate: (values?.investigation?.auto_escalate_on_anomaly === 'auto' ? 'auto' : 'prompt') as 'prompt' | 'auto',
   }
   const cur = draft ?? saved
   const stepCap = Number(values?.limits?.max_agent_steps) || 100
@@ -853,7 +856,8 @@ function PrefsTab() {
     const judgeChanged = changed.some((k) => JUDGE_DRAFT.has(k))
     const draftChanged = changed.some((k) => DRAFT_MODEL_DRAFT.has(k))
     const appsChanged = changed.some((k) => APPS_DRAFT.has(k))
-    const runChanged = changed.some((k) => k !== 'actor' && !APPS_DRAFT.has(k) && !JUDGE_DRAFT.has(k) && !DRAFT_MODEL_DRAFT.has(k))
+    const investigationChanged = changed.some((k) => INVESTIGATION_DRAFT.has(k))
+    const runChanged = changed.some((k) => k !== 'actor' && !APPS_DRAFT.has(k) && !JUDGE_DRAFT.has(k) && !DRAFT_MODEL_DRAFT.has(k) && !INVESTIGATION_DRAFT.has(k))
     try {
       // 裁判一组整组写：后端对没给的键回落到默认值，只发改过的那一项会把别的项冲回默认
       const judge = judgeChanged ? {
@@ -878,7 +882,10 @@ function PrefsTab() {
         ? { ...(values.apps ?? {}), on_demand_daily_limit: Number(cur.appsDaily.trim()), user_personal_apps: cur.appsPersonal,
             share_links: cur.appsShare }
         : null
-      if (runChanged || judge || verify || ledger || analysis || catalogDraft || apps) {
+      const investigation = investigationChanged
+        ? { ...(values.investigation ?? {}), auto_escalate_on_anomaly: cur.autoEscalate }
+        : null
+      if (runChanged || judge || verify || ledger || analysis || catalogDraft || apps || investigation) {
         const run = {
           ...(values.run ?? {}),
           default_memory_scope: cur.scope,
@@ -894,6 +901,7 @@ function PrefsTab() {
           ...(runChanged ? { run } : {}), ...(judge ? { judge } : {}), ...(verify ? { verify } : {}),
           ...(ledger ? { ledger } : {}), ...(analysis ? { analysis } : {}),
           ...(catalogDraft ? { catalog_draft: catalogDraft } : {}), ...(apps ? { apps } : {}),
+          ...(investigation ? { investigation } : {}),
         })
         setValues((v) => ({
           ...(v ?? {}),
@@ -904,6 +912,7 @@ function PrefsTab() {
           ...(analysis ? { analysis: out?.analysis ?? analysis } : {}),
           ...(catalogDraft ? { catalog_draft: out?.catalog_draft ?? catalogDraft } : {}),
           ...(apps ? { apps: out?.apps ?? apps } : {}),
+          ...(investigation ? { investigation: out?.investigation ?? investigation } : {}),
         }))
         // 每日上限改了：旁边那句「今天已花」的分母跟着变，顺手再取一次
         if (judge) void loadSpend()
@@ -1231,6 +1240,31 @@ function PrefsTab() {
 
           {values.analysis && <AnalysisSection cur={analysisCur} errors={analysisErrs} onEdit={editAnalysis} />}
 
+          <section data-investigation-settings="">
+            <SectionBar
+              title="问数异常跨源排查"
+              hint="简单查询在复核中命中指标契约告警、空结果或对账告警时，如何沿已确认业务本体升级排查关联数据源。"
+            />
+            <Field
+              label="触发异常时的处置策略"
+              htmlFor="pref-auto-escalate"
+              hint="默认提示一键排查，保证日常普通查询零额外开销；自动升级模式在同一轮最多自动重试一次。"
+            >
+              {(p) => (
+                <select
+                  {...p}
+                  className="field max-w-md"
+                  value={cur.autoEscalate}
+                  data-setting-auto-escalate=""
+                  onChange={(e) => edit({ autoEscalate: e.target.value === 'auto' ? 'auto' : 'prompt' })}
+                >
+                  <option value="prompt">提示一键排查（默认，日常查询零额外开销）</option>
+                  <option value="auto">自动升级跨源排查（每轮最多自动重试一次）</option>
+                </select>
+              )}
+            </Field>
+          </section>
+
           {values.catalog_draft && (
             <DraftModelSection provider={cur.draftProvider} model={cur.draftModel} onEdit={edit}
                                error={fieldError?.field === 'catalog_draft.provider' ? fieldError.message : undefined} />
@@ -1295,6 +1329,7 @@ function PrefsTab() {
                     draftProvider: DRAFT_MODEL_SETTING_TEXT.provider, draftModel: DRAFT_MODEL_SETTING_TEXT.model,
                     appsDaily: APP_SETTING_TEXT.onDemandLimit, appsPersonal: APP_SETTING_TEXT.personalApps,
                     appsShare: APP_SETTING_TEXT.shareLinks,
+                    autoEscalate: '问数异常跨源排查',
                   })[k]).concat(verifyLabels(verifyKeys), ledgerLabels(ledgerKeys), analysisLabels(analysisKeys)).join('、')}
                 </span>
               </span>
@@ -1334,6 +1369,8 @@ function PrefsTab() {
 
 /** 应用一组在草稿里的几项：保存时整组写 apps */
 const APPS_DRAFT = new Set(['appsDaily', 'appsPersonal', 'appsShare'])
+/** 问数异常跨源排查设置项 */
+const INVESTIGATION_DRAFT = new Set<string>(['autoEscalate'])
 
 /** 按需视图每日上限的缺省值和最大值（同服务端 settings.APPS_DEFAULTS、APPS_DAILY_LIMIT_MAX） */
 const APPS_DAILY_DEFAULT = 200

@@ -11,6 +11,11 @@ query 的条目：报告照样按先后编成 Qn，[[v:Qn.rK.列]]、[[table:Qn 
 
 **重放结果一致。** 快照里没有耗时这类每次不同的字段：节点重放、继续运行时同样的输入得到同一个工件 id、同一条
 台账，报告里已经写下的出处不会因此变成另一份快照。
+
+**服务端拼的语句不再被当模板。** 对账图里按维度值对齐的那条合并语句（ledger/reconcile 的 align_sql）由服务端拼成字面
+SQL，值来自查询结果、里面可能带 `{{ }}`：那种节点带参数契约（ledger/params 的 marker），契约里的 rendered_hash 与当前
+`sql` 对得上时这里的模板渲染跳过它——渲染一遍就是把数据当模板解释（K01 的二次渲染反例）。**核对过哈希才算**：节点被
+复制、sql 改过之后契约作废，照下面的正常渲染走。画布上自己写的合并 SQL 照旧支持 {{ }}（按运行输入筛日期）。
 """
 from __future__ import annotations
 
@@ -26,6 +31,8 @@ from app.engine.context import NodeContext, NodeError
 from app.engine.evidence import ledger_enabled, next_exec
 from app.engine.merge_query import MERGE_SOURCE, MergeError, MergeInput, execute
 from app.engine.state import GraphState
+from app.ledger import params as sql_params
+from app.tools.registry import execution_id_of
 
 #: 合并警告进运行事件时的 code（log 事件）。运行详情、运行概况按它认出这是合并查询的警告
 LOG_CODES = {"key_type_mismatch": "merge_key_type", "rows_grew": "merge_rows_grew",
@@ -80,8 +87,14 @@ async def run_merge(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     inputs = ctx.config.get("inputs")
     if not isinstance(inputs, dict) or not inputs:
         raise NodeError(ctx.node.id, "「合并查询」还没有配置输入：至少选择一个上游的查询节点，并给它起一个别名")
-    # SQL 里允许 {{ }}（例如按运行输入筛日期），和 tool 节点的 SQL 一样先渲染；快照里存的是渲染之后、守卫规范过的那条
-    sql = ctx.render_str(str(ctx.config.get("sql") or ""), state)
+    raw_sql = str(ctx.config.get("sql") or "")
+    if sql_params.is_literal(ctx.config, str(ctx.node.type)):
+        # 服务端拼好的字面语句（对账图里按维度值对齐的那条，ledger/reconcile），契约核对过哈希：里面的 {{ }} 是数据，
+        # 不再渲染一遍。契约过时（节点被复制、改过 sql）不在这里——那时 is_literal 为假，照下面的正常渲染走
+        sql = raw_sql
+    else:
+        # SQL 里允许 {{ }}（例如按运行输入筛日期），和 tool 节点的 SQL 一样先渲染；快照里存的是渲染之后、守卫规范过的那条
+        sql = ctx.render_str(raw_sql, state)
     loaded = [await _load_input(state, ctx, str(alias), node_id) for alias, node_id in inputs.items()]
 
     started = time.perf_counter()
@@ -122,11 +135,16 @@ async def run_merge(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         output["column_types"] = outcome.column_types
     updates: dict[str, Any] = {"nodes": {ctx.node.id: output}}
     if ledger_enabled(ctx.run):
-        # 证据台账：和数据源查询同形的 query 条目，报告据此编 Qn；没有 via（外面不包工具快照）
+        # 证据台账：和数据源查询同形的 query 条目，报告据此编 Qn；没有 via（外面不包工具快照）。执行身份（K10）：
+        # query_id 是这次合并（本节点），execution_id 按第几次执行——同一次运行里同样的合并跑两次也各不相同
+        exec_no = next_exec(state, ctx.node.id)
         updates["evidence"] = [{
-            "kind": "query", "node_id": ctx.node.id, "exec": next_exec(state, ctx.node.id), "artifact": artifact,
+            "kind": "query", "node_id": ctx.node.id, "exec": exec_no, "artifact": artifact,
             "source": MERGE_SOURCE, "columns": outcome.columns, "rows": len(outcome.rows),
             "truncated": outcome.truncated,
+            "query_id": ctx.node.id, "execution_id": execution_id_of(ctx.node.id, attempt=exec_no,
+                                                                    run_id=ctx.run.run_id),
+            "attempt": exec_no,
         }]
     var_name = str(ctx.config.get("assign_to") or "").strip()
     if var_name:

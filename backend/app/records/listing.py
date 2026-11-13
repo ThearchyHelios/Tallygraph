@@ -37,7 +37,7 @@ async def _masked(session: AsyncSession, row: Any) -> set[str]:
 
 def _shown(item: dict[str, Any], version: int, masked: set[str], viewer: str | None) -> dict[str, Any]:
     """一行交给看的人的样子：别人提交的行，遮罩列有值的换成「已遮罩」（P4）。"""
-    from app.api.evidence import MASKED
+    from app.engine.evidence_reader import MASKED
 
     out = {**item, "_version": version}
     if not masked or (viewer and item.get("_submitted_by") == viewer):

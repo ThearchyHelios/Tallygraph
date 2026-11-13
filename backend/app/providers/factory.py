@@ -54,7 +54,9 @@ class ProviderNotConfigured(RuntimeError):
 
 async def list_providers(session: AsyncSession) -> list[Provider]:
     rows = await session.execute(select(Provider).order_by(Provider.created_at, Provider.id))
-    return list(rows.scalars())
+    items = list(rows.scalars())
+    catalog.sync_provider_models(items)
+    return items
 
 
 #: 点名的接入不存在、已停用时，在「设置 → 模型接入」里能做什么。NAMED_FIX 是整句的前半句；后半句（去哪里换一个
@@ -276,6 +278,7 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
         model_kwargs: dict[str, Any] = {}
         thinking_on = False
         mode = spec.thinking or "summarized"
+        effort = spec.effort
 
         if catalog.supports_adaptive_thinking(model):
             if mode in ("adaptive", "summarized"):
@@ -286,7 +289,13 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
                 }
                 thinking_on = True
             elif mode == "off":
-                kwargs["thinking"] = {"type": "disabled"}
+                if catalog.requires_thinking(model):
+                    # 强制思考型模型不接受 disabled：保留隐藏式 adaptive，同时把推理档位压到 low
+                    kwargs["thinking"] = {"type": "adaptive", "display": "omitted"}
+                    thinking_on = True
+                    effort = effort or "low"
+                else:
+                    kwargs["thinking"] = {"type": "disabled"}
         elif mode != "off" and catalog.needs_interleaved_beta(model):
             # 光挂 header 是不够的：这一代默认根本没开 thinking，
             # 没有思考可交错，header 就是一条什么都不做的空设置
@@ -306,8 +315,8 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
         if thinking_on:
             kwargs.pop("temperature", None)
 
-        if spec.effort and catalog.supports_effort(model):
-            model_kwargs["output_config"] = {"effort": spec.effort}
+        if effort and catalog.supports_effort(model):
+            kwargs["output_config"] = {"effort": effort}
         if model_kwargs:
             kwargs["model_kwargs"] = model_kwargs
 
@@ -319,8 +328,16 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
             # 且 api_key=None 时不会发出 x-api-key。
             import anthropic
 
-            client_args = {"base_url": base_url, "api_key": None, "auth_token": api_key,
-                           "max_retries": chat.max_retries}
+            client_args: dict[str, Any] = {
+                "base_url": base_url,
+                "api_key": None,
+                "auth_token": api_key,
+                "max_retries": chat.max_retries,
+            }
+            if kwargs.get("timeout") is not None:
+                client_args["timeout"] = kwargs["timeout"]
+            if kwargs.get("default_headers"):
+                client_args["default_headers"] = dict(kwargs["default_headers"])
             chat._client = anthropic.Anthropic(**client_args)
             chat._async_client = anthropic.AsyncAnthropic(**client_args)
         return chat
@@ -339,11 +356,59 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
     # 兼容接口都填了 base_url，于是一次运行上百次调用记成 0 token、0 美元——llm.end 读的 usage_metadata
     # 就来自这一块。不认 stream_options 的服务由 ReasoningAwareChatOpenAI 去掉它重发，不让调用失败
     kwargs["stream_usage"] = True
-    return _ReasoningAwareChatOpenAI(**kwargs)
+    reasoning_hint = _openai_reasoning_hint(provider.kind, model, spec)
+    return _ReasoningAwareChatOpenAI(reasoning_hint=reasoning_hint, **kwargs)
+
+
+def _openai_reasoning_hint(provider_kind: str, model: str, spec: ModelSpec) -> dict[str, Any]:
+    """按模型家族生成 OpenAI / OpenAI 兼容接口的思考开关或推理强度参数。
+
+    仅当调用方显式指定了 spec.thinking == 'off' 或 spec.effort 时才生成提示参数；
+    默认未指定时返回空字典，完全不改变常规节点调用体。若目标网关不认该参数（400/422），
+    ReasoningAwareChatOpenAI 会在尚未收到首块响应时自动剥离重发一次并记忆该端点+模型。
+    """
+    if spec.thinking != "off" and not spec.effort:
+        return {}
+    norm = catalog._norm(model).lower()
+    if spec.thinking == "off":
+        if norm.startswith("qwen"):
+            return {
+                "extra_body": {
+                    "enable_thinking": False,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                }
+            }
+        if norm.startswith(("glm", "kimi", "deepseek", "doubao")):
+            return {"extra_body": {"thinking": {"type": "disabled"}}}
+        if provider_kind == "openai":
+            if norm.startswith(("gpt-5", "o1", "o3", "o4")):
+                return {"reasoning_effort": spec.effort or "low"}
+            return {}
+        return {"reasoning_effort": spec.effort or "low"}
+
+    if spec.effort:
+        if provider_kind == "openai" and not norm.startswith(("gpt-5", "o1", "o3", "o4")):
+            return {}
+        return {"reasoning_effort": spec.effort}
+    return {}
+
+
+def _merge_reasoning_hint(kwargs: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any]:
+    out = dict(kwargs)
+    for k, v in hint.items():
+        if k == "extra_body" and isinstance(v, dict):
+            existing = out.get("extra_body")
+            merged_eb = dict(v)
+            if isinstance(existing, dict):
+                merged_eb.update(existing)
+            out["extra_body"] = merged_eb
+        elif k not in out:
+            out[k] = v
+    return out
 
 
 def _reasoning_aware_openai() -> type:
-    """ChatOpenAI 的子类，保留供应商的思考内容。
+    """ChatOpenAI 的子类，保留供应商的思考内容并支持安全降级思考控制参数。
 
     langchain 的 ChatOpenAI 只认官方 OpenAI 规范，第三方加的 reasoning_content
     是**明确丢弃**的（它的文档原话："Non-standard response fields added by
@@ -359,9 +424,52 @@ def _reasoning_aware_openai() -> type:
     所以在这里把它捞回 additional_kwargs，thinking_text 再统一读出来。
     只加字段，不改 langchain 对正文的任何处理。
     """
+    from langchain_core.messages import AIMessage
     from langchain_openai import ChatOpenAI
+    from pydantic import PrivateAttr
 
     class ReasoningAwareChatOpenAI(ChatOpenAI):  # type: ignore[misc]
+        _reasoning_hint: dict[str, Any] = PrivateAttr(default_factory=dict)
+
+        def _get_request_payload(
+            self, input_: Any, *, stop: list[str] | None = None, **kwargs: Any
+        ) -> dict:
+            payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+            lc_msgs = self._convert_input(input_).to_messages()
+            ai_reasonings = [
+                (m.additional_kwargs or {}).get("reasoning_content")
+                for m in lc_msgs
+                if isinstance(m, AIMessage)
+            ]
+            raw_msgs = payload.get("messages")
+            if isinstance(raw_msgs, list) and ai_reasonings:
+                ai_idx = 0
+                for msg_dict in raw_msgs:
+                    if not isinstance(msg_dict, dict) or msg_dict.get("role") != "assistant":
+                        continue
+                    reasoning = ai_reasonings[ai_idx] if ai_idx < len(ai_reasonings) else None
+                    ai_idx += 1
+                    # DeepSeek Reasoner / Kimi K2 Thinking 等在工具调用多轮往返时要求携带了 tool_calls 的
+                    # assistant 消息必须原样回传 reasoning_content，否则直接报 400 Missing reasoning_content field
+                    if isinstance(reasoning, str) and reasoning and msg_dict.get("tool_calls"):
+                        msg_dict.setdefault("reasoning_content", reasoning)
+            return payload
+
+        def _create_chat_result(self, response: Any, generation_info: dict | None = None):
+            res = super()._create_chat_result(response, generation_info)
+            raw_dict = response if isinstance(response, dict) else (
+                response.model_dump() if hasattr(response, "model_dump") else {}
+            )
+            choices = raw_dict.get("choices") or []
+            for idx, gen in enumerate(res.generations):
+                if idx >= len(choices):
+                    break
+                msg = (choices[idx] or {}).get("message") or {}
+                text = msg.get("reasoning_content") or msg.get("reasoning")
+                if isinstance(text, str) and text:
+                    gen.message.additional_kwargs["reasoning_content"] = text
+            return res
+
         def _convert_chunk_to_generation_chunk(
             self, chunk: dict, default_chunk_class: type, base_generation_info: dict | None
         ):
@@ -378,13 +486,90 @@ def _reasoning_aware_openai() -> type:
                 gen.message.additional_kwargs["reasoning_content"] = text
             return gen
 
+        async def _agenerate(self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any):
+            hint_key = (_endpoint_key(self), str(getattr(self, "model_name", "") or ""))
+            use_hint = bool(self._reasoning_hint) and hint_key not in _NO_REASONING_HINT
+            if not use_hint:
+                return await super()._agenerate(messages, stop, run_manager, **kwargs)
+            try:
+                return await super()._agenerate(
+                    messages, stop, run_manager, **_merge_reasoning_hint(kwargs, self._reasoning_hint)
+                )
+            except Exception as e:  # noqa: BLE001
+                if not _rejects_reasoning_hint(e):
+                    raise
+                first = e
+            try:
+                res = await super()._agenerate(messages, stop, run_manager, **kwargs)
+                _NO_REASONING_HINT.add(hint_key)
+                logger.warning("模型接入 %s/%s 不支持思考控制参数（%s），已自动剥离", hint_key[0], hint_key[1], str(first)[:200])
+                return res
+            except Exception as e:
+                raise e from first
+
         async def _astream(self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any):
-            """流式调用；服务方不认 stream_options 时去掉它重发一次，之后这个接口不再带它。
+            """流式调用；服务方不认思考控制参数或 stream_options 时去掉它重发一次，之后这个接口+模型不再带它。
 
             只在还没收到任何一块时重发：拒绝都发生在请求刚发出去的时候，重发不会重复输出。"""
             usage = not self._use_responses_api({**kwargs, **self.model_kwargs}) \
                 and self._should_stream_usage(kwargs.get("stream_usage"), **kwargs)
-            key = _endpoint_key(self)
+            endpoint = _endpoint_key(self)
+            model_key = (endpoint, str(getattr(self, "model_name", "") or ""))
+            use_hint = bool(self._reasoning_hint) and model_key not in _NO_REASONING_HINT
+
+            if use_hint:
+                started = False
+                hint_kwargs = _merge_reasoning_hint(kwargs, self._reasoning_hint)
+                if not usage or model_key in _NO_STREAM_USAGE:
+                    hint_kwargs = {k: v for k, v in hint_kwargs.items() if k != "stream_options"} | {"stream_usage": False}
+                try:
+                    async for chunk in super()._astream(messages, stop, run_manager, **hint_kwargs):
+                        started = True
+                        yield chunk
+                    return
+                except Exception as e:  # noqa: BLE001
+                    if started:
+                        raise
+                    if _rejects_stream_options_specifically(e) and usage and model_key not in _NO_STREAM_USAGE:
+                        # 明确点名拒绝 stream_options：剥离 stream_options 但保留思考控制参数再试
+                        no_usage_hint_kwargs = {
+                            k: v for k, v in hint_kwargs.items() if k != "stream_options"
+                        } | {"stream_usage": False}
+                        try:
+                            async for chunk in super()._astream(messages, stop, run_manager, **no_usage_hint_kwargs):
+                                if model_key not in _NO_STREAM_USAGE:
+                                    _NO_STREAM_USAGE.add(model_key)
+                                    logger.warning(
+                                        "模型接入 %s/%s 不支持流式用量回传（%s），已改为不请求用量",
+                                        model_key[0], model_key[1], str(e)[:200],
+                                    )
+                                yield chunk
+                            return
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if not _rejects_reasoning_hint(e):
+                        raise
+                    # 剥离思考控制参数后走下方常规流式逻辑；若成则记入 _NO_REASONING_HINT
+                    yielded_after_strip = False
+                    async for chunk in self._astream_without_hint(messages, stop, run_manager, usage=usage, key=model_key, **kwargs):
+                        if not yielded_after_strip and model_key not in _NO_REASONING_HINT:
+                            _NO_REASONING_HINT.add(model_key)
+                            logger.warning(
+                                "模型接入 %s/%s 不支持思考控制参数（%s），已自动剥离",
+                                model_key[0],
+                                model_key[1],
+                                str(e)[:200],
+                            )
+                        yielded_after_strip = True
+                        yield chunk
+                    return
+
+            async for chunk in self._astream_without_hint(messages, stop, run_manager, usage=usage, key=model_key, **kwargs):
+                yield chunk
+
+        async def _astream_without_hint(
+            self, messages: Any, stop: Any = None, run_manager: Any = None, *, usage: bool, key: tuple[str, str], **kwargs: Any
+        ):
             first: Exception | None = None
             if usage and key not in _NO_STREAM_USAGE:
                 started = False
@@ -402,9 +587,12 @@ def _reasoning_aware_openai() -> type:
             try:
                 async for chunk in super()._astream(messages, stop, run_manager, **kwargs):
                     if first is not None and key not in _NO_STREAM_USAGE:
-                        # 去掉它就成了：记下这个接口不认，之后不再每次先失败一次
+                        # 去掉它就成了：记下这个接口+模型不认，之后不再每次先失败一次
                         _NO_STREAM_USAGE.add(key)
-                        logger.warning("模型接入 %s 不支持流式用量回传（%s），已改为不请求用量", key, str(first)[:200])
+                        logger.warning(
+                            "模型接入 %s/%s 不支持流式用量回传（%s），已改为不请求用量",
+                            key[0], key[1], str(first)[:200],
+                        )
                     yield chunk
             except Exception as e:
                 if first is None:
@@ -414,12 +602,32 @@ def _reasoning_aware_openai() -> type:
     return ReasoningAwareChatOpenAI
 
 
-#: 认定不支持 stream_options 的接口（base_url）。进程内有效：重启后再试一次，服务方可能已经升级
-_NO_STREAM_USAGE: set[str] = set()
+#: 认定不支持 stream_options 的 (base_url, model)。按接口+模型记忆，避免统一网关下单个旧模型连坐其它模型
+_NO_STREAM_USAGE: set[tuple[str, str]] = set()
+#: 认定不支持思考控制参数（reasoning_effort / enable_thinking / thinking）的 (base_url, model)
+_NO_REASONING_HINT: set[tuple[str, str]] = set()
 
 
 def _endpoint_key(model: Any) -> str:
     return str(getattr(model, "openai_api_base", None) or "https://api.openai.com/v1")
+
+
+def _rejects_stream_options_specifically(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "stream_options" in text or "include_usage" in text
+
+
+def _rejects_reasoning_hint(exc: Exception) -> bool:
+    """报错是否是服务方拒绝了思考开关或 reasoning_effort 参数（排除上下文超长与 max_tokens 额度拒绝）。"""
+    from langchain_core.exceptions import ContextOverflowError
+    from app.providers.budget import budget_refused
+
+    if isinstance(exc, ContextOverflowError) or budget_refused(exc):
+        return False
+    text = str(exc).lower()
+    if any(w in text for w in ("reasoning_effort", "enable_thinking", "chat_template_kwargs", "thinking", "unsupportedparams")):
+        return True
+    return getattr(exc, "status_code", None) in (400, 422)
 
 
 def _rejects_stream_options(exc: Exception) -> bool:
@@ -441,8 +649,11 @@ def _rejects_stream_options(exc: Exception) -> bool:
 class _LazyReasoningChatOpenAI:
     """延迟导入 langchain_openai：它加载得慢，而 mock/anthropic 路径用不上。"""
 
-    def __call__(self, **kwargs: Any) -> Any:
-        return _reasoning_aware_openai()(**kwargs)
+    def __call__(self, *, reasoning_hint: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        inst = _reasoning_aware_openai()(**kwargs)
+        if reasoning_hint:
+            inst._reasoning_hint = dict(reasoning_hint)
+        return inst
 
 
 _ReasoningAwareChatOpenAI = _LazyReasoningChatOpenAI()

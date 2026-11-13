@@ -76,7 +76,7 @@ export function PublishSummary({ blueprintId, open, onClose, onFix }: {
   // 执行中逐步打勾：每秒取一次
   usePoll(() => {
     if (!plan) return
-    void api.blueprints.plan(plan.id).then((p) => {
+    return api.blueprints.plan(plan.id).then((p) => {
       setPlan(p)
       if (p.status === 'done') void useBlueprint.getState().load(blueprintId, { force: true })
     }).catch(() => undefined)

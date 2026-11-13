@@ -28,6 +28,15 @@ from app.ledger import store
 #: state：matched 比对过；pending 已排队按需比对；ineligible 这次运行不比对（reason 写为什么）；unreadable 比对记录读不出
 STATES = ("matched", "pending", "ineligible", "unreadable")
 
+#: 普通使用者看的口径账本里**不出去**的键（递归过一遍整份视图）：口径的内部身份。人读的那一套——口径名（caliber、
+#: workflow_name）、级别叫法、指标与标签、每条查询的结果与证据关系、动作的说法、出具/对账的运行——都原样留着，只是认不出
+#: 「是哪一份工作流的哪一版」。builder 及以上拿到的是原件（run_view 只在普通使用者这一档过一遍）。
+USER_HIDDEN_KEYS = ("workflow_id", "workflow_version", "version", "graph_hash", "manifest", "manifest_hash",
+                    "publication", "closure_hash", "selection_hash", "execution_hash", "identity")
+#: 只在**口径标签/相关口径**那几处去掉的键：口径卡的节点 id（「是这张卡的哪个节点」是内部的事）。查询本身的 node_id
+#: 是这次运行图上的节点，证据关系靠它，留着。
+USER_HIDDEN_LABEL_KEYS = ("node_id",)
+
 #: 成功结束、还没封存的运行，结束后这么多秒内答 pending（runner 落库之后马上封存，正常是几秒）。过了还没封存的是封存出了错、
 #: 或者是封存之前的老数据：再答 pending，页面就一直转圈、等满两分钟（store/ledger.ts 的等待上限）再取还是 pending——照实说没封存
 SEAL_GRACE_S = 120
@@ -37,10 +46,10 @@ class _Hide:
     """按这次运行查到过的遮罩值遮：hide(值) 这个值给不给，shown(文字) 文字里的遮罩值换成「已遮罩」。"""
 
     def __init__(self, secrets: Any) -> None:
-        from app.api.evidence import _Shown
+        from app.engine.evidence_reader import ShownText
 
         self._secrets = secrets
-        self._shown = _Shown(secrets)
+        self._shown = ShownText(secrets)
 
     def hide(self, value: Any) -> bool:
         if self._secrets is None or value is None or isinstance(value, bool):
@@ -52,9 +61,9 @@ class _Hide:
 
 
 async def _hider(sealed: Any) -> _Hide:
-    from app.api.evidence import _Masks
+    from app.engine.evidence_reader import open_masks
 
-    return _Hide(await _Masks(sealed).run_secrets())
+    return _Hide(await open_masks(sealed).run_secrets())
 
 
 async def _names(ids: set[str]) -> dict[str, str]:
@@ -126,15 +135,102 @@ def _just_finished(finished_at: datetime | None) -> bool:
     return (datetime.now(timezone.utc) - at).total_seconds() <= SEAL_GRACE_S
 
 
+def _scrub(value: Any) -> Any:
+    """递归过一遍：内部身份的键去掉（别的键、值、结构一个不动）。"""
+    if isinstance(value, dict):
+        return {k: _scrub(v) for k, v in value.items() if k not in USER_HIDDEN_KEYS}
+    if isinstance(value, list):
+        return [_scrub(v) for v in value]
+    return value
+
+
+def _without(item: Any, keys: tuple[str, ...]) -> Any:
+    return {k: v for k, v in item.items() if k not in keys} if isinstance(item, dict) else item
+
+
+def _name_in_place(item: dict[str, Any]) -> None:
+    """就地：口径那一栏的 `caliber` 是**内部键**（`工作流 id@版本`，ledger/labels.caliber_key），换成**人读的名字**。
+
+    名字取不到（工作流删了）时去掉这一栏——宁可少一栏，也不把 id 交出去。别的一切原样。"""
+    key = item.get("caliber")
+    if isinstance(key, str) and "@" in key:
+        name = item.get("workflow_name")
+        if name:
+            item["caliber"] = str(name)
+        else:
+            item.pop("caliber", None)
+
+
+def _named(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return item
+    out = dict(item)
+    _name_in_place(out)
+    return out
+
+
+def _action_view(item: Any) -> Any:
+    """一项动作：能不能做、为什么、级别叫法与身份都按同一套投影；**只有确实给这个人做的那一项**留着口径身份。
+
+    出具与对账这两下都要带着 `workflow_id` + `version` 去发请求（`POST /api/ledger/answers/{run_id}/issue|reconcile`），
+    而这两项只有在这个人**确实有权**（`available`：应用授权、比对等价、绑定没被遮）时才会给出来——服务端在收到请求时还会
+    再核一遍。被拒的那些项只是说明，不是操作凭据，身份不带出去（不然就成了拿别人的口径 id 探路）。"""
+    if not isinstance(item, dict):
+        return item
+    out = _named(_scrub(item))
+    if item.get("available"):
+        for key in ("workflow_id", "version"):
+            if key in item:
+                out[key] = item[key]
+    return out
+
+
+def label_user_view(label: dict[str, Any]) -> dict[str, Any]:
+    """一个标签交给普通使用者的那一份：口径身份不出去（卡节点 id、工作流 id、版本、哈希），指标与结论一个字不动。
+
+    账本视图、证据片段的「口径」一步、报告导出读的是同一份标签（ledger/labels.view_label），三处按同一条规则投影。"""
+    out = _named(_scrub(label))
+    out.pop("node_id", None)
+    out["related"] = [_named(_without(item, USER_HIDDEN_LABEL_KEYS)) for item in out.get("related") or []]
+    return out
+
+
+def caliber_user_view(view: dict[str, Any]) -> dict[str, Any]:
+    """普通使用者看的口径账本（`/api/runs/{id}/ledger`）：口径身份不出去，人读的部分一个字不动。
+
+    去掉的：工作流 id / 版本号 / 清单引用 / 各种哈希（递归地）、口径标签里的卡节点 id、口径那一栏里的内部键（换成名字）；
+    只有「确实给这个人做」的动作（能出具、能对账）另带它要用的那两个身份。留着的：口径名（caliber、workflow_name）、
+    级别叫法、指标与标签、每条查询的结果、候选与证据关系、动作的说法（能不能出具、为什么）、出具与对账的运行和结论——
+    界面按这些画，一样不缺。builder 及以上不看这一份（run_view 里按 restricted() 分）。"""
+    out = _scrub(view)
+    out["calibers"] = [_named(c) for c in out.get("calibers") or []]
+    out["whole"] = _named(_without(out.get("whole"), USER_HIDDEN_LABEL_KEYS))
+    out["actions"] = [_action_view(action) for action in view.get("actions") or []]
+    for query in out.get("queries") or []:
+        if not isinstance(query, dict):
+            continue
+        query["candidates"] = [_named(_without(c, USER_HIDDEN_LABEL_KEYS)) for c in query.get("candidates") or []]
+        for cell in (query.get("cells") or {}).values():
+            if isinstance(cell, dict):
+                cell["candidates"] = [_named(_without(c, USER_HIDDEN_LABEL_KEYS))
+                                      for c in cell.get("candidates") or []]
+    for report in (out.get("reports") or {}).values():
+        if not isinstance(report, dict):
+            continue
+        report["labels"] = {sid: label_user_view(label) for sid, label in (report.get("labels") or {}).items()
+                            if isinstance(label, dict)}
+    return out
+
+
 async def run_view(run_id: str) -> dict[str, Any]:
     """GET /api/runs/{run_id}/ledger 的答复：标签、整题判断、每条查询的比对、能做的动作。没比对过、能比的运行这时排上按需比对
     （trigger=on_demand），答复 state=pending；不比的照实说为什么。"""
     from app.api.coded import CodedHTTPException
-    from app.api.evidence import RUN_NOT_FOUND, _sealed
-
-    from app.api.deps import current_principal
+    from app.api.deps import current_principal, restricted
+    from app.engine.evidence_reader import RUN_NOT_FOUND, load_sealed as _sealed
     from app.ledger.recall import answer_marks
 
+    ordinary = restricted()
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
         if run is None:
@@ -176,7 +272,9 @@ async def run_view(run_id: str) -> dict[str, Any]:
         # 对账结果上的「说明有用 / 看不懂」（ledger/feedback）：看的这个人给过哪一个、各几个
         votes = await ledger_feedback.feedback_of(session, [r["run_id"] for r in reconciled], principal)
         reconciled = [{**r, "feedback": votes[r["run_id"]]} for r in reconciled]
-    return {
+        # 对账这一项能不能做：同一份资产授权判定（reconcile.actions_of 里按这个身份给 available；无权的那些不带身份）
+        reconcile_actions = await ledger_reconcile.actions_of(session, content, names, hider.hide, actor=principal)
+    view = {
         **base, "state": "matched", **_stamp(recorded),
         "calibers": [{**{k: c.get(k) for k in ("caliber", "workflow_id", "version", "level", "graph_hash")},
                       "workflow_name": names.get(str(c.get("workflow_id") or "")),
@@ -186,15 +284,21 @@ async def run_view(run_id: str) -> dict[str, Any]:
         "reports": _labels_view(content, hider, names),
         "primary": content.get("primary"),
         "whole": _whole_view(content.get("whole") or {}, hider, names),
-        "actions": [*(p.action() for p in plans), *ledger_reconcile.actions_of(content, names, hider.hide)],
+        "actions": [*(p.action() for p in plans), *reconcile_actions],
         "issued": issued,
         "reconciled": reconciled,
     }
+    # 普通使用者那一档另过一遍投影（口径身份不出去，人读的部分不动）；builder 及以上拿原件
+    return caliber_user_view(view) if ordinary else view
 
 
 async def report_labels(sealed: Any, report_node: str) -> dict[str, Any] | None:
     """一份报告里每个数的标签（遮过的），给证据片段接口和报告导出：{labels: {片段 id: 标签}, 来历}。没比对过、比对记录读不出、
-    这份报告没有标签的为 None（片段接口就不加 ledger 键，老运行的返回一字不差）。"""
+    这份报告没有标签的为 None（片段接口就不加 ledger 键，老运行的返回一字不差）。
+
+    普通使用者拿到的是投影过的那一份（口径身份不出去）；builder 及以上是原件。"""
+    from app.api.deps import restricted
+
     recorded = await store.latest(sealed.run_id)
     if recorded is None or recorded.content is None:
         return None
@@ -203,8 +307,11 @@ async def report_labels(sealed: Any, report_node: str) -> dict[str, Any] | None:
         return None
     hider = await _hider(sealed)
     names = await _names(_workflow_ids(recorded.content))
-    return {"labels": {sid: ledger_labels.view_label(label, hide=hider.hide, shown=hider.shown, names=names)
-                       for sid, label in (report.get("labels") or {}).items()}, **_stamp(recorded)}
+    labels = {sid: ledger_labels.view_label(label, hide=hider.hide, shown=hider.shown, names=names)
+              for sid, label in (report.get("labels") or {}).items()}
+    if restricted():
+        labels = {sid: label_user_view(label) for sid, label in labels.items()}
+    return {"labels": labels, **_stamp(recorded)}
 
 
 async def segment_label(sealed: Any, report_node: str, segment_id: str) -> dict[str, Any] | None:

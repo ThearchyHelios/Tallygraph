@@ -361,7 +361,10 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    s = Settings()
+    import os
+
+    no_dotenv = os.environ.get("AGENTLAB_DISABLE_DOTENV", "").strip().lower() in ("1", "true", "yes", "on")
+    s = Settings(_env_file=None) if no_dotenv else Settings()
     s.ensure_dirs()
     return s
 

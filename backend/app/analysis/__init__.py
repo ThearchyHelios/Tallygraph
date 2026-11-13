@@ -41,7 +41,7 @@ ParentResolver = Callable[[str], AnalysisResult | None]
 #: （row_out_of_range、headline_empty）；要比的组这期没有（unknown_group、too_few_groups）；要用的那一格这期为空
 #: （empty_cell：乘积拆解的乘积、因子，差异检验的计数）
 DATA_ERRORS = frozenset({"parent_refused", "parent_key_missing", "period_not_found", "row_out_of_range",
-                         "headline_empty", "unknown_group", "too_few_groups", "empty_cell"})
+                         "headline_empty", "unknown_group", "too_few_groups", "empty_cell", "too_many_rows"})
 
 
 def _op_mode(request: Mapping[str, Any]) -> tuple[str, str | None]:
@@ -58,7 +58,7 @@ def _op_mode(request: Mapping[str, Any]) -> tuple[str, str | None]:
 
 
 def _compute(op: str, mode: str | None, raw: Mapping[str, Any], env: Any) -> AnalysisResult:
-    from app.analysis import comparable, decompose, differ, series
+    from app.analysis import cochange, comparable, decompose, differ, reconcile_op, series
 
     if op == "decompose":
         modes = {"additive": decompose.additive, "ratio": decompose.ratio, "factor": decompose.factor}
@@ -69,6 +69,10 @@ def _compute(op: str, mode: str | None, raw: Mapping[str, Any], env: Any) -> Ana
         return series.trend(raw, env)
     if op == "differ":
         return differ.differ(raw, env)
+    if op == "reconcile":
+        return reconcile_op.reconcile(raw, env)
+    if op == "cochange":
+        return cochange.cochange(raw, env)
     return comparable.comparable(raw, env)
 
 
@@ -83,7 +87,7 @@ def _env(op: str, mode: str | None, settings: Mapping[str, Any], inputs: Any, fa
 def _data_refusal(op: str, mode: str | None, raw: Mapping[str, Any], env: Any, error: CallError) -> AnalysisResult:
     """随数据变化的调用错误记成的算不了的结论。params 记调用原样（label 照样消毒；调用还没走完、规范化不完整，复算拿它重走一遍
     走到同一处），取过的快照都记进输入（Inputs.settle），阈值和判定标准同这个算子自己算不了时那一份。"""
-    from app.analysis import decompose, differ, series
+    from app.analysis import cochange, decompose, differ, reconcile_op, series
     from app.analysis import phrases as ph
     from app.analysis.common import build
 
@@ -97,6 +101,10 @@ def _data_refusal(op: str, mode: str | None, raw: Mapping[str, Any], env: Any, e
         used, criterion = series.refusal_basis(op, env.settings)
     elif op == "differ":
         used, criterion = differ.refusal_basis(mode, env.settings)
+    elif op == "reconcile":
+        used, criterion = reconcile_op.refusal_basis(env.settings)
+    elif op == "cochange":
+        used, criterion = cochange.refusal_basis(env.settings)
     else:
         used, criterion = [], ph.CRITERION_COMPARABLE
     code = "parent_refused" if error.code == "parent_refused" else "input_unavailable"

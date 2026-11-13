@@ -304,19 +304,61 @@ async def capability_versions_for(session: AsyncSession, tool_names: list[str]) 
 
 def is_platform_query(name: str) -> bool:
     """这个工具的结果能不能当查询快照作证（替换 nodes/tools.py、nodes/llm.py 里按名字前缀的判断，F11）。
-    认的是「平台执行」这个身份：数据源查询工具，和登记里声明了 tabular、绑定端点、由平台执行的读取。不看结果长什么样。"""
+    认的是「平台执行」这个身份：数据源查询工具、K10 的口径查询工具（`caliber_query`，由 QueryCore 自己执行取数）、
+    独立语义指标查询工具（`metric_query`，委托数据源查询工具落快照），
+    和登记里声明了 tabular、绑定端点、由平台执行的读取。不看结果长什么样。"""
+    from app.ledger.querycore import CALIBER_QUERY
     from app.tools.datasource import QUERY_PREFIX
+    from app.tools.metrics import METRIC_QUERY
 
-    return name.startswith(QUERY_PREFIX) or name in _platform_queries
+    return name.startswith(QUERY_PREFIX) or name in (CALIBER_QUERY, METRIC_QUERY) or name in _platform_queries
+
+
+def query_items(payload: Any, name: str) -> list[dict[str, Any]]:
+    """这次工具调用交回的结果里的查询条目——**按身份摊成一份列表**：`caliber_query` 是 queries 数组（多条），
+    别的平台执行的查询（数据源查询、登记里声明了表格的端点读取）是一条。
+
+    两个形状在这里合成同一种条目（工件、来源、列、行数、截断，加上 query_id / execution_id / attempt 与执行材料）：
+    调用方逐条过 snapshot_owned 再记台账，不会因为结果里带的是数组就只认第一条、也不会把数组误当一条。
+    **是不是平台执行的查询由调用方按 is_platform_query 先认**，这里只按名字决定结果的形状。"""
+    from app.ledger.querycore import CALIBER_QUERY, query_entries
+
+    if name == CALIBER_QUERY:
+        return query_entries(payload)
+    from app.engine.evidence import query_entry_fields
+
+    found = query_entry_fields(payload)
+    return [found] if found else []
 
 
 async def snapshot_owned(artifact_id: str, run_id: str, name: str) -> bool:
-    """端点读取交回的快照是不是这次运行落下的 endpoint_snapshot（防伪的第二道：名字对了，工件也得对）。数据源查询工具的
-    快照由数据层自己落，照旧不查。"""
+    """工具交回的快照是不是这次运行的、可以作证的那一件（防伪的第二道：名字对了，工件也得对）。
+
+    - 数据源查询（`db_query__`）：快照由数据层自己落，照旧不查；
+    - `caliber_query`（K10）：每条 query artifact 必须是**这次授权的父运行**自己落的，或它**明确派生的子运行**（子运行
+      origin 里的 `parent_run_id` 指回父运行）落下的，且 kind 必须是 `query_snapshot`——伪造的、别的运行落的、别的种类
+      的工件一律拒（这就是父 Run 证据接入的那道门，不另建权限系统）；
+    - 别的（登记里平台的端点读取）：工件得是这次运行落下的端点快照。"""
     from app.tools.datasource import QUERY_PREFIX
+    from app.tools.metrics import METRIC_QUERY
 
     if name.startswith(QUERY_PREFIX):
         return True
+    if name == METRIC_QUERY:
+        from app.data.catalog import QUERY_SNAPSHOT_KIND
+        from app.db.base import SessionLocal
+        from app.db.models import Artifact
+
+        async with SessionLocal() as session:
+            row = await session.get(Artifact, (artifact_id, run_id or ""))
+        return row is not None and row.kind == QUERY_SNAPSHOT_KIND
+    from app.ledger.querycore import CALIBER_QUERY, PARENT_RUN_KEY
+
+    if name == CALIBER_QUERY:
+        from app.data.catalog import QUERY_SNAPSHOT_KIND
+
+        return await _query_snapshot_of_parent(artifact_id, run_id, parent_key=PARENT_RUN_KEY,
+                                               kind=QUERY_SNAPSHOT_KIND)
     from app.capabilities.endpoints import SNAPSHOT_KIND
     from app.db.base import SessionLocal
     from app.db.models import Artifact
@@ -324,6 +366,36 @@ async def snapshot_owned(artifact_id: str, run_id: str, name: str) -> bool:
     async with SessionLocal() as session:
         row = await session.get(Artifact, (artifact_id, run_id or ""))
     return row is not None and row.kind == SNAPSHOT_KIND
+
+
+async def _query_snapshot_of_parent(artifact_id: str, run_id: str, *, parent_key: str, kind: str) -> bool:
+    """这件工件是不是父运行（或它明确派生的子运行）落下的、且种类是查询快照。
+
+    同一份内容可以有多行引用（内容寻址，不同运行产出同一件）；只要有一行对上就算数。"""
+    from sqlalchemy import select
+
+    from app.db.base import SessionLocal
+    from app.db.models import Artifact, Run
+
+    parent = str(run_id or "")
+    if not artifact_id:
+        return False
+    async with SessionLocal() as session:
+        rows = list((await session.execute(
+            select(Artifact.run_id, Artifact.kind).where(Artifact.id == artifact_id))).all())
+        for owner, row_kind in rows:
+            if str(row_kind or "") != kind:
+                continue
+            owner_id = str(owner or "")
+            if parent and owner_id == parent:
+                return True
+            if not parent or not owner_id:
+                continue
+            child = await session.get(Run, owner_id)
+            origin = child.origin if child is not None and isinstance(child.origin, dict) else None
+            if origin and str(origin.get(parent_key) or "") == parent:
+                return True
+    return False
 
 
 async def endpoint_request(session: AsyncSession, capability: Any, args: dict[str, Any], *, environment: str,

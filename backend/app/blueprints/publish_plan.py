@@ -555,6 +555,9 @@ async def plan(session: AsyncSession, blueprint: Blueprint, *, level: str, princ
     first_run = bool(options["first_run"]) if isinstance(options.get("first_run"), bool) else not target.process
     options["first_run"] = first_run
     options["spec_hash"] = spec_digest(blueprint)
+    # 出单时这份工作流是第几版（K02）：执行保存版本时对不上就停下重新出单，不把画布上别人刚改的图盖掉。
+    # 还没有工作流（第一次发布）时为空，那时保存的是新建的那一版
+    options["workflow_revision"] = target.workflow.version if target.workflow is not None else None
     problems = await _preflight(session, blueprint, target, level=level, principal=principal, options=options)
     row = PublishPlan(blueprint_id=blueprint.id, actor=principal.username, level=level, graph_hash=target.digest,
                       options=options, steps=_steps(target, first_run=first_run),
@@ -777,7 +780,12 @@ async def _do_preflight(session: AsyncSession, ctx: _Run) -> dict[str, Any]:
 
 
 async def _do_save_version(session: AsyncSession, ctx: _Run) -> dict[str, Any]:
-    """按图哈希判断：已有相同的版本就复用；没有就存一版（同画布保存：版本号加一、画布状态退回草稿）。"""
+    """按图哈希判断：已有相同的版本就复用；没有就存一版（同画布保存：版本号加一、画布状态退回草稿）。
+
+    已有工作流的那条路和画布保存同一条 CAS 规矩（apps/versions.append_version）：出单时记下的版本（workflow_revision）
+    到执行时对不上，说明有人直接从画布改了同一份资产，停在这一步让人重新出单——不把别人刚改的图盖掉。
+    """
+    from app.apps.versions import StaleRevision, append_version
     from app.blueprints.trial import template_of
 
     bp = ctx.bp
@@ -798,14 +806,19 @@ async def _do_save_version(session: AsyncSession, ctx: _Run) -> dict[str, Any]:
         session.add(workflow)
         await session.flush()
         version = 1
+        session.add(WorkflowVersion(workflow_id=workflow.id, version=version, graph=target.graph,
+                                    graph_hash=target.digest, note=note))
     else:
-        workflow.graph = target.graph
-        workflow.version += 1
-        version = workflow.version
-        if workflow.status in ("published", "governed"):
-            workflow.status = "draft"
-    session.add(WorkflowVersion(workflow_id=workflow.id, version=version, graph=target.graph,
-                                graph_hash=target.digest, note=note))
+        planned = (ctx.options or {}).get("workflow_revision")
+        if isinstance(planned, int) and workflow.version != planned:
+            raise StepFailed(GRAPH_CHANGED,
+                             f"出单之后「{target.name}」的画布又改过（出单时是 v{planned}，现在是 v{workflow.version}）："
+                             "这一份发布单要发的已经不是它看过的那张图，请重新出一份发布单")
+        try:
+            version = await append_version(session, workflow, target.graph, note=note, digest=target.digest)
+        except StaleRevision as e:
+            raise StepFailed(GRAPH_CHANGED,
+                             f"保存这一版时「{target.name}」已经有新的修改（{e}）：请重新出一份发布单") from e
     bp.workflow_id = workflow.id
     await session.commit()
     await session.refresh(workflow)
@@ -832,7 +845,13 @@ async def _do_publish_workflow(session: AsyncSession, ctx: _Run) -> dict[str, An
     if ctx.level == "governed" and not ctx.principal.at_least("admin"):
         raise StepFailed(ADMIN_REQUIRED, "以受管级别发布需要管理员")
     if is_published(snapshot, current=workflow.published_version) and snapshot.level == ctx.level:
-        return {"workflow_id": workflow.id, "version": snapshot.version, "level": ctx.level, "already": True}
+        # 已经是这一档的发布版：不再多发一次事件（发布依据是那一次留下的），照实把那一份清单交回
+        from app.apps import publications
+
+        row = await publications.latest(session, workflow.id, int(snapshot.version))
+        return {"workflow_id": workflow.id, "version": snapshot.version, "level": ctx.level, "already": True,
+                "manifest": getattr(row, "manifest", None),
+                "publication_id": getattr(row, "id", None)}
     if not ctx.principal.at_least("admin") and await downgrades_governed(session, workflow, ctx.level):
         raise StepFailed(DOWNGRADE_ADMIN, f"「{workflow.name}」现在是受管级别，降为已发布需要管理员")
     issues = await gate_issues(session, snapshot.graph, ctx.level)
@@ -840,7 +859,11 @@ async def _do_publish_workflow(session: AsyncSession, ctx: _Run) -> dict[str, An
         problems = [_with_who({**i, "source": "workflow"}) for i in issues or []]
         raise StepFailed(WORKFLOW_PUBLISH, "工作流没有通过发布检查，还没有发布", problems)
     out = await commit_publish(session, workflow, snapshot, ctx.level, ctx.actor)
-    return {"workflow_id": workflow.id, "version": out["version"], "level": out["level"]}
+    # K07：这一次发布实际留下的发布依据（清单、依据齐不齐、缺哪一块）记进这一步，发布单执行完能对上是哪一份
+    return {"workflow_id": workflow.id, "version": out["version"], "level": out["level"],
+            "manifest": out.get("manifest"), "publication_id": (out.get("publication") or {}).get("id"),
+            "proven": (out.get("publication") or {}).get("proven"),
+            "problems": (out.get("publication") or {}).get("problems") or []}
 
 
 async def _do_create_schedule(session: AsyncSession, ctx: _Run) -> dict[str, Any]:

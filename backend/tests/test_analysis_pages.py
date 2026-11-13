@@ -213,7 +213,7 @@ async def test_the_bundle_page_shows_the_analysis_detail_and_the_scope():
     phrase = next(text for text in out["opened"].values() if "出处分析结论 A1 的判定语" in text)
     assert "核对结果✓ 通过" in phrase and "分析结论里的值「销售额下降 194（-8.7%）" in phrase
     # 方法写服务端带来的叫法和 id（和导出页同一个写法），不只写 id
-    assert "判定语销售额下降 194（-8.7%）" in phrase and "方法与版本变化拆解（可加） · decompose.additive@1" in phrase
+    assert "判定语销售额下降 194（-8.7%）" in phrase and "方法与版本变化拆解（可加） · decompose.additive@2" in phrase
     assert "输入数据 · Q1" in phrase                       # 输入的角色写叫法，不写 data
     # 这份结论是分析卡做的（台账条目带 item）：那一句「在验证什么」写「分析卡上写的『在验证什么』」，不标成 Agent 写的假设
     assert "分析卡上写的『在验证什么』" in phrase and "Agent 写的假设" not in phrase
@@ -247,7 +247,7 @@ def test_the_bundle_page_shows_the_comparability_in_the_metric_detail():
     out = run_node(RUN_VERIFIER, VERIFIER, {"data": json.dumps(bundle), "seal": bundle["meta"]["manifest_hash"]})
     assert out["verified"] == ""
     [detail] = out["opened"].values()
-    for text in ("两期可比性", "判定两期可比", "判定标准只差日期", "方法与版本可比性检查 · comparable@1", "各项检查", "同口径",
+    for text in ("两期可比性", "判定两期有条件可比", "判定标准只差日期", "方法与版本可比性检查 · comparable@2", "各项检查", "同口径",
                  "复算一致：按封存的输入重新计算，结论逐项相同（导出时服务端按封存的输入复算的结论"):
         assert text in detail, text
 

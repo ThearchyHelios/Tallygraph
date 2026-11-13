@@ -52,13 +52,13 @@ import {
   readFileSync, readdirSync, rmSync, writeFileSync,
 } from 'node:fs'
 import { createServer } from 'node:net'
-import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
+import { resolveChrome, resolvePython } from './lib/env.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
-const SYSTEM_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+const SYSTEM_CHROME = resolveChrome()
 
 // 先跑快的、不开浏览器的，再按页面从外壳往里跑；最后是连真数据的两项
 const ORDER = [
@@ -96,6 +96,12 @@ const ORDER = [
   // 评测与口径账本（docs/design/next-round 01、02）
   'evals',           // 评测：题集、加题、发起与进度、结果表、对比与 A/B、口径命中与重复度
   'ledger',          // 口径账本：证据里的「口径」一步、轮次摘要与出具 / 对账、对账视图、认证队列
+  'caliber-drafts',  // 口径草稿页：业务规则工作台（K06；能改的资产才开表单、一次提交所有受影响指标、撤销、
+                     // 基准版本过期保留编辑、同步不了的原因与技术待办、独立期望与审阅、验证结论按证据说）
+                     // + 文档更新 / 增量重导入（K11：三方逐格、按工作项身份接受与拒绝、人工对齐、漏项不当删除、
+                     // 恢复、旧 L 重算三方、覆盖）+ 一句话改口径（K12：只读预览、澄清、确认之后才落一版、
+                     // 输入改过必须重新预览）
+  'ontology',        // 业务本体与跨源指标穿透：数据目录标准实体视图、口径本体拓扑与 /links 编辑、[[h:H1]] 源健康证据链与异常升级、ontology_tools 评测归因
   // 应用平台（docs/design/app-platform-and-look.md §4.5）。check-auth 不在这里：它要另起一套开着本地账号登录的服务，
   // 由编排者单独跑（关登录时的这些检查照常在这里跑）
   'apps',            // 应用页、印章、点数字看出处、入口校验、实例页
@@ -125,6 +131,10 @@ const ESTIMATE = {
   blueprint: 90, personal: 45, records: 30, files: 30,
   // 下一轮第 4 波：2026-10-16 两套服务、八道并行时的实测
   'catalog-changes': 43, evals: 33, ledger: 31,
+  // 口径工作台（K06）加文档更新与一句话（K11 / K12）：2026-11-10 本地实测 60 秒上下（全是伪造接口、不连真数据，
+  // 机器一挤就慢）
+  'caliber-drafts': 65,
+  ontology: 25,
   // 上面的 evidence、compare、bundle 按分析能力一轮第 2 波之后（2026-10-21，两套服务、八道并行）的实测改过：证据面板、
   // 运行对比、可验证报告各加了分析结论的几段
 }
@@ -179,8 +189,8 @@ if (unknown.length) {
   process.exit(2)
 }
 const names = picked.length ? ORDER.filter((n) => picked.includes(n)) : ORDER
-// 纯静态的几项不用起服务
-const STATIC = new Set(['tokens', 'copy'])
+// 纯静态或内存转译单测项不用起前后端服务
+const STATIC = new Set(['tokens', 'copy', 'trace', 'decode'])
 const needsServers = names.some((n) => !STATIC.has(n))
 
 // ---------------------------------------------------------------- 收尾
@@ -411,11 +421,11 @@ async function warmUp(stacks) {
 let stacks = []
 if (stackCount > 0 && needsServers) {
   const dataSrc = process.env.CHECK_DATA_SRC && resolve(process.env.CHECK_DATA_SRC)
-  const python = process.env.CHECK_PYTHON ?? join(homedir(), 'miniforge3', 'envs', 'agentlab', 'bin', 'python')
+  const python = resolvePython({ requireBackend: true })
   const problems = []
   if (!dataSrc) problems.push('--stacks 要知道拿哪份数据：用 CHECK_DATA_SRC=<数据目录> 指定（里面有 agentlab.db 的那一层）')
   else if (!existsSync(join(dataSrc, 'agentlab.db'))) problems.push(`CHECK_DATA_SRC=${dataSrc} 里没有 agentlab.db`)
-  if (!existsSync(python)) problems.push(`找不到后端解释器 ${python}，用 CHECK_PYTHON 指定`)
+  if (!python) problems.push('找不到可用的后端 Python 解释器，请用 CHECK_PYTHON 指定')
   if (problems.length) {
     for (const p of problems) console.error(`✗ ${p}`)
     process.exit(2)

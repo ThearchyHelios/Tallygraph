@@ -122,7 +122,7 @@ python scripts/fake-erp.py --port 8765
 ## 前端检查
 
 ```bash
-# 43 项，默认 8 道并行。连 5273 / 8000，先起 ./scripts/dev.sh
+# 45 项，默认 8 道并行。连 5273 / 8000，先起 ./scripts/dev.sh
 node scripts/check-all.mjs
 # 另起 2 套只给检查用的「后端 + vite」，各用一份数据拷贝，约 6.5 分钟；边改代码边跑也不被打断
 CHECK_DATA_SRC=<数据目录> node scripts/check-all.mjs --stacks 2 --lanes 12
@@ -135,7 +135,7 @@ node scripts/check-all.mjs evidence publish
 - `scripts/e2e-check.mjs` 真发起一次运行（Mock，不花钱），会在库里留下记录，所以不在 check-all 里。
 - `scripts/check-auth.mjs`（登录、按角色收起的导航、401 跳登录）要另起一套开着本地账号登录的服务单独跑，也不在 check-all 里。
 
-`check-all` 的 43 项按 `scripts/check-all.mjs` 里 `ORDER` 的顺序排：
+`check-all` 的 45 项按 `scripts/check-all.mjs` 里 `ORDER` 的顺序排：
 
 | 类别 | 检查 |
 |---|---|
@@ -144,7 +144,7 @@ node scripts/check-all.mjs evidence publish
 | 外壳、回答流与运行态 | `shell` `stream` `evidence`（可点击证据）`run-states`（节点卡）`canvas-fx`（画布表层） |
 | 各页面 | `studio` `publish`（发布前检查与自动修复）`chat` `runs` `manage` `versions`（上传表格的版本）`catalog`（数据目录）`catalog-loop`（表助手、审阅队列、导出导入）`catalog-profile`（数据剖析的逐表任务）`catalog-changes`（变化、表详情的变化一节、定时维护、后台任务条）`ui`（端到端，连真数据） |
 | 复核套件与导出 | `schedules`（定时任务）`compare`（运行对比）`verify`（双盲复算、反方审稿）`inquiry`（审批质询）`challenge`（反方审稿）`bundle`（可验证报告）`whatif`（数字推演）`report-export`（报告导出） |
-| 评测与口径账本 | `evals`（题集、加题、发起与进度、结果、对比与 A/B、口径命中与重复度）`ledger`（证据里的「口径」一步、轮次摘要、出具与对账、可沉淀的问题） |
+| 评测与口径账本 | `evals`（题集、加题、发起与进度、结果、对比与 A/B、口径命中与重复度）`ledger`（证据里的「口径」一步、轮次摘要、出具与对账、可沉淀的问题）`caliber-drafts`（口径草稿工作台、增量重导入与一句话改口径）`ontology`（标准业务实体、口径本体拓扑、源健康证据链、异常升级与本体穿透归因） |
 | 应用平台 | `apps`（应用页、印章、点数字看出处、入口校验、实例页）`inbox`（会签进度、超时、动作确认的哈希卡、核实）`app-editor`（应用编辑、派生、检查、发布时选处置、助手）`capabilities`（能力、端点、身份、通知、审计）`access-keys`（访问密钥）`share`（分享链接与 /s 页）`blueprint`（新建应用、蓝图卡片、试运行、发布摘要）`personal`（个人应用）`records`（记录列表）`files`（文件控件） |
 
 ### 三层验证的分工

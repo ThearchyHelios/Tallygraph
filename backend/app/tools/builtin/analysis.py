@@ -147,10 +147,40 @@ class ComparableArgs(BaseModel):
     hypothesis: str | None = Field(default=None, description=_HYPOTHESIS)
 
 
+class ReconcileArgs(BaseModel):
+    base_query: str | None = Field(default=None, description="主侧（左侧数据源）查询结果的编号，如 Q1")
+    target_query: str | None = Field(default=None, description="对账侧（右侧镜像数据源）查询结果的编号，如 Q2")
+    query: str | None = Field(default=None, description="两侧已合并进同一份查询结果时的编号（这时不写 base_query、target_query）")
+    by: list[str] | None = Field(default=None, description="对齐维度列（如产线、日期），1 到 2 列；总量单行对账时留空")
+    target_by: list[str] | None = Field(default=None, description="两份查询且对账侧维度列名不同时，写对账侧的维度列名（与 by 顺序对应）")
+    measure: str = Field(description="主侧要核对的数值列名")
+    target_measure: str | None = Field(default=None, description="对账侧的数值列名（两份查询且列名与 measure 相同时可留空；单份查询时必填）")
+    unit_factor: float | None = Field(default=None, description="已知的物理/计量单位换算系数（对账侧数值乘以该系数后与主侧比，如吨转千克写 1000）")
+    label: str | None = Field(default=None, description=_LABEL)
+    hypothesis: str | None = Field(default=None, description=_HYPOTHESIS)
+
+
+class CochangeArgs(BaseModel):
+    base_query: str | None = Field(default=None, description="主指标时间序列查询编号，如 Q1")
+    target_query: str | None = Field(default=None, description="上游驱动指标时间序列查询编号，如 Q2")
+    query: str | None = Field(default=None, description="主指标与驱动指标在同一份序列查询中时的编号（这时不写 base_query、target_query）")
+    period: str = Field(description="主指标期次列名")
+    target_period: str | None = Field(default=None, description="两份查询且驱动指标期次列名不同时，写驱动侧期次列名")
+    measure: str = Field(description="主指标数值列名")
+    driver_measure: str = Field(description="上游驱动指标数值列名")
+    target: str | None = Field(default=None, description="要检验异动的期次值；留空取主序列最后一期")
+    basis: Literal["change", "level"] | None = Field(
+        default=None, description="change：相邻期变化率是否同步超出常规波动（缺省）；level：水平值本身")
+    grain: Literal["day", "week", "month", "quarter"] | None = Field(default=None, description=_GRAIN)
+    lag: int | None = Field(default=None, description="上游驱动领先主指标的期数（0 表示同期，1 表示驱动早 1 期；缺省 0）")
+    label: str | None = Field(default=None, description=_LABEL)
+    hypothesis: str | None = Field(default=None, description=_HYPOTHESIS)
+
+
 #: 算子 → 参数模型。分析卡的一项按同一份参数模型校验参数（engine/nodes/analysis.py）
 ARGS: dict[str, type[BaseModel]] = {
     "decompose": DecomposeArgs, "baseline": BaselineArgs, "trend": TrendArgs, "differ": DifferArgs,
-    "comparable": ComparableArgs,
+    "comparable": ComparableArgs, "reconcile": ReconcileArgs, "cochange": CochangeArgs,
 }
 #: 不算「算什么」的参数：模式另放，这次在验证什么另放（contract.AnalysisRequest）
 NOT_PARAMS = frozenset({"mode", "hypothesis"})
@@ -260,6 +290,30 @@ async def analysis_differ(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
 )
 async def analysis_comparable(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
     return await run_tool("comparable", ctx, ComparableArgs(**kwargs))
+
+
+@register(
+    name=contract.TOOL_NAMES["reconcile"],
+    category=CATEGORY,
+    description="跨源对账：核对两个镜像数据源（或两套口径快照）在总量或各实体切片上是否对齐，按平台容差判定对账一致、"
+                "存在显著偏差或对侧缺失，列出超差最大的实体项。",
+    args_schema=ReconcileArgs,
+    guide=METHOD_GUIDE,
+)
+async def analysis_reconcile(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
+    return await run_tool("reconcile", ctx, ReconcileArgs(**kwargs))
+
+
+@register(
+    name=contract.TOOL_NAMES["cochange"],
+    category=CATEGORY,
+    description="伴随异动：检验主指标超出常规波动时，跨源上游关联指标在同期（或领先期 lag）是否也超出其自身稳健历史基线，"
+                "给出统计伴随异动或驱动未见异动的判定。",
+    args_schema=CochangeArgs,
+    guide=METHOD_GUIDE,
+)
+async def analysis_cochange(ctx: ToolContext, **kwargs: Any) -> dict[str, Any]:
+    return await run_tool("cochange", ctx, CochangeArgs(**kwargs))
 
 
 __all__ = ["ANALYSIS_METHOD_PROMPT", "ARGS", "METHOD_GUIDE", "param_names", "request_of", "run_tool"]

@@ -341,3 +341,83 @@ def test_auto_provided_variables_are_not_nagged_about() -> None:
     unused = [i.message for i in report.issues if "没有任何地方引用" in i.message]
     assert not any("item_index" in m for m in unused), unused
     assert not any("vars.items" in m for m in unused), unused
+
+# --------------------------------------------------------------------------
+# 已经渲染成字面值的参数（K01）：args / sql 里的 {{ }} 是数据，不是变量引用
+# --------------------------------------------------------------------------
+
+
+def _literal(config: dict, node_id: str = "fetch", node_type: str = "tool") -> dict:
+    """给节点配一份参数契约（ledger/params 的 marker）：args / sql 是服务端渲染好的字面值，契约与它绑定（rendered）。"""
+    from app.ledger import params
+
+    key = params.LITERAL_KEY[node_type]
+    return {**config, params.KEY: params.marker(rendered=config.get(key),
+                                                source={"kind": "caliber", "node_id": node_id})}
+
+
+def test_literal_parameters_are_not_read_as_variable_references() -> None:
+    """带参数契约的节点：args 里取不到同名变量的 {{ }} 是数据，不报「没有任何节点产出」。
+
+    组合式问数拷进来的取数节点、对账图里服务端拼的对齐语句都是这种：值来自口径参数或查询结果，里面带 `{{ }}` 纯属巧合
+    （用户写的就是这几个字）。报成模板引用会让整张图跑不起来——那是把数据当模板看。
+    """
+    g = _graph([
+        {"id": "start", "type": "input", "config": {"fields": [{"name": "question"}]}},
+        {"id": "fetch", "type": "tool",
+         "config": _literal({"tool": "db_query__shop", "assign_to": "rows",
+                             "args": {"sql": "SELECT * FROM orders WHERE region = '{{ vars.region }}'"}})},
+        {"id": "merge", "type": "merge",
+         "config": _literal({"inputs": {"o": "fetch"},
+                             "sql": "SELECT * FROM o WHERE 备注 = '{{ vars.region }}'"}, node_id="merge",
+                             node_type="merge")},
+    ], [("start", "fetch"), ("fetch", "merge")])
+    assert [i for i in analyze(g).issues if i.level != "info"] == []
+
+
+def test_a_normal_template_node_is_still_checked() -> None:
+    """没有契约的节点照旧全扫：拼错、取不到的变量仍然要在跑之前说破。"""
+    g = _graph([
+        {"id": "start", "type": "input", "config": {"fields": [{"name": "question"}]}},
+        {"id": "fetch", "type": "tool",
+         "config": {"tool": "db_query__shop", "args": {"sql": "SELECT * FROM orders WHERE region = '{{ vars.region }}'"}}},
+    ], [("start", "fetch")])
+    errs = [i for i in analyze(g).issues if i.level == "error"]
+    assert len(errs) == 1 and "vars.region" in errs[0].message, [i.message for i in errs]
+
+
+def test_literal_parameters_only_skip_their_own_key() -> None:
+    """契约只让 args / sql 那几个键不去当模板看：同一个节点别处的模板照旧扫。"""
+    g = _graph([
+        {"id": "start", "type": "input", "config": {"fields": [{"name": "question"}]}},
+        {"id": "fetch", "type": "tool",
+         "config": _literal({"tool": "db_query__shop",
+                             "args": {"sql": "SELECT '{{ vars.region }}' AS r"},
+                             "note": "{{ vars.region }}"})},
+    ], [("start", "fetch")])
+    errs = [i for i in analyze(g).issues if i.level == "error"]
+    assert len(errs) == 1 and errs[0].field == "note", [i.model_dump() for i in errs]
+
+
+def test_an_edited_node_loses_the_literal_exemption() -> None:
+    """契约与它注解的那条语句绑定：复制后改过 args / sql，契约作废，改过的内容照常当模板扫。
+
+    复制一个服务端渲染好的取数节点、再改它的 SQL 是最常见的走法。旧契约留在节点上，如果不核对哈希就按 literal 跳过，
+    一条改坏了的模板（引用没人产出的变量）会悄悄放行——运行前不再说破，运行时就渲染成空串。
+    """
+    from app.ledger import params
+
+    original = _literal({"tool": "db_query__shop", "assign_to": "rows",
+                         "args": {"sql": "SELECT '{{ vars.region }}' AS r"}})
+    edited = {**original, "args": {"sql": "SELECT '{{ vars.region }}' AS r, {{ vars.quesiton }} AS q"}}
+    assert params.literal_keys(original, "tool") == ("args",)
+    # 改过之后契约不再成立
+    assert params.literal_keys(edited, "tool") == () and params.marker_material(edited, "tool") is None
+
+    g = _graph([
+        {"id": "start", "type": "input", "config": {"fields": [{"name": "question"}]}},
+        {"id": "copy", "type": "tool", "config": edited},
+    ], [("start", "copy")])
+    errs = [i for i in analyze(g).issues if i.level == "error"]
+    assert len(errs) == 2 and {i.path for i in errs} == {"vars.region", "vars.quesiton"}, \
+        [i.message for i in errs]

@@ -63,6 +63,7 @@ FIELD_LABEL: dict[str, str] = {
     "judge": "结论句裁判", "entities": "表名、字段名",
     # 分析能力一轮：判断词要挂对应的分析结论（engine/analysis_claims）、文档末尾系统写的分析范围（engine/analysis_scope）
     "analysis_claims": "分析说法核对", "analysis_scope": "分析范围",
+    "ask_data_optimization": "问数执行策略", "reuse_answer_from": "复用答案来源",
     # 口径卡
     "caliber_from": "口径卡来源", "caliber": "口径名称", "caliber_version": "口径版本",
     "metrics": "指标定义", "on_missing": "缺输入时",

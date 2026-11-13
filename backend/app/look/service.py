@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import time
 from typing import Any
 
@@ -98,6 +99,7 @@ class LookService:
         self.texts: list[str] = []
         self._seen: set[str] = set()
         self._n = 0
+        self._requests_seen: set[str] = set()
 
     @property
     def default_kind(self) -> str | None:
@@ -136,6 +138,10 @@ class LookService:
             return LookResult(LIMIT_PROMPT.format(limit=budget.limit), None, counted=False)
         if budget is not None:
             budget.used += 1
+        request_key = json.dumps({"need": need, "targets": parse_targets(line), "sources": _sources(line)},
+                                 ensure_ascii=False, sort_keys=True)
+        if request_key in self._requests_seen:
+            return LookResult(REPEAT_PROMPT.format(what="对象"), None, counted=True)
         self._n += 1
         started = time.monotonic()
         record: dict[str, Any] = {"op": "look", "id": f"L{self._n}", "by": by, "need": need, "status": "ok"}
@@ -155,6 +161,8 @@ class LookService:
             what = "、".join(dict.fromkeys(self.kinds[k.split(":", 1)[0]].label for k in keys))
             return LookResult(REPEAT_PROMPT.format(what=what), None, counted=True)
         self._seen |= keys
+        if record["status"] == "ok" and keys and not any(o.get("missing") for o in objects):
+            self._requests_seen.add(request_key)
         record["elapsed_ms"] = int((time.monotonic() - started) * 1000)
         record["objects"] = objects
         text = "\n".join([head, NEED_PROMPT.format(need=need), "", body])
@@ -189,6 +197,7 @@ class LookService:
                     picks[t["kind"]] = None
         if not targets and self.default_kind:
             picks[self.default_kind] = None
+        record["kinds"] = list(dict.fromkeys([*named, *picks]))
         parts: list[str] = []
         objects: list[dict[str, Any]] = []
         keys: set[str] = set()

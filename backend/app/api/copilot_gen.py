@@ -72,6 +72,9 @@ OP_NAMES = frozenset({
     "bp_ask", "bp_set", "bp_add", "bp_remove", "bp_template", "fill_joint",
 })
 
+#: 这一轮看得见口径但**不能选用**（普通使用者的问数据）时的拒收原因与改法：改用口径查询工具，别自己拼取数 SQL
+NO_COMPOSE_TEXT = "这一轮不能选用口径：把口径的取数 SQL 拷进图里只有搭建者及以上能走"
+
 
 def _op_text(line: str) -> str:
     """一行里要按操作读的那段：去掉首尾空白和同一行上的围栏。只有围栏的行（```、```json）交回空串。"""
@@ -533,17 +536,25 @@ class GraphApplier:
     第一个取数节点（入口还没加的话，等入口加了再接）；转给界面的只是那一条 use_caliber，带上 result（选用了哪一版、生成了
     哪几个节点）。不合规的拒收：result 写原因、照样转给界面（过程里照实写一行），原因记进 refused，自查时交回模型改
     （GraphChecker.issues）。没有 composer 的入口（画布、发布前修复、升级）use_caliber 不认，照旧当认不出的操作丢掉。
+
+    no_compose：这一轮**看得见口径但不能选用**（普通使用者的问数据，K14：拷口径的取数 SQL 进图只有搭建者及以上能走）。
+    这时 use_caliber 不丢掉也不落地，照实拒收、自查时交回模型改用口径查询工具（口径清单与取数写法 look 已经给了）。
     """
 
     def __init__(self, nodes: dict[str, dict[str, Any]], edges: list[dict[str, Any]], *, patches: bool = True,
-                 questions: bool = False, composer: Any = None) -> None:
+                 questions: bool = False, composer: Any = None, no_compose: bool = False) -> None:
         self.nodes = nodes
         self.edges = edges
         self.patches = patches
         self.questions_mode = questions
         self.composer = composer
+        #: 这一轮看得见口径但不能选用（见类说明）：use_caliber 拒收而不是当认不出的操作丢掉
+        self.no_compose = no_compose
         #: 选用口径实例化出来的段：[(第一个取数节点, 全部节点 id)]，接入口用
         self.composed: list[tuple[str, list[str]]] = []
+        #: 这一轮选用过的口径（调用审计 caliber.use 用）：[{workflow_id, version, card, metrics, inputs}]。
+        #: inputs 只在内存里，写审计时只留指纹，不落参数值
+        self.caliber_uses: list[dict[str, Any]] = []
         #: 已经落地的 use_caliber（ledger/compose.signature），接着写时重发的同一个不再落地
         self._composed_ops: set[str] = set()
         #: 系统接上的连线（入口 → 取数）：模型再发一条一模一样的不重复加
@@ -593,8 +604,13 @@ class GraphApplier:
             self.autorun = op.get("run") is not False
             self.seen.append(op)
             return Applied(False, True)
-        if kind == "use_caliber" and self.composer is not None:
-            return self._use_caliber(op)
+        if kind == "use_caliber":
+            if self.composer is not None:
+                return self._use_caliber(op)
+            if self.no_compose:
+                # 看得见口径但不能选用：照实拒收（自查时交回模型改用口径查询工具），不静默丢掉
+                self.refused.append({"op": op, "message": NO_COMPOSE_TEXT, "no_compose": True})
+                return Applied(False, True)
         if kind == "add_edge" and self._was_wired(op.get("edge") or {}):
             # 入口 → 取数这条系统已经接上了
             return Applied(False, False)
@@ -643,6 +659,12 @@ class GraphApplier:
         if composed.op_id not in self._landed:
             self._landed.append(composed.op_id)
         self._wire()
+        self.caliber_uses.append({
+            "workflow_id": composed.option.workflow_id, "version": int(composed.option.version),
+            "card": composed.option.node_id,
+            "metrics": [str(m.get("id")) for m in composed.metrics if m.get("id")],
+            "inputs": dict(composed.inputs or {}),
+        })
         op["result"] = composed.result()
         return Applied(True, True)
 
@@ -717,7 +739,7 @@ class GraphChecker:
                  baseline: list[dict[str, Any]] | None = None, level: str | None = None,
                  defaults: dict[str, Any] | None = None, checkers: dict[str, Any] | None = None,
                  known: set[Any] | None = None, chat_user: bool = False, question: str | None = None,
-                 analysis_tools: bool = True) -> None:
+                 analysis_tools: bool = True, ontology_tools: bool = True) -> None:
         from app.analysis.intent import analysis_intent
 
         self.applier = applier
@@ -737,6 +759,8 @@ class GraphChecker:
         self._coverage_given = False
         #: 这一轮给不给分析工具（评测「关掉分析工具」那一臂为假）
         self.analysis_tools = analysis_tools
+        #: 这一轮给不给本体穿透工具（评测「关掉本体穿透」那一臂为假）
+        self.ontology_tools = ontology_tools
         #: 关掉分析工具时，用了分析能力的子工作流节点（issues 每次先读好）
         self._off_subgraphs: set[str] = set()
         #: 用户问题的分析意图（问为什么、怎么变了、是否异常、趋势……），不是分析类问题、或者这一轮没有分析工具时为 None
@@ -750,7 +774,7 @@ class GraphChecker:
         return _blocking_issues(self.applier.nodes, self.applier.edges, self.scope, sources=self.sources,
                                 baseline=self.baseline, level=self.level, defaults=self.defaults,
                                 checkers=self.checkers, chat_user=self.chat_user, analysis_tools=self.analysis_tools,
-                                off_subgraphs=self._off_subgraphs)
+                                ontology_tools=self.ontology_tools, off_subgraphs=self._off_subgraphs)
 
     async def issues(self) -> list[dict[str, Any]]:
         if not self.analysis_tools:
@@ -868,8 +892,8 @@ def analysis_gaps_fix(*, asked: str = "问题问的是变化从哪来（「把�
 COVERAGE_BUDGET_S = 8.0
 #: 分析类问题、查库的 Agent 没绑分析工具（GraphChecker.analysis_gaps）那条问题的 code
 ANALYSIS_TOOLS_MISSING = "analysis_tools_missing"
-#: 自查让助手绑分析工具时列出的先后：先定现象（可比性、基线、趋势），再拆、再检验（同分析方法 tools/builtin/analysis.py）
-ANALYSIS_TOOL_ORDER = ("comparable", "baseline", "trend", "decompose", "differ")
+#: 自查让助手绑分析工具时列出的先后：先定现象（可比性、基线、趋势），再拆、再检验、跨源对账与伴随异动（同分析方法 tools/builtin/analysis.py）
+ANALYSIS_TOOL_ORDER = ("comparable", "baseline", "trend", "decompose", "differ", "reconcile", "cochange")
 
 
 async def _probe_source(row: Any) -> Any:
@@ -908,6 +932,9 @@ def _profile_facts(row: Any) -> Any:
 #: 选用口径被拒时交回模型的说法
 _REFUSED_FOR_MODEL = ("上一次的 use_caliber 被拒收：{message}。按原因改正后重新输出 use_caliber（id 可以沿用）；这份口径对不上"
                       "问法的话就不要选用，交给 agent 查")
+_NO_COMPOSE_FOR_MODEL = ("这一次不能选用口径（{message}）：不要重新输出 use_caliber，也不要把口径的取数 SQL 抄进图里。"
+                         "改用口径查询工具 {tool}——在一个 agent 节点的 prompt 里让它照 look 交回的「取数写法」调它取数，"
+                         "交回的指标值写进报告")
 
 
 def _refused_issues(applier: Any) -> list[dict[str, Any]]:
@@ -915,10 +942,17 @@ def _refused_issues(applier: Any) -> list[dict[str, Any]]:
     if not isinstance(applier, GraphApplier):
         return []
     from app.ledger.compose import REFUSED
+    from app.ledger.querycore import CALIBER_QUERY
 
-    return [{"level": "error", "node_id": None, "edge_id": None, "field": None, "code": REFUSED,
-             "message": f"没有选用口径：{r['message']}", "for_model": _REFUSED_FOR_MODEL.format(message=r["message"])}
-            for r in applier.unreported()]
+    out: list[dict[str, Any]] = []
+    for r in applier.unreported():
+        if r.get("no_compose"):
+            model = _NO_COMPOSE_FOR_MODEL.format(message=r["message"], tool=CALIBER_QUERY)
+        else:
+            model = _REFUSED_FOR_MODEL.format(message=r["message"])
+        out.append({"level": "error", "node_id": None, "edge_id": None, "field": None, "code": REFUSED,
+                    "message": f"没有选用口径：{r['message']}", "for_model": model})
+    return out
 
 
 APP_REPAIR_PROMPT = (

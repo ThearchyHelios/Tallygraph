@@ -348,6 +348,39 @@ export function LedgerPart({ runId, runClass, report, segId, segText, segLedger,
             i.workflow_id === issue.workflow_id && i.version === issue.version) }} />}
         </div>
       )}
+      {label.kind === 'external' && (
+        <div className="space-y-1" data-ledger-external="">
+          <p className="font-medium">外部常量</p>
+          <p className="text-2xs text-dim">
+            来源：{label.source || '未写'} · 生效日期：{label.as_of || '未写'}
+            {label.stale && <span className="ml-1.5 text-[var(--warn)]">已过期</span>}
+          </p>
+          <p className="text-2xs text-faint">不来自查询，没有等价证明；正式出具前请核对来源和有效期。</p>
+        </div>
+      )}
+      {label.kind === 'derived' && (
+        <div className="space-y-1" data-ledger-derived="">
+          <p className="font-medium">按规则派生</p>
+          <p className="text-2xs text-dim">
+            数由规则从查询结果算出，不是某条查询与口径等价；输入仍然逐格可追溯。
+          </p>
+          {label.rule?.conditions ? <p className="text-2xs text-faint">条件：{label.rule.conditions} 条</p> : null}
+        </div>
+      )}
+      {label.kind === 'assessed' && (
+        <div className="space-y-1" data-ledger-assessed="">
+          <p className="font-medium">评估值</p>
+          <p className="text-2xs text-dim">
+            按评分协议从输入算出，不是测量值；不参与自动正式出具。
+          </p>
+          {label.assessment?.level && (
+            <p className="text-2xs text-faint">
+              等级：{label.assessment.level}
+              {label.assessment.score != null ? ` · 得分：${label.assessment.score}` : ''}
+            </p>
+          )}
+        </div>
+      )}
       {label.kind === 'related' && (
         <div className="space-y-2">
           <p className="text-2xs text-dim">{LEDGER_UI.step.relatedSub}{label.reason ? `：${label.reason}` : ''}</p>
@@ -365,11 +398,19 @@ export function LedgerPart({ runId, runClass, report, segId, segText, segLedger,
                   <DiffList related={where} />
                 </div>
                 {action ? (
-                  <button type="button" className="btn btn-xs mt-1.5" disabled={readOnly}
-                          title={readOnly ? LEDGER_UI.reconcile.readOnly : undefined}
-                          onClick={() => setDialog({ action, related: where })} data-ledger-reconcile-open={r.caliber ?? ''}>
-                    <Scale size={11} aria-hidden /> {LEDGER_UI.reconcile.button}
-                  </button>
+                  action.available === false ? (
+                    // 服务端没给这一项身份（当前身份没有使用授权）：只是说明，不摆按钮
+                    <p className="mt-1.5 text-2xs text-dim" data-ledger-reconcile-refused={r.caliber ?? ''}
+                       title={LEDGER_UI.reconcile.unavailableHint}>
+                      {LEDGER_UI.reconcile.unavailable(caliberOf(action))}
+                    </p>
+                  ) : (
+                    <button type="button" className="btn btn-xs mt-1.5" disabled={readOnly}
+                            title={readOnly ? LEDGER_UI.reconcile.readOnly : undefined}
+                            onClick={() => setDialog({ action, related: where })} data-ledger-reconcile-open={r.caliber ?? ''}>
+                      <Scale size={11} aria-hidden /> {LEDGER_UI.reconcile.button}
+                    </button>
+                  )
                 ) : r.comparable === false ? <p className="mt-1 text-2xs text-faint">{r.reason || LEDGER_UI.step.notComparable}</p> : null}
                 {!!done.length && <ReconcileResults runId={runId} items={done} data={data} original={segText} readOnly={readOnly} />}
               </div>

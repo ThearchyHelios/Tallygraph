@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 import json
 import math
 import re
+from collections.abc import Iterable, Mapping
+from datetime import date, timedelta
 from typing import Any
 
 from app.core import artifact_store
 from app.core.errors import describe_exception
 from app.core.events import EventType
+from app.data.caliber_identity import card_hash_of
 from app.engine.context import NodeContext, NodeError
 from app.engine.evidence import (
     DEFAULT_FORMAT,
@@ -71,6 +75,24 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         caliber_raw, caliber_version = pinned["caliber"], pinned["caliber_version"]
     if not definitions:
         raise NodeError(ctx.node.id, "口径卡没有定义任何指标")
+    # K08：卡上的指标 ID 要唯一——重复了不取第一条静默执行（下游按 ID 与位置取数，会分不清是哪一条）。带选择时
+    # _pinned_caliber 的 require_selection 已经在过滤前拦过；这里管整卡（本地卡、转抄卡没给选择）那一路
+    if duplicates := duplicate_metric_ids(definitions):
+        raise NodeError(ctx.node.id, f"口径卡上的指标 ID 重复了：{'、'.join(f'「{d}」' for d in duplicates)}。"
+                                     "同一张卡上的指标 ID 要唯一——下游按 ID 与位置取数，重复了分不清是哪一条，"
+                                     "不能取第一条静默执行")
+    # K04：拿**实际生效的定义**和这张图里**真正要执行的那几个取数节点**上的受控绑定比。源头卡就是本地的指标；
+    # 转抄卡（caliber_from）是钉住那一版的定义，而且式子已经按 caliber_from.nodes 的源→本地映射改写到本图的节点 id
+    # （_pinned_caliber 的 rename_definition），所以本地那句被手工改过、还停在旧写法的 SQL 会被判中。对不上就在
+    # 算数之前停：那条 SQL 算出来的是旧定义下的数，不能冒充新定义
+    from app.ledger import bindings
+
+    alignment = bindings.analyze(ctx.run.spec.model_dump(mode="json"), ctx.node.id, definitions)
+    if alignment.blocked:
+        raise NodeError(ctx.node.id, "口径卡的业务定义和取数 SQL 对不上，没有计算任何指标：" + alignment.reason)
+    # 定义的内容指纹（data/caliber_identity）：同一位置的口径定义变没变按它认，运行时算出来的值不进哈希。
+    # 口径名和版本不参与（这里只按指标算），和账本里的源头口径卡两侧对得上
+    definition_hash = card_hash_of({"metrics": definitions})
 
     tctx = template_context(state)
     caliber = ctx.render_str(caliber_raw, state)
@@ -91,15 +113,189 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     snapshots: dict[str, Any] = {}
     #: 可比性检查：同一对查询快照只查一次（几个指标都用本周、上周两份快照时），和做检查要用的几样（_Comparing）
     comparing = _Comparing()
+
+    async def quality(inputs: list[dict[str, Any]], paths: list[str], use: TruncatedUse) -> dict[str, Any]:
+        """所有取数型指标共用的质量检查；换一种计算方式不能丢掉来源查询的缺口。"""
+        carried = [m for item in inputs if (m := _copied_metric(item, tctx)) is not None]
+        truncated = list(use.sources.values())
+        for source in (s for m in carried if m.get("incomplete") for s in m.get("truncated_sources") or []):
+            if isinstance(source, dict) and source not in truncated:
+                truncated.append(source)
+        flags: dict[str, Any] = {}
+        if truncated:
+            flags.update(incomplete=True, incomplete_reason=_incomplete_reason(truncated),
+                         truncated_sources=truncated)
+        copied_checks = [str(c.get("artifact")) for m in carried for c in m.get("sql_check_sources") or []
+                         if isinstance(c, dict) and c.get("artifact")]
+        if failed := _failed_queries(inputs, truncated, paths, tctx, checked, extra=copied_checks):
+            flags.update(sql_check_failed=True, sql_check_reason=_sql_check_reason(failed),
+                         sql_check_sources=[{"artifact": artifact, "codes": list(dict.fromkeys(
+                             code for p in found for code in p.codes))} for artifact, found in failed])
+            failed_by[metric_id] = [p for _, found in failed for p in found]
+        if lacking := _no_data_inputs(inputs, carried, snapshots):
+            flags.update(no_data=True, no_data_reason=_no_data_reason(lacking), no_data_sources=lacking)
+        comparable = await _comparability(metric_id, str(definition.get("name") or metric_id), inputs, ctx,
+                                          comparing, snapshots)
+        if comparable:
+            flags["comparability"] = comparable
+        artifacts = {item.get("artifact") for item in inputs if item.get("artifact")}
+        if any(set(pair) <= artifacts for pair in comparing.skipped):
+            flags["comparability_skipped"] = True
+        if any(m.get("comparability_skipped") for m in carried):
+            flags["comparability_skipped"] = True
+        if any(m.get("semantic_unverified") for m in carried):
+            flags["semantic_unverified"] = True
+        flags["contract_findings"] = list(dict.fromkeys(str(f) for m in carried for f in m.get("contract_findings") or []))
+        inherited = [m["comparability"] for m in carried if isinstance(m.get("comparability"), dict)
+                     and m["comparability"].get("verdict") != "comparable"]
+        if inherited:
+            worst = next((c for c in inherited if c.get("verdict") == "incomparable"), inherited[0])
+            if flags.get("comparability", {}).get("verdict") != "incomparable":
+                flags["comparability"] = worst
+        return flags
+
+    def input_refs(expressions: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+        paths = list(dict.fromkeys(path for expr in expressions for path in leaf_refs(parse_expression(expr)[0])))
+        return paths, [_input_of(path, _value_of(path, tctx), state, ctx, tctx) for path in paths]
+
     for definition in definitions:
         metric_id = str(definition.get("id") or "").strip()
-        expr = str(definition.get("expression") or "").strip()
-        if not metric_id or not expr:
-            errors.append(f"指标定义不完整（缺少 ID 或计算表达式）：{definition}")
+        if not metric_id:
+            errors.append(f"指标定义不完整（缺少 ID）：{definition}")
             continue
         display, problem = _display_of(definition)
         if problem:
             errors.append(f"指标「{metric_id}」：{problem}")
+            continue
+        use = TruncatedUse(edge=lambda path: _truncated_field(path, state, ctx))
+        if str(definition.get("kind") or "formula") == "assessment":
+            assessment, problem = _assessment_of(definition)
+            if problem:
+                errors.append(f"指标「{metric_id}」：{problem}")
+                continue
+            dimensions = assessment["dimensions"]
+            values_by_name = {str(d["name"]): _value_of(str(d["input"]), tctx, track=use) for d in dimensions}
+            missing = [name for name, value in values_by_name.items() if value is None]
+            if missing and on_missing != "null":
+                errors.append(f"指标「{metric_id}」：" + _missing_reason([str(d["input"]) for d in dimensions
+                                                                         if d["name"] in missing]))
+                continue
+            value: Any = None
+            details: list[dict[str, Any]] = []
+            level: str | None = None
+            out_of_range: list[str] = []
+            if not missing:
+                total = sum(float(d.get("weight", 1)) for d in dimensions)
+                points = 0.0
+                bad: str | None = None
+                for d in dimensions:
+                    low, high = float(d.get("min", 0)), float(d.get("max", 100))
+                    try:
+                        raw = float(values_by_name[str(d["name"])])
+                    except (TypeError, ValueError):
+                        bad = f"维度「{d['name']}」的输入不是数（{values_by_name[str(d['name'])]!r}）"
+                        break
+                    if not math.isfinite(raw) or isinstance(values_by_name[str(d["name"])], bool):
+                        bad = f"维度「{d['name']}」的输入必须是有限数值"
+                        break
+                    normalized = max(0.0, min(100.0, (raw - low) / (high - low) * 100))
+                    weight = float(d.get("weight", 1))
+                    points += normalized * weight
+                    if raw < low or raw > high:
+                        out_of_range.append(str(d["name"]))
+                    details.append({"name": d["name"], "value": raw, "normalized": normalized, "weight": weight,
+                                    "out_of_range": raw < low or raw > high})
+                if bad:
+                    errors.append(f"指标「{metric_id}」：{bad}")
+                    continue
+                raw_score = points / total
+                value = round_metric(raw_score, display["decimals"])
+                level = next((str(l["name"]) for l in assessment["levels"] if raw_score >= float(l["min"])), None)
+            paths, inputs = input_refs([str(d["input"]) for d in dimensions])
+            metrics.append({
+                "id": metric_id,
+                "name": definition.get("name") or metric_id,
+                "unit": definition.get("unit") or "",
+                "value": value,
+                "expression": "",
+                "decimals": display["decimals"],
+                "format": display["format"],
+                "rendered": _rendered(value, definition, display),
+                "inputs": inputs,
+                "substituted": "加权评分",
+                "recompute_ok": None,
+                "recompute_reason": "这个指标不按表达式复算",
+                "status": "ok" if value is not None else "missing_input",
+                "assessment": {"score": value, "level": level, "dimensions": details,
+                               "levels": assessment["levels"],
+                               **({"missing": missing} if missing else {}),
+                               **({"out_of_range": out_of_range} if out_of_range else {}),
+                               **({"unlevelled": True} if value is not None and level is None else {})},
+                **await quality(inputs, paths, use),
+            })
+            continue
+        if str(definition.get("kind") or "formula") == "rule":
+            rule, problem = _rule_of(definition)
+            if problem:
+                errors.append(f"指标「{metric_id}」：{problem}")
+                continue
+            inputs_cfg = {str(name): str(path) for name, path in (rule.get("inputs") or {}).items()}
+            values_by_name = {name: _value_of(path, tctx, track=use) for name, path in inputs_cfg.items()}
+            missing = [name for name, value in values_by_name.items() if value is None]
+            if missing and on_missing != "null":
+                errors.append(f"指标「{metric_id}」：" + _missing_reason([inputs_cfg[name] for name in missing]))
+                continue
+            value: Any = None
+            if not missing:
+                value = rule.get("then", 1) if _rule_matches(values_by_name, rule) else rule.get("else", 0)
+            decimals = display["decimals"]
+            value = round_metric(value, decimals)
+            paths, inputs = input_refs(list(inputs_cfg.values()))
+            metrics.append({
+                "id": metric_id,
+                "name": definition.get("name") or metric_id,
+                "unit": definition.get("unit") or "",
+                "value": value,
+                "expression": "",
+                "decimals": decimals,
+                "format": display["format"],
+                "rendered": _rendered(value, definition, display),
+                "inputs": inputs,
+                "substituted": _rule_text(rule),
+                "recompute_ok": None,
+                "recompute_reason": "这个指标不按表达式复算",
+                "status": "ok" if value is not None else "missing_input",
+                "rule": rule,
+                **await quality(inputs, paths, use),
+            })
+            continue
+        if str(definition.get("kind") or "formula") == "external":
+            value, external, problem = _external_of(definition)
+            if problem:
+                errors.append(f"指标「{metric_id}」：{problem}")
+                continue
+            decimals = display["decimals"]
+            value = round_metric(value, decimals)
+            metrics.append({
+                "id": metric_id,
+                "name": definition.get("name") or metric_id,
+                "unit": definition.get("unit") or "",
+                "value": value,
+                "expression": "",
+                "decimals": decimals,
+                "format": display["format"],
+                "rendered": _rendered(value, definition, display),
+                "inputs": [],
+                "substituted": str(value),
+                "recompute_ok": None,
+                "recompute_reason": "这个指标不按表达式复算",
+                "status": "ok",
+                "external": external,
+            })
+            continue
+        expr = str(definition.get("expression") or "").strip()
+        if not expr:
+            errors.append(f"指标定义不完整（缺少计算表达式）：{definition}")
             continue
         try:
             tree, _, _ = parse_expression(expr)
@@ -111,7 +307,6 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         missing = [path for path in paths if values[path] is None]
 
         value: Any = None
-        use = TruncatedUse(edge=lambda path: _truncated_field(path, state, ctx))
         try:
             value = eval_expression(expr, tctx, track=use)
         except ExpressionError as e:
@@ -142,17 +337,6 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         value = round_metric(value, decimals)
         substituted = substitute(tree, values)
         inputs = [_input_of(path, values[path], state, ctx, tctx) for path in paths]
-        # 转抄另一张口径卡的指标：那个指标不完整、所依据的查询没通过 SQL 检查的，这一个照样不完整、存疑（出处是跨卡追下去
-        # 的，判档也按追到底的结果，见 engine/lineage.metric_copy）
-        carried = [m for item in inputs if (m := _copied_metric(item, tctx)) is not None]
-        truncated = list(use.sources.values())
-        for source in (s for m in carried if m.get("incomplete") for s in m.get("truncated_sources") or []):
-            if isinstance(source, dict) and source not in truncated:
-                truncated.append(source)
-        incomplete: dict[str, Any] = {}
-        if truncated:
-            incomplete = {"incomplete": True, "incomplete_reason": _incomplete_reason(truncated),
-                          "truncated_sources": truncated}
         for path, item in zip(paths, inputs):
             # 容器型的 vars.* 输入（列表、字典）另存一份完整值：卡里只记了「[12 项]」这样的大概，事后推演
             # （engine/recompute.py）要拿完整的值重算。nodes.*、input.* 的完整值在那个节点封存的产出工件里，
@@ -160,22 +344,6 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             # 只能在这一刻存下。只给这种输入多一个键：没有容器型 vars 输入的卡和以前逐字节相同
             if _container_var(path, values[path]) and (stored := await _store_value(path, values[path], ctx)):
                 item["value_artifact"] = stored
-        sql_check: dict[str, Any] = {}
-        copied_checks = [str(c.get("artifact")) for m in carried for c in m.get("sql_check_sources") or []
-                         if isinstance(c, dict) and c.get("artifact")]
-        if failed := _failed_queries(inputs, truncated, paths, tctx, checked, extra=copied_checks):
-            sql_check = {"sql_check_failed": True, "sql_check_reason": _sql_check_reason(failed),
-                         "sql_check_sources": [{"artifact": artifact, "codes": list(dict.fromkeys(
-                             code for p in found for code in p.codes))} for artifact, found in failed]}
-            failed_by[metric_id] = [p for _, found in failed for p in found]
-        # 输入取自「查询区间里这张表没有数据」的列（查询快照的 no_data，data/coverage.py）：值照算，标 no_data 并写明原因，
-        # 出具契约据此降档（issuance.no_data_gaps）。按输入的快照 id + 列认：同一条查询里有数的列不受影响。转抄的指标
-        # 那张卡标了的，这一个照样标
-        no_data: dict[str, Any] = {}
-        if lacking := _no_data_inputs(inputs, carried, snapshots):
-            no_data = {"no_data": True, "no_data_reason": _no_data_reason(lacking), "no_data_sources": lacking}
-        comparability = await _comparability(metric_id, str(definition.get("name") or metric_id), inputs, ctx,
-                                             comparing, snapshots)
         metrics.append(
             {
                 "id": metric_id,
@@ -195,20 +363,41 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                 # 输入都齐、是计算式自己交回的空值（分母为 0 时写的 … if 分母 else None）：算不出来，不是缺输入。状态照旧是
                 # missing_input（证据面板、推演、运行对比按状态认的地方不受影响），只多这一个键；有值的指标和以前一字不差
                 **({"undefined": True} if value is None and not missing else {}),
-                # 只在不完整时出现：完整的指标和以前一字不差，老运行复核时目录也对得上
-                **incomplete,
-                # 只在来源查询没通过 SQL 检查时出现，同上
-                **sql_check,
-                # 只在输入取自「查询区间里这张表没有数据」的列时出现，同上
-                **no_data,
-                # 只在输入落在两份同形、只差字面量的查询快照上、可比性检查做成了时出现（contract.MetricComparability）
-                **({"comparability": comparability} if comparability else {}),
+                **await quality(inputs, paths, use),
             }
         )
 
     if errors:
         # 口径卡是固定层：任何一个指标算不出来都是模板缺陷，不能带病出具
         raise NodeError(ctx.node.id, "口径卡计算失败：" + "；".join(errors))
+
+    from app.engine.metric_spec import contract_findings
+    from app.engine.validation import metric_quality
+    from app.data.caliber_identity import semantic_hash
+
+    definitions_by_id = {str(d.get("id")): d for d in definitions}
+    for metric in metrics:
+        definition = definitions_by_id[metric["id"]]
+        sources = []
+        for item in metric.get("inputs") or []:
+            artifact = (item.get("origin") or {}).get("artifact") if isinstance(item.get("origin"), dict) else None
+            artifact = artifact or item.get("query_artifact") or item.get("artifact") or _result_artifact(str(item.get("path") or ""), tctx)
+            if artifact:
+                try:
+                    snap = snapshots.get(artifact) or artifact_store.load(artifact)
+                except (ValueError, OSError):
+                    snap = None
+                if isinstance(snap, dict) and isinstance(snap.get("rows"), list):
+                    sources.append(snap)
+        metric["contract_findings"] = list(dict.fromkeys([*(metric.get("contract_findings") or []),
+                                                        *contract_findings(definition, metric, sources)]))
+        # 描述文字不会被静默当作已执行的 SQL 约束。业务字段（K04 的时间口径、退款规则）也算：受控绑定对齐只说
+        # 「定义和取数实现同步」，业务描述本身仍需人工审阅（4.5），质量结论不能因为 aligned 自动变成 pass
+        if any(definition.get(key) for key in ("grain", "time_field", "numerator", "denominator", "dimensions",
+                                               "filters", "params", "time_role", "refund_rule")):
+            metric["semantic_unverified"] = True
+        metric["quality"] = metric_quality(metric)
+    semantic_fingerprint = semantic_hash(ctx.run.spec.model_dump(mode="json"), ctx.node.id)
 
     # text 是给叙述节点 prompt 用的清单——它是叙述层唯一的数字来源
     lines = [
@@ -232,10 +421,37 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
                  metrics=[m["id"] for m in lacking], metric_names=[m["name"] for m in lacking],
                  reason=lacking[0]["no_data_reason"],
                  message="指标" + "".join(f"「{m['name']}」" for m in lacking) + lacking[0]["no_data_reason"])
+    if violated := [m for m in metrics if m.get("contract_findings")]:
+        raw_findings = [
+            dict(f) if isinstance(f, Mapping) else str(f)
+            for m in violated
+            for f in (m.get("contract_findings") or [])
+            if f
+        ]
+        first_finding = raw_findings[0] if raw_findings else ""
+        detail = (
+            str(first_finding.get("detail") or first_finding.get("code") or "触发指标数值契约异常")
+            if isinstance(first_finding, Mapping)
+            else (str(first_finding) or "触发指标数值契约异常")
+        )
+        ctx.emit(
+            EventType.LOG,
+            level="warn",
+            code="metric_contract_violated",
+            metric=violated[0]["id"],
+            metrics=[m["id"] for m in violated],
+            metric_names=[m["name"] for m in violated],
+            findings=raw_findings,
+            reason=detail,
+            message="指标" + "".join(f"「{m['name']}」" for m in violated) + f"触发数值契约告警：{detail}",
+        )
     card = {
         "kind": "metric_set",
+        "validation_version": 1,
         "caliber": caliber,
         "caliber_version": caliber_version,
+        "definition_hash": definition_hash,
+        "semantic_hash": semantic_fingerprint,
         "metrics": metrics,
     }
     if source:
@@ -262,6 +478,8 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             "artifact": artifact,
             "caliber": caliber,
             "version": caliber_version,
+            "definition_hash": definition_hash,
+            "semantic_hash": semantic_fingerprint,
             "metrics": [m["id"] for m in metrics],
             **({"source": source} if source else {}),
         }]
@@ -271,13 +489,106 @@ async def run_metrics(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     return updates
 
 
+# --------------------------------------------------------------------------
+# 指标选择（K08）：caliber_from.metrics 是可选选择，缺省整卡
+# --------------------------------------------------------------------------
+
+
+class SelectionRefused(ValueError):
+    """口径卡的指标选择读不出来（形状不对、空的、点了卡上不存在的指标）：响亮失败，绝不退回整卡。
+
+    退回整卡等于没选——算的是别的指标、下游按位置取的 `nodes.<卡>.metrics[i]` 也就对不上了。所以这里不静默放宽。"""
+
+
+def duplicate_metric_ids(definitions: Iterable[Any]) -> list[str]:
+    """卡上**重复出现的非空指标 id**（按首次出现顺序，每个只列一次）。
+
+    指标 id 在一张卡上该唯一：下游 `nodes.<卡>.metrics[i]`、出具契约、比例契约、报告引用都按 id 与位置取数，同一张卡上
+    两个指标同名就分不清是哪一条。**不能取第一条静默执行**——那会把另一条的数顶替过来。空 id（没有声明的）不算重复，
+    缺 id 另有报法（画布校验 metrics.id_missing、运行时报「指标定义不完整」）。
+
+    判定只有一处：``ledger.closure.duplicate_metric_ids``（闭包把它记成 DUPLICATE_METRIC_ID 未决，运行时/画布校验按同一份
+    依据响亮失败——两边不会一个拦一个放）。"""
+    from app.ledger.closure import duplicate_metric_ids as canonical
+
+    return list(canonical(list(definitions)))
+
+
+def selection_index(definitions: Iterable[Any], selection: Any = None) -> list[int]:
+    """有效指标在 ``definitions`` 里的**下标**（按卡顺序）。``selection`` 缺省 → 全部下标。
+
+    位置与取舍只由 ``ledger.closure.selection_index`` 这一处算（K08 的一份解释），这里只是取它的 ``positions``：运行时、
+    对账、召回认 ``nodes.<卡>.metrics[i]`` 的 i 时都走它，别处不再各写一遍筛选与排序。"""
+    from app.ledger.closure import selection_index as canonical
+
+    return list(canonical(list(definitions), selection).positions)
+
+
+def effective_metrics(definitions: Iterable[Any], selection: Any = None) -> list[Any]:
+    """这次真正要算的指标定义（按**卡顺序**归一）。``selection`` 缺省（``None``）→ 整卡原样，行为一字不变。
+
+    唯一的一份解释在 ``ledger.closure.effective_metrics``（位置与取舍同一处算）；这里只是转发，别处不再各写一遍。"""
+    from app.ledger.closure import effective_metrics as canonical
+
+    return list(canonical(list(definitions), selection))
+
+
+def require_selection(definitions: Iterable[Any], selection: Any) -> list[Any]:
+    """运行时按口径卡上记的选择（``caliber_from.metrics``）读这一次真正要算的定义，未知、空的选择响亮失败。
+
+    ``ledger.closure.selection_index`` 把选择里认不出的 id 照实交回（不静默当整卡、也不静默丢掉）：这里把它变成一条
+    能看懂的 NodeError 由调用方抛。空选择（显式 ``[]``，或选择里没有一个是这张卡上的）同样不许——不退成整卡。"""
+    from app.ledger.closure import selection_index as canonical
+
+    if isinstance(selection, (str, bytes)) or not isinstance(selection, (list, tuple)):
+        raise SelectionRefused("要写成一串指标 id")
+    if any(not isinstance(s, str) or not s.strip() for s in selection):
+        raise SelectionRefused("每一项都要是非空的指标 id")
+    # 卡上同名指标（重复 id）：闭合解析只取第一次，绝不能顺着它把第一条静默算出来顶替另一条——在这里响亮失败
+    if duplicates := duplicate_metric_ids(definitions):
+        raise SelectionRefused(f"这张卡上有重复的指标 ID：{'、'.join(f'「{d}」' for d in duplicates)}"
+                               "（指标 ID 要唯一，重复了分不清取的是哪一条）")
+    index = canonical(list(definitions), selection)
+    card_ids = [str(m.get("id")) for m in definitions if isinstance(m, Mapping) and m.get("id")]
+    if index.unknown:
+        raise SelectionRefused(f"这张卡上没有指标 {'、'.join(f'「{u}」' for u in index.unknown)}"
+                               f"（卡上的指标：{'、'.join(card_ids) or '（一个也没有）'}）")
+    if not index.definitions:
+        raise SelectionRefused("一个指标也没选：不给就按整卡算，给了空列表不当作整卡")
+    return list(index.definitions)
+
+
+def pinned_effective(pinned: Any) -> list[dict[str, Any]]:
+    """一张已读好的口径卡（ledger.derive.Pinned）**这次真正会算出的**指标数组：``effective_metrics(pinned.metrics, 选择)``。
+
+    对账、召回按 ``nodes.<卡>.metrics[i]`` 建引用、配列时只用这一份：卡带了指标选择（caliber_from.metrics，K08）时，
+    全量定义里的下标和运行时算出来那份对不上，照全量定下标会静默取到别的指标。没有选择时就是全量定义（行为一字不变）。
+
+    选择从哪来（K08 S2）：裁剪过的 ``Pinned.closure``（``derive.select_pinned`` 附的这一次选择）优先；没有闭包时看
+    ``Pinned.selection``、再看卡自己的 ``caliber_from.metrics``。"""
+    selection: Any = None
+    closure = getattr(pinned, "closure", None)
+    if closure is not None and not getattr(closure, "whole_card", True):
+        selection = list(getattr(closure, "metric_ids", ()) or ())
+    else:
+        selection = getattr(pinned, "selection", None)
+        if selection is None:
+            config = getattr(pinned, "card_config", None)
+            ref = config.get("caliber_from") if isinstance(config, dict) else None
+            selection = ref.get("metrics") if isinstance(ref, dict) else None
+    return effective_metrics(list(pinned.metrics), selection)
+
+
 async def _pinned_caliber(ctx: NodeContext) -> tuple[dict[str, Any], dict[str, Any]]:
     """caliber_from 指向的那张口径卡：({caliber, caliber_version, metrics}, 来源)。
 
     从那个工作流的 WorkflowVersion 快照里取——版本快照不可变，同一份引用每次取到的定义都一样，
     审批恢复后节点重放也还是这一份。取不到就让节点失败并说清是哪一环断了：悄悄退回本地
     定义，等于换了口径还照常出具。
-    """
+
+    **普通使用者先过资产授权这一道**（`_require_own_caliber`，K14）：图是使用者的（问数据里生成的图也是），光在发起时按图
+    的白名单拦一遍不够——「读别的工作流那一版的口径定义」这件事真正的门在这一层。没有授权在**读定义之前**就失败（`format`
+    写错那种不涉及定义，照旧直接说格式）。"""
     from sqlalchemy import select
 
     from app.db.base import SessionLocal
@@ -291,6 +602,7 @@ async def _pinned_caliber(ctx: NodeContext) -> tuple[dict[str, Any], dict[str, A
     if not wf_id or not node_id or version is None or version < 1:
         raise NodeError(ctx.node.id, f"「{field_label('caliber_from')}」格式有误：需要指定工作流、版本和其中的口径卡，"
                                      f"当前为「{ref}」")
+    await _require_own_caliber(ctx, workflow_id=wf_id, version=version)
     async with SessionLocal() as session:
         workflow = await session.get(Workflow, wf_id)
         if workflow is None:
@@ -330,8 +642,56 @@ async def _pinned_caliber(ctx: NodeContext) -> tuple[dict[str, Any], dict[str, A
             raise NodeError(ctx.node.id, f"「{field_label('caliber_from')}」的节点改名映射有误：{problem}")
         metrics = [rename_definition(m, rename) for m in metrics]
         source["nodes"] = dict(rename)
+    # K08：可选指标选择（caliber_from.metrics）。缺省整卡；给了就只算选中的那些（按卡顺序归一）——未知、空的响亮失败，
+    # 绝不退回整卡。绑定判定（run_metrics 拿这一份 definitions 去比对）、指标集、下游按位置取的 nodes.<卡>.metrics[i]
+    # 都按这一份有效数组（唯一的一份解释在 ledger.closure，见 effective_metrics）
+    selection = ref.get("metrics") if isinstance(ref, dict) else None
+    if selection is not None:
+        try:
+            metrics = require_selection(metrics, selection)
+        except SelectionRefused as e:
+            raise NodeError(ctx.node.id, f"「{field_label('caliber_from')}」的指标选择（metrics）用不了：{e}") from e
+        source["metrics"] = [str(m.get("id")) for m in metrics]
     return {"caliber": cfg.get("caliber") or title, "caliber_version": str(cfg.get("caliber_version") or "v1"),
             "metrics": metrics}, source
+
+
+async def _require_own_caliber(ctx: NodeContext, *, workflow_id: str, version: int) -> None:
+    """普通使用者拿 `caliber_from` 钉别的工作流那一版的口径卡时，运行时按**同一份资产授权**核一遍（K14）。
+
+    为什么必须在运行时再判一道：图是使用者自己的（问数据里模型生成的图、画布上搭的图都一样），发起时的白名单只认节点类型，
+    认不出「这一版口径是谁的」——`caliber_from` 把**任意一份已发布口径的定义**读进这次运行这件事，只有执行到这一步才知道。
+    所以门设在这里：`apps/access.caliber_role`（AppGrant + 应用当前发布版精确固定着这一版）到 use 及以上才放行；
+    builder / admin / 关登录由 `restricted_actor` 显式放行（这几档不写进资产授权函数）。没授权在**读定义之前**失败——
+    既不把那份口径读出来，也不算任何指标（机器码 `querycore_not_authorized`，和别处同一条口径的拒绝同一个码）。
+
+    判谁：**父 Run 记下来的发起人**（名字），加上请求上下文里那个认得出名字的身份（调用方替谁发起时取更严的那一个）。
+    **两者都没有**说明这次运行不是某个使用者发起的（服务端自己发起的按需比对、口径召回、目录变化后的重算：`ledger/reconcile`、
+    `ledger/recall` 这批不带 actor，调度器、发布之后的后台任务也一样）——那不是「使用者拿别人的口径定义」，不按使用者那一档
+    收窄（builder 路径照旧跑得完）。"""
+    from app.api.deps import Principal, current_principal
+    from app.apps.access import at_least, caliber_role
+    from app.auth.chat_policy import restricted_actor
+    from app.db.base import SessionLocal
+    from app.ledger.querycore import NOT_AUTHORIZED
+    from app.tools.registry import RUN_STARTED_BY_KEY
+
+    extra = ctx.run.extra if isinstance(ctx.run.extra, dict) else {}
+    who: Any = extra.get(RUN_STARTED_BY_KEY)
+    if not who:
+        request = current_principal()
+        if not isinstance(request, Principal) or not request.username:
+            return
+        who = request
+    async with SessionLocal() as session:
+        if not await restricted_actor(session, who):
+            return
+        role = await caliber_role(session, who, str(workflow_id), int(version))
+        if at_least(role, "use"):
+            return
+    raise NodeError(ctx.node.id, "没有权限：这张卡转抄的口径没有授权给你使用，没有读它的定义、也没有算任何指标"
+                                 f"（{NOT_AUTHORIZED}）。要用它先让搭建者把固定着那一版的「应用」授权给你，"
+                                 "或者按数据源自己搭一张图")
 
 
 #: 改名映射里的节点 id：要能写进式子的取值链（nodes.<id>），和画布上的节点 id 同一种写法
@@ -389,10 +749,22 @@ def rename_expression(expression: str, rename: dict[str, str]) -> str:
 
 
 def rename_definition(definition: Any, rename: dict[str, str]) -> Any:
-    """一个指标定义按映射改写式子（别的项原样）。不是对象的原样交回，后面照常报「指标定义不完整」。"""
-    if not isinstance(definition, dict) or not isinstance(definition.get("expression"), str):
+    """改写公式、规则输入和评分维度里的节点引用，不修改被固定的源定义。"""
+    if not isinstance(definition, dict):
         return definition
-    return {**definition, "expression": rename_expression(definition["expression"], rename)}
+    result = copy.deepcopy(definition)
+    if isinstance(result.get("expression"), str):
+        result["expression"] = rename_expression(result["expression"], rename)
+    rule = result.get("rule")
+    if isinstance(rule, dict) and isinstance(rule.get("inputs"), dict):
+        rule["inputs"] = {name: rename_expression(path, rename) if isinstance(path, str) else path
+                          for name, path in rule["inputs"].items()}
+    assessment = result.get("assessment")
+    if isinstance(assessment, dict):
+        for dimension in assessment.get("dimensions") or []:
+            if isinstance(dimension, dict) and isinstance(dimension.get("input"), str):
+                dimension["input"] = rename_expression(dimension["input"], rename)
+    return result
 
 
 def source_expression(expression: str, source: Any) -> str:
@@ -406,6 +778,121 @@ def source_expression(expression: str, source: Any) -> str:
 
 #: 新写法的小数位范围。负数是取整到十位、百位（round(x, -2)）
 _DECIMALS_RANGE = 15
+
+
+def _external_of(definition: dict[str, Any]) -> tuple[Any, dict[str, Any], str | None]:
+    """外部常量指标：{value, external: {source, as_of, stale_after_days, stale}}，以及写错时的一句话。
+
+    外部常量不来自查询，但也不能没有出处：来源和生效日期必填；过了 stale_after_days 天标 stale，出具契约据此降档。
+    值只收数（布尔不算），单位的换算、取整仍交给 decimals/format。
+    """
+    external = definition.get("external")
+    if not isinstance(external, dict):
+        return None, {}, "外部常量指标需要 external 对象（value / source / as_of / stale_after_days）"
+    value = external.get("value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None, {}, "external.value 需要是有限数值"
+    source = str(external.get("source") or "").strip()
+    if not source:
+        return None, {}, "external.source 需要写明来源"
+    raw_as_of = external.get("as_of")
+    try:
+        as_of = date.fromisoformat(str(raw_as_of))
+    except (TypeError, ValueError):
+        return None, {}, "external.as_of 需要是 YYYY-MM-DD"
+    days = external.get("stale_after_days")
+    if days is not None and (isinstance(days, bool) or not isinstance(days, int) or days < 0):
+        return None, {}, "external.stale_after_days 需要是非负整数"
+    stale = days is not None and date.today() > as_of + timedelta(days=days)
+    return value, {"source": source, "as_of": as_of.isoformat(), "stale_after_days": days, "stale": stale}, None
+
+
+def _assessment_of(definition: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """评估型指标：{dimensions: [{name, input, weight, min, max}], levels: [{name, min}]}。"""
+    assessment = definition.get("assessment")
+    if not isinstance(assessment, dict):
+        return {}, "评估型指标需要 assessment 对象（dimensions / levels）"
+    dimensions = assessment.get("dimensions")
+    if not isinstance(dimensions, list) or not dimensions:
+        return {}, "评估需要至少一个维度"
+    for dimension in dimensions:
+        if not isinstance(dimension, dict) or not isinstance(dimension.get("name"), str) \
+                or not isinstance(dimension.get("input"), str) \
+                or isinstance(dimension.get("weight", 1), bool) \
+                or not isinstance(dimension.get("weight", 1), (int, float)) \
+                or not math.isfinite(dimension.get("weight", 1)) \
+                or float(dimension.get("weight", 1)) <= 0:
+            return {}, "评估维度需要 name、input 和正的 weight"
+        low, high = dimension.get("min", 0), dimension.get("max", 100)
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in (low, high)) or low >= high:
+            return {}, "评估维度的 min / max 必须是递增的有限数值"
+    levels = assessment.get("levels")
+    if not isinstance(levels, list) or not levels:
+        return {}, "评估需要至少一个等级"
+    return assessment, None
+
+
+def _rule_of(definition: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """规则型指标：{inputs: {名字: 取值路径}, all: [{input, op, value|values}], then, else}。"""
+    rule = definition.get("rule")
+    if not isinstance(rule, dict):
+        return {}, "规则型指标需要 rule 对象（inputs / all / then / else）"
+    inputs = rule.get("inputs")
+    if not isinstance(inputs, dict) or not inputs:
+        return {}, "规则需要 inputs：输入名 → 取值路径"
+    if any(not isinstance(name, str) or not str(name).strip() or not isinstance(path, str) or not path.strip()
+           for name, path in inputs.items()):
+        return {}, "规则的每个输入都要有名字和取值路径"
+    conditions = rule.get("all")
+    if not isinstance(conditions, list) or not conditions:
+        return {}, "规则需要 all：至少一条条件"
+    for cond in conditions:
+        if not isinstance(cond, dict) or cond.get("input") not in inputs:
+            return {}, "规则的条件要指向一个已声明的输入"
+        if cond.get("op") not in ("eq", "ne", "gt", "gte", "lt", "lte", "in", "not_in"):
+            return {}, "规则条件的运算符不认识"
+        if cond.get("op") in ("in", "not_in") and not isinstance(cond.get("values"), list):
+            return {}, "in / not_in 需要 values 列表"
+        if cond.get("op") not in ("in", "not_in") and "value" not in cond:
+            return {}, "规则条件需要 value"
+    return rule, None
+
+
+def _rule_matches(values: dict[str, Any], rule: dict[str, Any]) -> bool:
+    """所有条件都成立才为真；类型对不上（字符串和数比较）按不成立，不抛。"""
+    for cond in rule.get("all") or []:
+        a = values.get(str(cond.get("input")))
+        op = cond.get("op")
+        if op in ("in", "not_in"):
+            found = a in (cond.get("values") or [])
+            if found != (op == "in"):
+                return False
+            continue
+        b = cond.get("value")
+        # 类型对不上（字符串和数）按条件不成立，不静默走 ne；大小比较只对数
+        if op in ("eq", "ne"):
+            comparable = (isinstance(a, (int, float)) and not isinstance(a, bool)
+                          and isinstance(b, (int, float)) and not isinstance(b, bool)) or type(a) is type(b)
+            if not comparable:
+                return False
+            equals = a == b
+            ok = equals if op == "eq" else not equals
+        else:
+            if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (a, b)):
+                return False
+            ok = {"gt": a > b, "gte": a >= b, "lt": a < b, "lte": a <= b}.get(op, False)
+        if not ok:
+            return False
+    return True
+
+
+def _rule_text(rule: dict[str, Any]) -> str:
+    """规则的一句话写法，给指标清单和证据面板看。"""
+    parts = []
+    for cond in rule.get("all") or []:
+        right = cond.get("values") if cond.get("op") in ("in", "not_in") else cond.get("value")
+        parts.append(f"{cond.get('input')} {cond.get('op')} {right}")
+    return " 且 ".join(parts)
 
 
 def _display_of(definition: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
@@ -495,6 +982,7 @@ class _Comparing:
     def __init__(self) -> None:
         self.done: dict[tuple[str, str], dict[str, Any] | None] = {}
         self.kinds: dict[str, str | None] = {}
+        self.skipped: set[tuple[str, str]] = set()
 
 
 async def _comparability(metric_id: str, name: str, inputs: list[dict[str, Any]], ctx: NodeContext,
@@ -526,6 +1014,7 @@ async def _comparability(metric_id: str, name: str, inputs: list[dict[str, Any]]
     except _NotPeriods:
         found = None
     except Exception as e:  # noqa: BLE001 - 检查是附加的，不能挡住口径卡
+        comparing.skipped.add(key)
         why = e.message if isinstance(e, _Skipped) else describe_exception(e)
         ctx.emit(EventType.LOG, level="warn", code=COMPARABILITY_SKIPPED, metric=metric_id, metric_name=name,
                  reason=why, message=COMPARABILITY_SKIPPED_TEXT.format(name=name, why=why))
@@ -739,10 +1228,10 @@ def _listed(metric: dict[str, Any]) -> str:
     return rendered
 
 
-def _value_of(path: str, tctx: dict[str, Any]) -> Any:
+def _value_of(path: str, tctx: dict[str, Any], *, track: TruncatedUse | None = None) -> Any:
     """单独取一个引用的值。取不到（或取值本身出错）一律当作没有值。"""
     try:
-        return eval_expression(path, tctx)
+        return eval_expression(path, tctx, track=track)
     except Exception:  # noqa: BLE001
         return None
 
@@ -1279,7 +1768,9 @@ async def _store(card: dict[str, Any], caliber: str, version: str, ctx: NodeCont
 
     try:
         return await put_json(card, kind="metric_set", run_id=ctx.run.run_id, node_id=ctx.node.id,
-                              meta={"caliber": caliber, "version": version})
+                              meta={"caliber": caliber, "version": version,
+                                    "definition_hash": str(card.get("definition_hash") or ""),
+                                    "semantic_hash": str(card.get("semantic_hash") or "")})
     except Exception as e:  # noqa: BLE001
         ctx.emit(EventType.LOG, level="warn", code="evidence_store_failed",
                  message=f"口径卡的指标保存失败（{describe_exception(e)}），报告将无法引用这些指标")

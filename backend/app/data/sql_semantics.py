@@ -8496,47 +8496,182 @@ def _slot_of(expr: str, index: int, context: str) -> TemplateSlot:
     return TemplateSlot(index=index, field=found.group(1), filters=filters, context=context)
 
 
-def _template_slots(template: str) -> tuple[list[tuple[int, int, TemplateSlot]], str]:
-    """模板里每一处 {{ … }}：[(起, 止, 槽位)]，以及按哨兵渲染的 SQL。逐字看引号和注释，定下每一处在哪：单引号里是字，
-    双引号、反引号里是名字，-- 和 /* */ 里是注释，别处是裸写。{{ … }} 里面的字不参与判断。"""
+_DOLLAR_QUOTE_RE = re.compile(r"\$(?:[^\W\d]\w*)?\$")
+_ORACLE_Q_CLOSE = {"[": "]", "(": ")", "{": "}", "<": ">"}
+
+
+def _is_word_char(ch: str) -> bool:
+    return ch.isalnum() or ch in "_$"
+
+
+def _is_e_string_at(sql: str, i: int) -> bool:
+    return i >= 1 and sql[i - 1] in "eE" and not (i >= 2 and _is_word_char(sql[i - 2]))
+
+
+def _oracle_q_close_at(sql: str, i: int) -> str | None:
+    if i + 1 >= len(sql) or sql[i + 1].isspace() or not (i >= 1 and sql[i - 1] in "qQ"):
+        return None
+    j = i - 2
+    if j >= 0 and sql[j] in "nN":
+        j -= 1
+    if j >= 0 and _is_word_char(sql[j]):
+        return None
+    opener = sql[i + 1]
+    return _ORACLE_Q_CLOSE.get(opener, opener)
+
+
+def _is_bracket_ident_at(sql: str, i: int, dialect_key: str) -> bool:
+    if dialect_key == "sqlite":
+        return True
+    if dialect_key in ("postgres", "postgresql", "mysql", "mariadb", "oracle"):
+        return False
+    j = i - 1
+    while j >= 0 and sql[j].isspace():
+        j -= 1
+    return j < 0 or not (_is_word_char(sql[j]) or sql[j] in ")]")
+
+
+def _template_slots(
+    template: str, *, dialect: str | None = None,
+) -> tuple[list[tuple[int, int, TemplateSlot]], str]:
+    """模板里每一处 {{ … }}：[(起, 止, 槽位)]，以及按哨兵渲染的 SQL。
+
+    按方言词法逐字扫描引号与注释，定下每一处在哪：
+    - 单引号（含 PostgreSQL E'…'、MySQL 反斜杠转义、PostgreSQL $$…$$ / $tag$…$tag$、Oracle q'[…]'）里是字（quoted）；
+    - 双引号、反引号、SQLite 方括号 `[…]` 里是名字（name；MySQL 默认模式下双引号是字符串）；
+    - `--`、`/* … */`（PostgreSQL 支持嵌套）与 MySQL `#` 里是注释（comment）；
+    - 其余代码位置是裸写（bare）。`{{ … }}` 里面的字不参与外层引号/注释状态切换。
+    """
+    dialect_key = (dialect or "").strip().lower()
+    is_mysql = dialect_key in ("mysql", "mariadb")
+    is_pg = dialect_key in ("postgres", "postgresql")
+    allow_dollar = dialect_key in ("", "postgres", "postgresql")
+    allow_q_quote = dialect_key in ("", "oracle")
+
     spans: list[tuple[int, int, TemplateSlot]] = []
     out: list[str] = []
     state = "code"
+    quote = ""
+    backslash_escape = False
+    dollar_tag = ""
+    q_close = ""
+    block_depth = 0
+
     i, n = 0, len(template)
     while i < n:
         if template.startswith("{{", i):
             m = _SLOT_RE.match(template, i)
             if m is not None:
-                context = {"code": "bare", "string": "quoted", "name": "name", "line": "comment",
-                           "block": "comment"}[state]
+                context = {
+                    "code": "bare",
+                    "string": "quoted",
+                    "dollar": "quoted",
+                    "q_string": "quoted",
+                    "name": "name",
+                    "bracket_name": "name",
+                    "line": "comment",
+                    "block": "comment",
+                }[state]
                 slot = _slot_of(m.group(1).strip(), len(spans), context)
                 spans.append((m.start(), m.end(), slot))
-                out.append(_STRING_SENTINEL.format(slot.index) if context == "quoted"
-                           else str(_NUMBER_SENTINEL + slot.index) if context == "bare" else "")
+                out.append(
+                    _STRING_SENTINEL.format(slot.index)
+                    if context == "quoted"
+                    else str(_NUMBER_SENTINEL + slot.index)
+                    if context == "bare"
+                    else ""
+                )
                 i = m.end()
                 continue
         ch = template[i]
         if state == "code":
             if ch == "'":
+                q_closer = _oracle_q_close_at(template, i) if allow_q_quote else None
+                if q_closer is not None:
+                    state = "q_string"
+                    q_close = q_closer
+                    out.append(template[i:i + 2])
+                    i += 2
+                    continue
                 state = "string"
-            elif ch in "\"`":
+                quote = "'"
+                backslash_escape = is_mysql or _is_e_string_at(template, i)
+            elif ch == '"' and is_mysql:
+                state = "string"
+                quote = '"'
+                backslash_escape = True
+            elif ch in '"`':
                 state = "name"
                 quote = ch
+            elif ch == "[" and _is_bracket_ident_at(template, i, dialect_key):
+                state = "bracket_name"
+            elif allow_dollar and ch == "$" and (dm := _DOLLAR_QUOTE_RE.match(template, i)) is not None:
+                state = "dollar"
+                dollar_tag = dm.group(0)
+                out.append(dollar_tag)
+                i = dm.end()
+                continue
             elif template.startswith("--", i):
+                state = "line"
+                out.append("--")
+                i += 2
+                continue
+            elif is_mysql and ch == "#":
                 state = "line"
             elif template.startswith("/*", i):
                 state = "block"
-        elif state == "string" and ch == "'":
-            state = "code"          # 成对的 '' 是转义：关上又马上打开，结果一样
-        elif state == "name" and ch == quote:
-            state = "code"
+                block_depth = 1
+                out.append("/*")
+                i += 2
+                continue
+        elif state == "string":
+            if backslash_escape and ch == "\\" and i + 1 < n:
+                out.append(template[i:i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                if i + 1 < n and template[i + 1] == quote:
+                    out.append(quote * 2)
+                    i += 2
+                    continue
+                state = "code"
+        elif state == "dollar":
+            if template.startswith(dollar_tag, i):
+                out.append(dollar_tag)
+                i += len(dollar_tag)
+                state = "code"
+                continue
+        elif state == "q_string":
+            if ch == q_close and i + 1 < n and template[i + 1] == "'":
+                out.append(template[i:i + 2])
+                i += 2
+                state = "code"
+                continue
+        elif state == "name":
+            if ch == quote:
+                if i + 1 < n and template[i + 1] == quote:
+                    out.append(quote * 2)
+                    i += 2
+                    continue
+                state = "code"
+        elif state == "bracket_name":
+            if ch == "]":
+                state = "code"
         elif state == "line" and ch == "\n":
             state = "code"
-        elif state == "block" and template.startswith("*/", i):
-            out.append("*/")
-            i += 2
-            state = "code"
-            continue
+        elif state == "block":
+            if is_pg and template.startswith("/*", i):
+                block_depth += 1
+                out.append("/*")
+                i += 2
+                continue
+            if template.startswith("*/", i):
+                out.append("*/")
+                i += 2
+                block_depth -= 1
+                if block_depth <= 0:
+                    state = "code"
+                continue
         out.append(ch)
         i += 1
     return spans, "".join(out)
@@ -8734,7 +8869,7 @@ def _bindings(template_sql: str, sql: str, read: str | None, info: _Schema
               ) -> Iterator[tuple[str, dict[str, Any], tuple[str, ...], tuple[TemplateSlot, ...]]]:
     """按 BINDING_LEVELS 的先后给出配得上的绑定：(哪一级, {字段: 值}, 没取到值的字段, 槽位)，同样的绑定只给一次。
     模板没有槽位时只给一个空绑定（level 为 parsed：用不着配）。不可比抛 _NotComparable。"""
-    spans, sentinel_sql = _template_slots(template_sql)
+    spans, sentinel_sql = _template_slots(template_sql, dialect=read)
     slots = tuple(slot for _, _, slot in spans)
     fields = tuple(dict.fromkeys(s.field for s in slots))
     if not slots:
@@ -8839,7 +8974,7 @@ def bind_template(template_sql: str, slots: Any, sql: str, dialect: str | None =
     try:
         for level, values, unbound, found in _bindings(template_sql or "", sql or "", read, info):
             return TemplateBinding(True, values, unbound, level, None, found)
-        spans, _ = _template_slots(template_sql or "")
+        spans, _ = _template_slots(template_sql or "", dialect=read)
     except _NotComparable as e:
         return TemplateBinding(False, reason=str(e))
     except Exception:  # noqa: BLE001 - 绑定本身的缺陷不能连累调用方：当作没配上
@@ -8924,7 +9059,7 @@ def match_template(template_sql: str, slots: Any, sql: str, dialect: str | None 
         level, values, unbound, diff, rendered = tried[0]
         return TemplateMatch(False, binding=values, unbound=unbound, level=level, diff=diff, rendered=rendered)
     try:
-        spans, _ = _template_slots(template_sql)
+        spans, _ = _template_slots(template_sql, dialect=read)
     except _NotComparable as e:
         return TemplateMatch(False, comparable=False, reason=str(e))
     fields = tuple(dict.fromkeys(slot.field for _, _, slot in spans))
@@ -8954,7 +9089,7 @@ def _now_slots(template_sql: str, sql: str, read: str | None) -> list[tuple[str,
     from sqlglot import exp
 
     try:
-        spans, sentinel = _template_slots(template_sql)
+        spans, sentinel = _template_slots(template_sql, dialect=read)
     except _NotComparable:
         return []
     by_index = {slot.index: slot for _, _, slot in spans}
@@ -9344,7 +9479,7 @@ def project_template(template_sql: str, keep: Sequence[int], dialect: str | None
     template = (template_sql or "").strip()
     keep = tuple(keep)
     try:
-        slots, sentinel = _template_slots(template)
+        slots, sentinel = _template_slots(template, dialect=read)
         root, spans, expected = _plan_projection(sentinel, keep, read, None)
         items = list(root.expressions)
         names = tuple(_output_name(items[k], read) for k in keep)
@@ -9358,7 +9493,7 @@ def project_template(template_sql: str, keep: Sequence[int], dialect: str | None
             raise _NotProjectable(_PROJ_TEXT)
         out = _cut(template, mapped, keep)  # type: ignore[arg-type]
         # 换回模板之后再按哨兵渲染一遍：结构（字面量只看位置，槽位的编号会因为去掉了几处而变）要和投影后的一样
-        _, again = _template_slots(out)
+        _, again = _template_slots(out, dialect=read)
         root_again, _ = _parse(again, read)
         lits_a: list[Any] = []
         lits_b: list[Any] = []
@@ -9420,7 +9555,7 @@ def output_names(sql: str, dialect: str | None = None, *, template: bool = False
     text = (sql or "").strip()
     try:
         if template:
-            _, text = _template_slots(text)
+            _, text = _template_slots(text, dialect=read)
         root, _ = _parse(_mysql_dashes(text) if read == "mysql" else text, read)
     except _NotComparable:
         return None

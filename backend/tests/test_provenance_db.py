@@ -351,14 +351,15 @@ async def test_rehash_is_false_without_a_hash_or_a_file(snapshot):
 ])
 async def test_compile_facts_reports_tables_and_result_rows(snapshot, sql, tables, rows, yields):
     facts = await provenance_db.compile_facts(await _view(snapshot), sql)
-    assert facts == CompileFacts(tables=tables, result_rows=rows, yields=yields)
+    selects = 3 if 'UNION ALL' in sql else 2 if ' IN (SELECT' in sql else 1
+    assert facts == CompileFacts(tables=tables, result_rows=rows, yields=yields, selects=selects)
 
 
 @pytest.mark.parametrize("op", ["UNION", "INTERSECT", "EXCEPT"])
-async def test_compile_facts_sees_yield_in_set_operations(snapshot, op):
+async def test_compile_facts_sees_multiple_selects_in_set_operations(snapshot, op):
     facts = await provenance_db.compile_facts(
         await _view(snapshot), f'SELECT "日期","全日客流" FROM "日客流" {op} SELECT "日期","分区甲" FROM "日客流"')
-    assert facts.yields >= 1
+    assert facts.selects >= 2  # 不依赖 SQLite 是否将复合查询编译成 Yield 协程
 
 
 async def test_compile_facts_runs_in_a_thread_on_an_immutable_read_only_connection(snapshot, monkeypatch):

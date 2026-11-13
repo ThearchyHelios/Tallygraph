@@ -1,8 +1,11 @@
 """逐个数标口径（docs/design/next-round/02-口径账本.md 做法 3）：报告里每个引用了查询格、口径卡指标的数，来自哪一份口径。
 
-标签四种（KINDS）：
+标签（KINDS）：
 - caliber：来自口径「X」vN。how 是怎么认的：independent「等价已证明」（这次 Agent 自己写的 SQL 被证明和口径的取数等价）、
   composed「助手选用」（助手 use_caliber 按口径组合出来的取数，证明了和那一版一致：ledger/match 的 composed）。
+- external：外部常量（口径卡上的 kind=external），带来源、生效日期、是否过期。
+- derived：规则型指标（kind=rule），数由结构化规则从输入算出，不是某条查询与口径等价。
+- assessed：评估型指标（kind=assessment），按评分协议算出的评估值，不是测量值。
 - related：相关口径——同一个数据源、查了同样的表的已发布口径，但不等价；附差在哪（explain_sql_diff 的条目）。
 - reasoning：这次的推理——没有相关的已发布口径。
 - unknown：没比对、比对没做完（超时、解析失败）、快照读不出来。
@@ -34,7 +37,7 @@ from typing import Any
 from app.analysis.contract import LEDGER_KIND
 
 #: 标签的四种、认法的两种
-KINDS = ("caliber", "related", "reasoning", "unknown")
+KINDS = ("caliber", "external", "derived", "assessed", "related", "reasoning", "unknown")
 HOWS = ("independent", "composed")
 #: 界面上标签要写明的两句：比对在封存之后做，不在封存范围内；事后补比的是按现在的口径回看
 POST_SEAL_NOTE = "封存后比对，不在封存范围内"
@@ -86,10 +89,17 @@ def _related(query: Mapping[str, Any], *, reason: str | None = None) -> dict[str
 
 
 def _caliber(cand: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
-    return {"kind": "caliber", "how": "composed" if cand.get("how") == "composed" else "independent",
-            "caliber": cand.get("caliber"),
-            "workflow_id": cand.get("workflow_id"), "version": cand.get("version"), "level": cand.get("level"),
-            "binding": dict(cand.get("binding") or {}), **extra}
+    """来自口径的标签。定义的内容指纹取自候选：版本级的 caliber_hash，或者候选自带 / extra 覆盖的 definition_hash
+    （指标标签按它所在的那张卡的哈希覆盖版本级，见 metric_label）。"""
+    out: dict[str, Any] = {
+        "kind": "caliber", "how": "composed" if cand.get("how") == "composed" else "independent",
+        "caliber": cand.get("caliber"),
+        "workflow_id": cand.get("workflow_id"), "version": cand.get("version"), "level": cand.get("level"),
+        "binding": dict(cand.get("binding") or {}),
+    }
+    if hash := cand.get("definition_hash") or cand.get("caliber_hash"):
+        out["definition_hash"] = hash
+    return {**out, **extra}
 
 
 def _proven(query: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -293,8 +303,37 @@ def metric_label(card: Mapping[str, Any] | None, metric_id: Any, queries: Mappin
     metric = next((m for m in card.get("metrics") or [] if isinstance(m, dict) and m.get("id") == metric_id), None)
     if metric is None:
         return _unknown(METRIC_GONE)
+    external = metric.get("external")
+    if isinstance(external, dict):
+        # 外部常量不来自查询：没有等价证明可做，标签单独一类；带来源和生效日期，过期照实标
+        return {"kind": "external", "source": external.get("source"), "as_of": external.get("as_of"),
+                "stale": bool(external.get("stale")),
+                **({"definition_hash": card.get("definition_hash")} if card.get("definition_hash") else {})}
     inputs = [i for i in metric.get("inputs") or [] if isinstance(i, dict)]
     from_queries = [i for i in inputs if i.get("artifact") and i.get("via") in _SNAPSHOT_VIAS]
+    if metric.get("rule") is not None:
+        # 规则型指标：数由规则从输入算出，不是某条查询与口径等价；输入仍然逐格可追溯。
+        # 标签里只给结构（输入名、条件条数、then/else），不给条件里的字面量——那可能是遮罩列的取值
+        rule = metric.get("rule") if isinstance(metric.get("rule"), dict) else {}
+        return {"kind": "derived",
+                "rule": {"inputs": sorted(str(k) for k in (rule.get("inputs") or {})),
+                         "conditions": len(rule.get("all") or []),
+                         "then": rule.get("then", 1), "else": rule.get("else", 0)},
+                "queries": [str(i["artifact"]) for i in from_queries],
+                **({"definition_hash": card.get("definition_hash")} if card.get("definition_hash") else {})}
+    if metric.get("assessment") is not None:
+        # 评估值：按评分协议从输入算出，不是测量值，也不参与自动出具。标签里不带各维度的原始取值
+        # （可能是遮罩列的取值），只给得分、等级和维度名/权重
+        assessment = metric.get("assessment") if isinstance(metric.get("assessment"), dict) else {}
+        dimensions = [{"name": d.get("name"), "weight": d.get("weight")}
+                      for d in assessment.get("dimensions") or [] if isinstance(d, dict)]
+        return {"kind": "assessed",
+                "assessment": {"score": assessment.get("score"), "level": assessment.get("level"),
+                               "dimensions": dimensions,
+                               "levels": [{"name": l.get("name"), "min": l.get("min")}
+                                          for l in assessment.get("levels") or [] if isinstance(l, dict)]},
+                "queries": [str(i["artifact"]) for i in from_queries],
+                **({"definition_hash": card.get("definition_hash")} if card.get("definition_hash") else {})}
     if not from_queries:
         return {"kind": "reasoning"}
     rows = [queries.get(str(i["artifact"])) for i in from_queries]
@@ -358,7 +397,10 @@ def metric_label(card: Mapping[str, Any] | None, metric_id: Any, queries: Mappin
                     if theirs == mine), None)
         if hit is None:
             continue
-        label = {**_caliber(chosen[0], card=hit[0], metric=hit[1]), "binding": binding,
+        # 指标按它对上的那张卡的哈希记（版本里不止一张卡时版本级哈希不够细）；版本信息里没有这张卡的哈希就保留候选里的
+        card_hash = ((calibers.get(key) or {}).get("card_hashes") or {}).get(hit[0])
+        label = {**_caliber(chosen[0], card=hit[0], metric=hit[1],
+                            **({"definition_hash": card_hash} if card_hash else {})), "binding": binding,
                  "queries": [str(i["artifact"]) for i in from_queries]}
         if any(c.get("how") == "composed" for c in chosen):
             # 几个输入里有一个是助手选用的，整个指标就按助手选用说（不能说成都是独立写出来的）
@@ -419,7 +461,11 @@ def whole_of(labels: Mapping[str, Mapping[str, Any]], calibers: Mapping[str, Map
     keys = {label.get("caliber") for label in labels.values() if label.get("kind") == "caliber"}
     if counts["caliber"] != len(labels):
         # 逐格判之后常见「一部分数来自口径、另几个只是相关」：照实说是不一致，不说成这次的推理
-        reason = ("有的数没有比对" if counts["unknown"] else "没有数来自口径" if not counts["caliber"]
+        reason = ("有的数没有比对" if counts["unknown"]
+                  else "有的数是外部常量，不是测量值" if counts["external"]
+                  else "有的数是规则派生的，不是测量值" if counts["derived"]
+                  else "有的数是评估值，不是测量值" if counts["assessed"]
+                  else "没有数来自口径" if not counts["caliber"]
                   else "有的数和相关口径不一致，不来自口径" if counts["related"] else "有的数是这次的推理")
         return {"equivalent": False, "reason": reason, "counts": counts}
     if len(keys) != 1:

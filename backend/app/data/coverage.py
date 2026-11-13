@@ -28,6 +28,7 @@ import asyncio
 import logging
 import re
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -51,7 +52,9 @@ MAX_COLUMNS = 12
 #: 现查到的表的范围在进程里记多久（秒）：同一张表一会儿内查好几次（一张图里几个取数节点、助手自查几轮）不再全表 MIN /
 #: MAX。滚动表一天才换一次数据，几分钟的旧不影响判断；查不成的、退回剖析的不记
 LIVE_TTL_S = 300.0
-_LIVE: dict[tuple[Any, ...], tuple[float, Any]] = {}
+SNAPSHOT_LIVE_TTL_S = 86400.0
+_LIVE_MAX = 512
+_LIVE: OrderedDict[tuple[Any, ...], tuple[float, Any]] = OrderedDict()
 #: 现查没成功（大表全表 MIN / MAX 超时、库一时连不上）也记 LIVE_TTL_S：这段时间里同一张表直接退回剖析、取值观察，
 #: 不然取数 agent 连查几次、每次结果里有整列 0，每次都要白等 PROBE_TIMEOUT_S 秒才退回
 _PROBE_FAILED = object()
@@ -68,7 +71,7 @@ NO_DATA_SHORT = "查询区间里这张表没有数据"
 _COMPARE = {"GT": ">", "GTE": ">=", "LT": "<", "LTE": "<=", "EQ": "="}
 _FLIP = {">": "<", ">=": "<=", "<": ">", "<=": ">=", "=": "="}
 _ISO = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?"
-                  r"(?:Z|[+-]\d{2}:?\d{2})?$")
+                  r"(?:Z|[+-]\d{2}(?::?\d{2})?)?$")
 _COMPACT = re.compile(r"^(\d{4})(\d{2})(\d{2})$")
 
 
@@ -399,14 +402,19 @@ async def _range(source: Any, flt: _Filter, read: str | None, cache: Cache, fact
     key = (str(getattr(source, "name", "")), name_key(flt.table_name), name_key(flt.column_name))
     if key in cache.ranges:
         return cache.ranges[key]
-    live = (getattr(source, "id", None), getattr(source, "snapshot_id", None), *key)
+    snapshot_id = getattr(source, "snapshot_id", None)
+    live = (getattr(source, "id", None), snapshot_id, *key)
     held = _LIVE.get(live)
     failed_before = False
-    if held is not None and held[0] > time.monotonic():
-        if held[1] is not _PROBE_FAILED:
-            cache.ranges[key] = held[1]
-            return held[1]
-        failed_before = True
+    if held is not None:
+        if held[0] > time.monotonic():
+            _LIVE.move_to_end(live)
+            if held[1] is not _PROBE_FAILED:
+                cache.ranges[key] = held[1]
+                return held[1]
+            failed_before = True
+        else:
+            _LIVE.pop(live, None)
     table = flt.table.copy()
     table.set("alias", None)
     ident = flt.column.this.copy() if isinstance(flt.column.this, exp.Identifier) \
@@ -429,16 +437,18 @@ async def _range(source: Any, flt: _Filter, read: str | None, cache: Cache, fact
         out = await _fallback(flt, facts)
     cache.ranges[key] = out
     if found is None and not failed_before:
-        _remember(live, _PROBE_FAILED)
+        _remember(live, _PROBE_FAILED, ttl=LIVE_TTL_S)
     elif out is not None and out.basis == "live":
-        _remember(live, out)
+        ttl = SNAPSHOT_LIVE_TTL_S if snapshot_id else LIVE_TTL_S
+        _remember(live, out, ttl=ttl)
     return out
 
 
-def _remember(live: tuple[Any, ...], value: Any) -> None:
-    if len(_LIVE) > 512:
-        _LIVE.clear()
-    _LIVE[live] = (time.monotonic() + LIVE_TTL_S, value)
+def _remember(live: tuple[Any, ...], value: Any, *, ttl: float = LIVE_TTL_S) -> None:
+    _LIVE.pop(live, None)
+    while len(_LIVE) >= _LIVE_MAX:
+        _LIVE.popitem(last=False)
+    _LIVE[live] = (time.monotonic() + ttl, value)
 
 
 async def _fallback(flt: _Filter, facts: Facts) -> _Range | None:

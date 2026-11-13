@@ -43,11 +43,11 @@ from app.analysis.contract import OP_LABELS, method_label
 #: 两种分析期望
 ANALYSIS_KINDS = ("contribution", "verdict")
 #: 判定期望能用的分析（贡献恒为变化拆解）
-VERDICT_OPS = ("baseline", "trend", "differ", "comparable")
-#: 判定类，见模块说明。前六个是贡献的，后九个是判定的
+VERDICT_OPS = ("baseline", "trend", "differ", "comparable", "reconcile", "cochange")
+#: 判定类，见模块说明。前六个是贡献的，其余是判定的
 JUDGEMENTS = ("source", "dispersed", "flat", "mix", "rate", "mixed",
               "normal", "anomaly", "rising", "falling", "no_trend", "differs", "no_evidence", "comparable",
-              "incomparable")
+              "incomparable", "aligned", "diverged", "co_anomalous", "target_normal")
 #: 分析的输入在算子里的名字（报错里照它说：「期望 SQL 里没有『地区』这一列」）
 GOLD_REF = "期望 SQL"
 #: 贡献期望最多点名前几段
@@ -66,6 +66,8 @@ _JUDGEMENT_OF: dict[tuple[str, str | None], dict[str, str]] = {
     ("trend", None): {"rising": "rising", "falling": "falling", "no_trend": "no_trend"},
     ("differ", None): {"differs": "differs", "no_evidence": "no_evidence"},
     ("comparable", None): {"comparable": "comparable", "conditional": "comparable", "incomparable": "incomparable"},
+    ("reconcile", None): {"aligned": "aligned", "diverged": "diverged", "missing_counterpart": "diverged"},
+    ("cochange", None): {"co_anomalous": "co_anomalous", "target_normal": "target_normal", "primary_normal": "target_normal"},
 }
 #: 判定类要看方向的：主要来源、结构或自身为主、分散（总变化的涨跌）、超出常规波动（本期变化的涨跌）、差异站得住（A 相对 B）
 _DIRECTED = frozenset({"source", "mix", "rate", "mixed", "dispersed", "anomaly", "differs"})
@@ -79,6 +81,8 @@ _AFFIRMS: dict[str, frozenset[str]] = {
     "anomaly": frozenset({"anomaly"}), "rising": frozenset({"trend"}), "falling": frozenset({"trend"}),
     "no_trend": frozenset({"no_trend"}), "differs": frozenset({"differ"}), "no_evidence": frozenset({"no_diff"}),
     "comparable": frozenset(), "incomparable": frozenset(),
+    "aligned": frozenset(), "diverged": frozenset(),
+    "co_anomalous": frozenset({"anomaly"}), "target_normal": frozenset({"normal"}),
 }
 #: 判断词所在的句子最多留多少字给人看
 _SNIPPET_MAX = 40

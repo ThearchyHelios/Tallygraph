@@ -10,7 +10,7 @@
 //   - 非 GET 请求都带 X-AgentLab-Request 头（服务端开登录时据此防跨站）；
 //   - 使用者（user 角色）：导航只有「应用」和「设置」，别的地址送回应用首页，⌥ 数字切不到看不见的页；没有署名框，
 //     账户菜单写显示名、角色、退出登录；待办卡写「以登录身份处理」；
-//   - 搭建者：导航十项都在（第 4 波加了「评测」，搭建者以上可见），账户菜单写搭建者；
+//   - 搭建者：导航十一项都在（第 4 波加了「评测」，搭建者以上可见），账户菜单写搭建者；
 //   - 关登录：/login 直接回首页；导航底部是署名入口，没有账户菜单；应用首页挂「未开启登录」的说明；
 //   - 管理员允许使用者问数据时（D-c）：问数据页只取数据源的名字（/api/datasources/names），不取完整列表和表结构；
 //   - 使用者的设置页只剩偏好设置（主题）和通知，换主题只存本机、不写服务端（D-s）；
@@ -247,7 +247,9 @@ await section('使用者：导航只有应用和设置、账户菜单、没有�
     && (await page.locator('[data-task-signer]').innerText()).includes('张三（zhangsan）'))
   await nav(page).locator('[data-account]').click()
   await page.locator('[data-logout]').click()
-  check('退出登录回到登录页', await page.waitForURL(/\/login/, { timeout: 8000 }).then(() => true, () => false), page.url())
+  const loggedOut = await page.waitForURL(/\/login/, { timeout: 15000, waitUntil: 'domcontentloaded' }).then(() => true, () => false)
+  check('退出登录回到登录页', loggedOut, loggedOut ? page.url() : `${page.url()} ${await page.locator('body').innerText()}`)
+  check('退出没有未捕获的运行时错误', page.errors.length === 0, page.errors.join('；'))
   check('退出请求带 X-AgentLab-Request 头', state.writes.find((w) => w.path === '/api/auth/logout')?.csrf === '1')
 })
 
@@ -262,12 +264,12 @@ await section('会话中途失效：401 整页跳登录', async () => {
   check('任何接口回 401 都跳 /login，带上原处', await page.waitForURL(/\/login\?next=/, { timeout: 15000 }).then(() => true, () => false), page.url())
 })
 
-await section('搭建者：导航十项、账户菜单', async () => {
+await section('搭建者：导航十一项、账户菜单', async () => {
   const state = { mode: 'local', who: 'builder', writes: [] }
   const page = await open(state)
   await page.goto(`${WEB}/apps`)
   await nav(page).waitFor({ timeout: 15000 })
-  check('导航十项都在（含搭建者以上可见的「评测」）', (await navLabels(page)).length === 10 && (await navLabels(page)).includes('评测'),
+  check('导航十一项都在（含搭建者以上可见的「评测」）', (await navLabels(page)).length === 11 && (await navLabels(page)).includes('评测'),
     (await navLabels(page)).join(','))
   await nav(page).locator('[data-account]').click()
   check('账户菜单写搭建者', (await page.locator('[data-account-role]').innerText()) === '搭建者')
@@ -293,7 +295,7 @@ await section('关登录：登录页回首页、署名入口、说明行', async
   await page.goto(`${WEB}/login`)
   check('/login 回首页', await page.waitForURL(/\/chat/, { timeout: 15000 }).then(() => true, () => false), page.url())
   await nav(page).waitFor({ timeout: 8000 })
-  check('导航十项', (await navLabels(page)).length === 10)
+  check('导航十一项', (await navLabels(page)).length === 11)
   check('底部是署名入口', (await nav(page).locator('a[href="/settings/prefs"]').count()) === 1)
   check('没有账户菜单', (await nav(page).locator('[data-account]').count()) === 0)
   await page.goto(`${WEB}/apps`)
@@ -339,7 +341,7 @@ await section('使用者：个人应用开关关着时没有新建入口，开�
   check('关着：页头没有「新建应用」', await page.locator('[data-app-create]').count() === 0)
   check('……没有「我的应用」一组', await page.locator('[data-app-group="personal"]').count() === 0)
   await page.goto(`${WEB}/apps/create`)
-  await page.locator('[data-new-app]').waitFor({ timeout: 8000 })
+  await page.getByText('管理员还没有开放个人应用', { exact: true }).waitFor({ timeout: 8000 })
   check('……打开新建页：写明管理员还没有开放个人应用，不给起点', (await page.locator('[data-new-app]').getAttribute('data-new-app')) === 'none'
     && (await page.locator('main').innerText()).includes('管理员还没有开放个人应用'))
   await page.goto(`${WEB}/blueprints/bp_mine`)

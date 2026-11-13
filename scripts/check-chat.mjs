@@ -1716,6 +1716,8 @@ for (const theme of THEMES) {
     const bodyAfter = await page.evaluate(() => Math.round(document.querySelector('[data-stream-scroll]')?.getBoundingClientRect().width ?? 0))
     check('390 宽：抽屉打开时正文不被挤窄', bodyAfter === narrow.body, `${narrow.body} → ${bodyAfter}`)
     await page.screenshot({ path: `${SHOTS}/narrow-390-drawer-${theme}.png` })
+    // 目录失败提示在窄屏会覆盖顶部会话；先按真实用户路径关闭提示，再验证抽屉选中交互。
+    for (const close of await page.getByRole('button', { name: '关闭提示', exact: true }).all()) await close.click()
     await drawer.locator('div.group', { hasText: '会话 B' }).locator('button').first().click()
     await page.waitForURL(/\/chat\/c0idleb$/, { timeout: 5000 }).catch(() => {})
     await page.waitForTimeout(300)
@@ -3551,6 +3553,14 @@ for (const theme of THEMES) {
       `${log.sourceGets - getsBefore} 次`)
     check('别处刚加的库出现在首屏的标签里', await page.locator('[data-scope-chip="ds-new"]').waitFor({ timeout: 5000 })
       .then(() => true, () => false))
+    const freshGets = log.sourceGets
+    await page.locator('nav[aria-label="主导航"] a[href="/runs"]').click()
+    await page.waitForURL((u) => u.pathname.startsWith('/runs'))
+    await page.locator('nav[aria-label="主导航"] a[href^="/chat"]').first().click()
+    await page.waitForURL((u) => u.pathname.startsWith('/chat'))
+    await page.locator('[data-scope-chip="ds-new"]').waitFor({ timeout: 5000 })
+    await page.waitForTimeout(300)
+    check('缓存仍新鲜时快速往返不重复取库列表', log.sourceGets === freshGets, `${log.sourceGets - freshGets} 次`)
     ctl.extraSource = false
     check('没有运行时报错', errors.length === 0, errors[0] ?? '')
     await ctx.close()

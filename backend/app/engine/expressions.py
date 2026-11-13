@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Callable
 
 # --------------------------------------------------------------------------
@@ -36,6 +37,8 @@ def resolve_path(ctx: dict[str, Any], path: str) -> Any:
             if isinstance(cur, dict):
                 cur = cur.get(name)
             else:
+                if name.startswith("_"):
+                    return None
                 cur = getattr(cur, name, None)
             if cur is None:
                 return None
@@ -65,11 +68,24 @@ _FILTERS = {
 }
 
 
+def _format_decimal(value: Decimal) -> str:
+    if not value.is_finite():
+        return str(value)
+    text = str(value)
+    if "e" in text or "E" in text:
+        exp = value.as_tuple().exponent
+        if isinstance(exp, int) and abs(exp) <= 100:
+            return format(value, "f")
+    return text
+
+
 def _stringify(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
         return value
+    if isinstance(value, Decimal):
+        return _format_decimal(value)
     if isinstance(value, (dict, list, tuple)):
         return json.dumps(value, ensure_ascii=False, default=str)
     return str(value)
@@ -223,6 +239,7 @@ class ExpressionError(ValueError):
 # 一条画布上的分支条件就能把整个后端冻死。
 _MAX_POW_EXPONENT = 1024
 _MAX_POW_BASE = 1e15
+_MAX_SEQ_REPEAT = 1_000_000
 
 
 def _safe_pow(base: Any, exponent: Any) -> Any:
@@ -237,10 +254,22 @@ def _safe_pow(base: Any, exponent: Any) -> Any:
     return operator.pow(base, exponent)
 
 
+def _safe_mul(a: Any, b: Any) -> Any:
+    """带上界的乘法：序列重复（'x' * 10**9、[0] * 10**8）超界直接报错，防止在事件循环里把内存撑爆。"""
+    seq_types = (str, bytes, bytearray, list, tuple, TruncatedRows)
+    if isinstance(a, seq_types) and isinstance(b, int):
+        if len(a) * max(0, b) > _MAX_SEQ_REPEAT:
+            raise ExpressionError(f"序列重复长度超过上限 {_MAX_SEQ_REPEAT}")
+    elif isinstance(b, seq_types) and isinstance(a, int):
+        if len(b) * max(0, a) > _MAX_SEQ_REPEAT:
+            raise ExpressionError(f"序列重复长度超过上限 {_MAX_SEQ_REPEAT}")
+    return operator.mul(a, b)
+
+
 _BIN_OPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
+    ast.Mult: _safe_mul,
     ast.Div: operator.truediv,
     ast.FloorDiv: operator.floordiv,
     ast.Mod: operator.mod,

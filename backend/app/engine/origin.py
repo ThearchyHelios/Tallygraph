@@ -29,7 +29,14 @@ ORIGIN_KINDS = (
     "ledger_issue",  # 问数据的答案按已治理口径正式出具（正式运行）
     "reconcile",     # 口径对账：这次的取数和口径在同一份数据上各算一次（探索运行）
     "recall",        # 口径召回：新旧两版口径在同一份数据上各算一次（探索运行）
+    "caliber_trial", # 口径目录里的试跑（探索运行，不是问数回答，也不进统计/召回）
 )
+
+#: 进程内 QueryCore 固定执行（K09，app/ledger/querycore.py）用的来源：**沿用口径试跑这一档**——同样是「按一份固定口径跑
+#: 一次取数」的探索运行，不是有人在问数，也不进使用统计与召回比对。这一档的枚举与前端联合类型逐字对齐
+#: （tests/test_frontend_type_unions.py 比对 ORIGIN_KINDS），加一种新来源要同时改前端和 apps/resolve 的分类，这一轮不动它；
+#: QueryCore 自己那几件事（版本、清单、闭包身份、用途、trace）记在 origin 数据的 service/purpose/… 上，不新开一档。
+QUERYCORE_ORIGIN = "caliber_trial"
 
 #: 客户端在 POST /api/runs 里能声明的来源
 CLIENT_ORIGINS = ("chat", "canvas", "launcher", "api")
@@ -38,7 +45,7 @@ CLIENT_ORIGINS = ("chat", "canvas", "launcher", "api")
 #: 不是有人在用。它们是完整的运行（证据、封存都在、点得开），但不进使用统计——探索问题聚类、工具白名单衰减、数据目录的
 #: 使用次数和「被哪些运行用过」、审阅队列的使用权重、以后的账本统计——否则一跑评测，治理信号和目录的使用热度就失真了。
 #: 记录页默认也不列（筛选里能选，列表照实写有几次没列出）。ledger_issue 是替用户正式出具，照常计入
-SYSTEM_ORIGINS = ("eval", "reconcile", "recall")
+SYSTEM_ORIGINS = ("eval", "reconcile", "recall", "caliber_trial")
 
 
 def counted_runs() -> Any:

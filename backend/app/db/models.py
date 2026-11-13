@@ -602,7 +602,7 @@ class Workflow(Base, TimestampMixin):
     origin: Mapped[dict[str, Any] | None] = mapped_column(default=None)
 
     versions: Mapped[list["WorkflowVersion"]] = relationship(
-        back_populates="workflow", cascade="all, delete-orphan", lazy="selectin"
+        back_populates="workflow", cascade="all, delete-orphan", lazy="select", passive_deletes=True
     )
 
 
@@ -649,8 +649,11 @@ class WorkflowVersion(Base, TimestampMixin):
 
 class Run(Base, TimestampMixin):
     __tablename__ = "runs"
-    # 找钉住版本最近一次封存的运行（应用的视图、口径对比）。存量库由 db/base.py 的 _INDEX_MIGRATIONS 补建
-    __table_args__ = (Index("ix_runs_wf_ver_status", "workflow_id", "version", "status"),)
+    # 找钉住版本最近一次封存的运行（应用的视图、口径对比）与列表游标翻页。存量库由 db/base.py 的 _INDEX_MIGRATIONS 补建
+    __table_args__ = (
+        Index("ix_runs_wf_ver_status", "workflow_id", "version", "status"),
+        Index("ix_runs_created_id", "created_at", "id"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     workflow_id: Mapped[str | None] = mapped_column(
@@ -765,7 +768,10 @@ class Artifact(Base, TimestampMixin):
     """
 
     __tablename__ = "artifacts"
-    __table_args__ = (Index("ix_artifacts_run", "run_id"),)
+    __table_args__ = (
+        Index("ix_artifacts_run", "run_id"),
+        Index("ix_artifacts_kind", "kind"),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     run_id: Mapped[str] = mapped_column(String(32), primary_key=True, default="")
@@ -806,6 +812,10 @@ class Document(Base, TimestampMixin):
     """知识库里的一份原始文档。"""
 
     __tablename__ = "documents"
+    __table_args__ = (
+        Index("ix_documents_col_created", "collection", "created_at", "id"),
+        Index("ix_documents_created_id", "created_at", "id"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     collection: Mapped[str] = mapped_column(String(100), default="default", index=True)
@@ -833,7 +843,7 @@ class Chunk(Base):
     __table_args__ = (Index("ix_chunks_collection", "collection"),)
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
-    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
     collection: Mapped[str] = mapped_column(String(100), default="default")
     ordinal: Mapped[int] = mapped_column(Integer, default=0)
     content: Mapped[str] = mapped_column(Text)
@@ -863,7 +873,10 @@ class ChunkTerm(Base):
     """
 
     __tablename__ = "chunk_terms"
-    __table_args__ = (Index("ix_chunk_terms_lookup", "collection", "term"),)
+    __table_args__ = (
+        Index("ix_chunk_terms_lookup", "collection", "term"),
+        Index("ix_chunk_terms_term", "term"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     chunk_id: Mapped[str] = mapped_column(
@@ -964,7 +977,7 @@ class ConversationTurn(Base, TimestampMixin):
     explanation: Mapped[str] = mapped_column(Text, default="")
     graph: Mapped[dict[str, Any] | None] = mapped_column(default=None)
     run_id: Mapped[str | None] = mapped_column(
-        ForeignKey("runs.id", ondelete="SET NULL"), default=None
+        ForeignKey("runs.id", ondelete="SET NULL"), default=None, index=True
     )
     # running | done | error
     status: Mapped[str] = mapped_column(String(20), default="running")
@@ -1089,6 +1102,323 @@ class WebhookDelivery(Base):
 
 
 # --------------------------------------------------------------------------
+# 口径账本（docs/design/next-round/02-口径账本.md 做法 8 的文档一侧）
+# --------------------------------------------------------------------------
+
+
+class CaliberDraftJob(Base, TimestampMixin):
+    """口径起草的持久化任务，和草稿业务状态分开。一次草稿同一时间只执行一个任务。"""
+
+    __tablename__ = "caliber_draft_jobs"
+
+    id: Mapped[str] = mapped_column(ForeignKey("caliber_drafts.id", ondelete="CASCADE"), primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    owner: Mapped[str | None] = mapped_column(String(120), default=current_owner)
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), default=None)
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), default=None)
+
+
+class CaliberDraft(Base, TimestampMixin):
+    """从业务文档起草的一份口径（app/ledger/draftplan.py 的产出）。
+
+    主路径一次到位：模型读文档和数据目录，产出定义 + 取数 SQL + 入口字段 + 指标表达式；服务端校验收成草稿图，建一个
+    status="draft" 的工作流和 v1，后台自动只读试跑。payload 的形状见接口契约（documents / metrics / entry_fields / sql /
+    workflow_id / version / trial / open_questions / alignment / dropped / truncated / model_id），这张草稿对应的工作流 id
+    记在 workflow_id 上。attach（app/ledger/docattach.py）保留为辅助入口：已经有跑对的答案时让它认这份定义。
+    """
+
+    __tablename__ = "caliber_drafts"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    collection: Mapped[str] = mapped_column(String(100), default="default")
+    # 起草时给模型看的数据源：表结构和数据目录是取数 SQL 的唯一依据；源删了草稿照旧在，只丢这一条线索
+    datasource_id: Mapped[str | None] = mapped_column(
+        ForeignKey("data_sources.id", ondelete="SET NULL"), default=None, index=True
+    )
+    # 同 docdraft.STATUSES：drafting | ready | questions_open | path_pending | attached | rejected | failed
+    status: Mapped[str] = mapped_column(String(20), default="drafting", index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    # 这份草稿从哪来：{"documents": [文档 id], "guidance": 用户补充要求}
+    origin: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    workflow_id: Mapped[str | None] = mapped_column(
+        ForeignKey("workflows.id", ondelete="SET NULL"), default=None, index=True
+    )
+    # 起草失败的说法（没有可用模型、模型回的东西取不出 JSON……）。草稿不置成 rejected：人改完还能再试
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_by: Mapped[str | None] = mapped_column(String(120), default=None)
+    model_id: Mapped[str | None] = mapped_column(String(120), default=None)
+
+
+class CaliberWriteRequest(Base, TimestampMixin):
+    """对一份已接管的口径资产的写入请求（K02 幂等）：按（主体 + 工作流 + 目标卡 + request_id）认这一次请求。
+
+    客户端重试（网络断了、页面重发）时带着同一个 request_id 再来：内容指纹一样就按上一次做完的结果交回，
+    不再新增版本；同键不同内容报冲突（409）。记在库里而不是内存里，是因为同一个请求可能在另一个进程、或者
+    服务重启之后才重试。request_id 由客户端给，不给就照旧按每次请求都写（老客户端的行为）。
+    """
+
+    __tablename__ = "caliber_write_requests"
+    __table_args__ = (UniqueConstraint("actor", "workflow_id", "card_id", "request_id"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    #: 发起这次写入的主体（开登录时是认证过的用户名，关登录时是自报署名，照实记）
+    actor: Mapped[str] = mapped_column(String(120), default="")
+    workflow_id: Mapped[str] = mapped_column(ForeignKey("workflows.id", ondelete="CASCADE"), index=True)
+    #: 这次请求针对的那张口径卡；只改标题这类不碰图的请求记空串（列非空，唯一键才认得住）
+    card_id: Mapped[str] = mapped_column(String(64), default="")
+    request_id: Mapped[str] = mapped_column(String(64))
+    #: 这次请求的内容指纹（标题、指标、消掉的问题、目标卡）：同键同指纹才算重放
+    payload_hash: Mapped[str] = mapped_column(String(64))
+    #: 上一次做完的结果：{"revision": 版本号}。重放按它核对，不按它去改图
+    result: Mapped[dict[str, Any]] = mapped_column(default=dict)
+
+
+class CaliberValidationRecord(Base, TimestampMixin):
+    """一次试跑留下的一条验证记录（K05，**只追加**）。
+
+    试跑成功、绑定对齐、业务确认和正式可用是四件不同的事：这张表只记「这次试跑在什么定义/绑定上、拿什么输入、
+    和什么独立期望比、结果是什么」。定义或绑定一变，旧记录还在（历史可追踪），但不再算覆盖新版本——覆盖与否
+    由 `app/ledger/validation.covers_current` 读的时候现算，不写在这里。
+
+    一行 = 一次试跑的一次终态。同一份草稿的不同试跑各有一行；晚结束的旧试跑即使不能替换当前 trial 指针，
+    也照旧追加自己这一行（`trial_id` + `status` 唯一，重复保存同一次终态只落一行）。
+    """
+
+    __tablename__ = "caliber_validation_records"
+    __table_args__ = (UniqueConstraint("draft_id", "trial_id", "status"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    draft_id: Mapped[str] = mapped_column(ForeignKey("caliber_drafts.id", ondelete="CASCADE"), index=True)
+    workflow_id: Mapped[str | None] = mapped_column(
+        ForeignKey("workflows.id", ondelete="SET NULL"), default=None, index=True
+    )
+    #: 这次试跑对着的图版本（Workflow.version；读的时候现算覆盖，不用它判是否有用）
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    #: 这次验证绑定的那张源头口径卡
+    card_id: Mapped[str] = mapped_column(String(64), default="")
+    #: 这次验证覆盖的指标（卡上的 metric_id，按卡的顺序）
+    metric_ids: Mapped[list[Any]] = mapped_column(default=list)
+    #: 定义依据：卡的定义指纹（data/caliber_identity.definition_hash）
+    definition_hash: Mapped[str] = mapped_column(String(64), default="")
+    #: 绑定依据：取数节点 id → 绑定指纹（app/ledger/bindings.fingerprint）
+    binding_fingerprints: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    #: 取数语义指纹：含 SQL、数据源和上游依赖（data/caliber_identity.semantic_hash），排除布局
+    semantic_hash: Mapped[str] = mapped_column(String(64), default="")
+    #: 这次跑的那张图的图指纹（工件的执行哈希；版本行被删了也能认出是哪张图）
+    execution_hash: Mapped[str] = mapped_column(String(64), default="")
+    #: 独立期望：{"source": …, "metrics": {metric_id: 值}, "note": …}；没有期望时为空
+    expectation: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+    expectation_hash: Mapped[str] = mapped_column(String(64), default="")
+    #: 期望来自哪里：human_confirmed / fixture / independent_computation
+    expectation_source: Mapped[str] = mapped_column(String(40), default="")
+    #: 点名的那套样例（可空）：固定 fixture 的编号和版本
+    sample_id: Mapped[str] = mapped_column(String(120), default="")
+    sample_version: Mapped[str] = mapped_column(String(40), default="")
+    #: 规范化之后的入口输入与它的哈希（和试跑记的 inputs_hash 同一份）
+    inputs: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    inputs_hash: Mapped[str] = mapped_column(String(64), default="")
+    #: 验证方法版本（app/ledger/validation.METHOD_VERSION）：比较口径本身的版本
+    method_version: Mapped[int] = mapped_column(Integer, default=1)
+    #: 实际结果：metric_id → {value, status, rendered, rows, masked, shape, findings}
+    actual: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    #: 状态：matched / mismatched / observed / unverified / failed
+    status: Mapped[str] = mapped_column(String(20), default="observed", index=True)
+    #: 逐条问题（给人看，也是机器判别的依据）
+    problems: Mapped[list[Any]] = mapped_column(default=list)
+    #: 这一次试跑的标识与运行引用
+    trial_id: Mapped[str] = mapped_column(String(64), default="")
+    run_id: Mapped[str] = mapped_column(String(64), default="")
+    #: 发起这次试跑的主体（开登录时是认证用户名）
+    actor: Mapped[str | None] = mapped_column(String(120), default=None)
+    #: 这一行是怎么来的：trial（保存试跑时追加）/ late（读的时候补记晚完成的试跑）
+    origin: Mapped[str] = mapped_column(String(20), default="trial")
+
+
+class CaliberReviewDecision(Base, TimestampMixin):
+    """对一条验证记录的审阅决定（K05，**只追加**）：确认或驳回，绑定认证主体、确认范围和所审记录的依据。
+
+    **审批人只能来自服务端身份**（接口不收 actor 字段）。**模型不能写审批人，也不能写批准状态**：这里没有
+    任何一条路径是从模型回复或请求体里取「谁批了」「批过了」的。
+
+    决定绑的是**所审记录的定义/绑定依据**（definition_hash / binding_fingerprints / semantic_hash 记在 basis 里），
+    不是「这张卡现在长什么样」：定义或绑定一改，旧决定保留但不再覆盖新版本（读的时候现算 covers_current）。
+    同一份记录可以被多次审阅（追加），显示用最新的一条；驳回也是追加一条，不改写旧的。
+    """
+
+    __tablename__ = "caliber_review_decisions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    draft_id: Mapped[str] = mapped_column(ForeignKey("caliber_drafts.id", ondelete="CASCADE"), index=True)
+    #: 审的是哪一条验证记录（caliber_validation_records.id）
+    record_id: Mapped[str] = mapped_column(
+        ForeignKey("caliber_validation_records.id", ondelete="CASCADE"), index=True
+    )
+    workflow_id: Mapped[str | None] = mapped_column(
+        ForeignKey("workflows.id", ondelete="SET NULL"), default=None, index=True
+    )
+    #: confirmed / rejected
+    decision: Mapped[str] = mapped_column(String(20), default="confirmed")
+    #: 认证主体（服务端身份，不从请求体取）
+    actor: Mapped[str | None] = mapped_column(String(120), default=None)
+    #: 这个主体是认证过的还是自报署名（关登录时）
+    verified: Mapped[bool] = mapped_column(default=False)
+    #: 确认范围：这份记录覆盖的指标（可以只确认其中一个子集）
+    scope: Mapped[list[Any]] = mapped_column(default=list)
+    #: 所审记录的依据版本：{version, definition_hash, binding_fingerprints, semantic_hash, method_version}
+    basis: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    note: Mapped[str | None] = mapped_column(Text, default=None)
+
+
+class WorkflowPublication(Base, TimestampMixin):
+    """一次发布留下的发布事件（K07，**只追加**）：这一版按什么依据发布过。
+
+    发布时按那一版不可变的图算出一份**确定**的清单，存成内容寻址工件（`manifest` 就是它的内容哈希、也就是工件 id），
+    再在这里追一行。清单固定图指纹、每张源头口径卡的定义/绑定/取数语义指纹、参数契约、当前的取数依赖、编译器与验证
+    方法版本，以及发布这一刻引用的验证记录与审阅决定。
+
+    **重发旧版产生新事件，旧事件和旧清单一个字不改**；`workflow_versions` 上那几列发布元数据（级别、发布人、发布时间、
+    目录/结构/能力版本）是**最新投影**，记的是最近一次发布的结果。发布指针 `Workflow.published_version` 是**推荐指针**，
+    问的是「默认调用读哪一版」，和最新一次发布事件一致；最高已发布版另算（`apps/versions.latest_published`，只用于升级
+    发现）。
+
+    **观察到的环境不进清单内容**（发布人、时间、目录/结构/能力版本、绑定工具当前在不在）：清单要能被重建，所以内容只由
+    原始输入（这一版不可变的图 + 引用的那两行记录）决定；这些观察记在 `observed` 上，单独标出来。加这一列之前发布的
+    版本没有这一行，读的时候按「老资产」处理（formal_legacy），不 backfill、不伪造历史。
+    """
+
+    __tablename__ = "workflow_publications"
+    __table_args__ = (Index("ix_workflow_publications_workflow_version", "workflow_id", "version"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    workflow_id: Mapped[str] = mapped_column(ForeignKey("workflows.id", ondelete="CASCADE"))
+    #: 发布的是哪一版（workflow_versions.version）
+    version: Mapped[int] = mapped_column(Integer)
+    #: 这一版按哪一档发布的：published | governed
+    level: Mapped[str] = mapped_column(String(20), default="published")
+    #: 这一版图的指纹（和 WorkflowVersion.graph_hash 同一份）：清单读出来和版本行对不上时认这个
+    graph_hash: Mapped[str] = mapped_column(String(64), default="")
+    #: 清单工件 id（内容寻址，= 清单内容的哈希，也是格式里的 agentlab.publication/1）
+    manifest: Mapped[str] = mapped_column(String(64), default="", index=True)
+    format: Mapped[str] = mapped_column(String(40), default="")
+    #: 这一版每张源头口径卡的依据摘要（和清单内容里的那一份逐字相同）：不读工件也能看「依据齐不齐」
+    cards: Mapped[list[Any]] = mapped_column(default=list)
+    #: 发布这一刻依据是否完整（每张卡都有 matched 且认证确认覆盖全部指标的记录）：之后补的验证/审阅不会回头改这一行
+    proven: Mapped[bool] = mapped_column(default=False)
+    #: 发布这一刻这份资产要不要证明（publish 按当时的接管状态判，记下来）：**判定按这一行或当前接管状态，两者取或**——
+    #: 发布时要求过证明的，后来把接管标记去掉（清 tags 之类）也不能把这一版降级成「不需要证明」。加这一列之前的事件行
+    #: 回填 0，判定照旧看当前的接管状态（不 backfill 猜历史，也不会因为补了个 0 就放松）
+    required: Mapped[bool] = mapped_column(default=False)
+    #: 观察到的环境（无法从原始输入重建的那些，不进清单内容的哈希）
+    observed: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    #: 发布人（服务端记，不从请求体取；关登录时是自报署名）
+    actor: Mapped[str | None] = mapped_column(String(120), default=None)
+
+
+# --------------------------------------------------------------------------
+# 增量重导入与 B/L/R 三方合并（K11）
+# --------------------------------------------------------------------------
+
+
+class CaliberImportRun(Base, TimestampMixin):
+    """一次增量重导入（K11）：把新一段材料重新抽成候选 R，和当前图 L、字段基线 B 逐字段比对。
+
+    **R 的来源是可还原的。** 这次抽取读到的原文按内容寻址存成不可变工件（`source_snapshot` 记引用，同 K05 的来源快照），
+    `visible_chunk_ids` 记**实际进了这次提示**的段落，解析/模型/提示各留版本。工件之外还记这份引用，历史结果才知道是按
+    哪一版抽的、当时能看到哪些段落。
+
+    **任务进度不是字段基线 B。** `checkpoint` 只记「哪些工作项还没做完、哪些字段已经被接受」，重启后据此显式恢复未完成
+    的工作项；B 在草稿 payload 的 field_baseline 上，只随「接受字段」推进（见 app/ledger/reimport.py、fieldbaseline.py）。
+
+    这张表同时是后台任务的载体（core/job_runtime 的生命周期，同 CaliberDraftJob）：`status` 用它那一套词，`owner` 是认领
+    这一行的进程，重启时属主不在了的记 interrupted、不自动续跑（界面点「恢复」接着做）。
+    """
+
+    __tablename__ = "caliber_import_runs"
+    #: 同一份草稿 + 同一个客户端 request_id 只建一次（request_id 为 NULL 的不参与去重：SQLite / PostgreSQL 的唯一索引都不把
+    #: 多个 NULL 当成重复）。两路真并发同时建时靠这条收敛，接口按完整性错误重查一次交回赢的那一次。
+    __table_args__ = (UniqueConstraint("draft_id", "request_id"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    draft_id: Mapped[str] = mapped_column(
+        ForeignKey("caliber_drafts.id", ondelete="CASCADE"), index=True
+    )
+    #: L 所在的工作流（草稿接管到工作流上之后才有）；工作流删了这次导入照旧在，只丢这条线索
+    workflow_id: Mapped[str | None] = mapped_column(
+        ForeignKey("workflows.id", ondelete="SET NULL"), default=None, index=True
+    )
+    #: queued | running | ready | partial | failed | cancelled | interrupted（core/job_runtime 的状态词）
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    #: R 的来源快照引用（不可变工件）：{artifact_id, kind, version, content_hash, documents, chunk_ids}
+    source_snapshot: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    #: 实际进了这次提示的段落（被截断丢掉的段落不在里面：引用它核不上，也不许当引用）
+    visible_chunk_ids: Mapped[list[Any]] = mapped_column(default=list)
+    #: 这次抽取用的提示词 / 解析 / 模型版本
+    prompt_version: Mapped[int] = mapped_column(Integer, default=0)
+    parse_version: Mapped[int] = mapped_column(Integer, default=0)
+    model_id: Mapped[str | None] = mapped_column(String(120), default=None)
+    #: 客户端给的幂等键：同一份草稿 + 同一个 request_id 只建一次 run（空的不参与去重）
+    request_id: Mapped[str | None] = mapped_column(String(64), default=None)
+    #: 这次导入是服务端从认证主体上取的（不从请求体取）；关登录时是自报署名
+    actor: Mapped[str | None] = mapped_column(String(120), default=None)
+    #: 任务恢复用：{accepted: [...], done: [...], material_hash: …}。**不是字段基线 B**
+    checkpoint: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    #: 认领这一行的进程（core/job_runtime 的多进程接手靠它）
+    owner: Mapped[str | None] = mapped_column(String(120), default=current_owner)
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), default=None)
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), default=None)
+    #: 读列表用的计数投影（每次都从工作项现算，这里只是缓存一份方便排序显示）
+    items_total: Mapped[int] = mapped_column(Integer, default=0)
+    items_decided: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class CaliberImportItem(Base, TimestampMixin):
+    """这次导入里的一个工作项：一条候选指标 R，逐字段记三方（B 基线 / L 当前 / R 候选）和它现在的处置。
+
+    **逐项状态可恢复。** 每一项自己带状态和对齐依据；抽取被中断之后，已经做完的项原样留着，恢复只处理还没做完的
+    （见 reimport.resume）。`fields` 是逐字段的 {b, l, r, state, ...}：state 是 no-conflict 更新 / 人工冲突 / 新增候选 /
+    缺失候选 / 不变 / 需要人工对齐（baseline_unknown）之一——机器按它判能不能接受，界面按它显示。
+
+    对齐只认稳定的 metric_id 和来源证据（引用指向哪几段），**不按名称相似度自动合并**：名字像不等于同一条指标，
+    同名不同范围要人来定（见 reimport.align）。
+    """
+
+    __tablename__ = "caliber_import_items"
+    __table_args__ = (UniqueConstraint("run_id", "seq"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("caliber_import_runs.id", ondelete="CASCADE"), index=True
+    )
+    #: 这次候选里的序号（抽取确定，恢复时按它认得同一个工作项）
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    #: 持久对齐键：稳定 metric 身份 + 规范化来源证据（段落 id）。**恢复时按它认同一个工作项**，
+    #: 不按候选位置 seq 搬接受 / 拒绝的决定——顺序变了、条数变了都不会串项。
+    align_key: Mapped[str] = mapped_column(String(64), default="", index=True)
+    #: 对齐到的 L 指标 id（稳定身份，写回 L 时认它）；没对齐上时是空串
+    metric_id: Mapped[str] = mapped_column(String(64), default="")
+    #: 候选 R 自己的 id（不一定稳定，只作识别）
+    candidate_id: Mapped[str] = mapped_column(String(64), default="")
+    name: Mapped[str] = mapped_column(String(200), default="")
+    #: pending | update | conflict | new | manual | unchanged | partial | accepted | rejected | failed
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    #: 对齐依据：{"mode": metric_id|evidence|new|manual, "reason": …, "evidence": […], "live_evidence": […]}
+    align: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    #: 逐字段三方：{path: {"b": …, "l": …, "r": …, "state": …, "r_hash": …, "decided": accepted|rejected|null}}
+    fields: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    #: 已经接受的字段路径（写进 L 并推进 B 的那几格）
+    accepted: Mapped[list[Any]] = mapped_column(default=list)
+    #: 已经拒绝的字段路径（保持 L 不动的那几格）
+    rejected: Mapped[list[Any]] = mapped_column(default=list)
+    #: 上次接受时落到哪一版图（工作流的 version）
+    applied_revision: Mapped[int | None] = mapped_column(Integer, default=None)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+
+
+# --------------------------------------------------------------------------
 # 应用平台（docs/design/app-platform-and-look.md §3.1）：按领域分文件，这里统一导入，
 # 让 init_db 的 create_all 和其他模块 `from app.db.models import ...` 都认得到
 # --------------------------------------------------------------------------
@@ -1112,3 +1442,9 @@ from app.db import models_triggers  # noqa: E402,F401
 # 编排完善第 2 波 W2-b（docs/design/orchestration-round/00-总方案.md §5）：多进程协调——工作进程的登记和租约、调度当班、
 # 跨进程的请求、运行的并发名额、同源队、按时间窗的计数
 from app.db import models_cluster  # noqa: E402,F401
+# 指标本体穿透（W1-a）：标准业务实体与跨源映射
+from app.db import models_ontology  # noqa: E402,F401
+from app.db.models_ontology import CanonicalEntity  # noqa: E402,F401
+# 独立语义指标库（即存即用指标卡片）与文档拆解后台任务：与受管工作流口径并存
+from app.db import models_metrics  # noqa: E402,F401
+from app.db.models_metrics import SemanticDecomposeJob, SemanticMetric  # noqa: E402,F401

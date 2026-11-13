@@ -2,16 +2,21 @@
 
 以前三处各有各的判断：发起只认当前发布版（launch.py:92，F1），口径升版取 max(version) 把草稿也算进去（F3）。
 工作流每保存一次就生成一个版本快照，没发布过的快照只是草稿：level 为空、也不是当前发布版。
+
+K02 起，改图的几处（画布保存、口径草稿、回滚、发布单的保存版本）都走 append_version / save_graph 这一条路：
+条件更新抢版本（CAS）+ 可选的客户端基准版本（expected_revision），旧写抛 StaleRevision；对已经接管的资产
+（文档起草建出来的口径卡）缺基准版本就拒。写入幂等（同一主体 + 工作流 + 目标的 request_id 只落一次）也在这里。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
-from app.db.models import Workflow, WorkflowVersion
+from app.db.models import CaliberWriteRequest, Workflow, WorkflowVersion
 from app.db.models_apps import App, AppVersion
 from app.db.models_process import ActionRecord
 
@@ -19,6 +24,149 @@ from app.db.models_process import ActionRecord
 RETIRE_CURRENT = "version_retire_current"
 RETIRE_UNPUBLISHED = "version_retire_unpublished"
 RETIRE_ALREADY = "version_retire_already"
+
+#: 写入保护的机器码（K02）：客户端拿着的基准版本已经过期；已接管的资产必须给基准版本（老页面照旧写会绕过并发保护）
+STALE_REVISION = "stale_revision"
+REVISION_REQUIRED = "revision_required"
+#: 幂等键的机器码：同一个 request_id 配了不同的内容
+IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+
+
+class WorkflowChanged(ValueError):
+    """保存期间另一处已经提交了新版本，需要重新读取后再编辑。"""
+
+
+class StaleRevision(WorkflowChanged):
+    """写入的基准版本对不上：客户端拿的那一版已经过期，或者另一处已经先提交了新版本。
+
+    current 是库里现在的版本号（409 的 current_version）。是 WorkflowChanged 的一种，原来按它兜底的调用方照旧兜得住。
+    """
+
+    def __init__(self, message: str, current: int) -> None:
+        super().__init__(message)
+        self.current = current
+
+
+def stale_revision_message(current: int, expected: int | None = None) -> str:
+    """基准版本过期时给用户的一句话：发生了什么、现在是什么版本、怎么办。
+
+    客户端照旧保留自己的编辑（画布上是冲突横幅给两条路，草稿页上是提示后再点一次），所以这里不要求「刷新」，
+    只说清「没替你重发、确认后再提交」。"""
+    if expected is None:
+        return f"工作流已经有新的修改（现在是 v{current}）：你这次没有写进去，也没有替你重发，请确认后再提交"
+    return (f"这份内容基于 v{expected}，现在已经是 v{current}：有人先改过。你刚才的修改还留着，"
+            "没有替你重发，确认后可以基于最新的一版再提交一次")
+
+
+async def append_version(session: AsyncSession, workflow: Workflow, graph: dict[str, Any], *,
+                         note: str = "", expected_revision: int | None = None, digest: str | None = None,
+                         status: str = "draft") -> int:
+    """在当前工作流上换一份新图并新增一版（回滚旧版、发布单按蓝图重建都走这里）：和保存同一条 CAS 规矩。
+
+    expected_revision 是客户端拿着的基准版本（Workflow.version）；给了就先核对，对不上抛 StaleRevision。写的时候按
+    读到的版本做条件更新，另一处在这中间提交了新版本（CAS 打不中）也是 StaleRevision，带着库里现在的版本号。
+    只新增快照、不动任何旧版本；由调用方提交事务。返回新的版本号。
+    """
+    from app.core.artifact_store import graph_hash
+
+    previous = workflow.version
+    if expected_revision is not None and expected_revision != previous:
+        raise StaleRevision(stale_revision_message(previous, expected_revision), previous)
+    result = await session.execute(update(Workflow).where(
+        Workflow.id == workflow.id, Workflow.version == previous,
+    ).values(graph=graph, version=previous + 1, status=status).execution_options(synchronize_session=False))
+    if result.rowcount != 1:
+        fresh = await session.scalar(select(Workflow.version).where(Workflow.id == workflow.id))
+        raise StaleRevision(stale_revision_message(int(fresh or previous)), int(fresh or previous + 1))
+    for key, value in (("graph", graph), ("version", previous + 1), ("status", status)):
+        set_committed_value(workflow, key, value)
+    session.add(WorkflowVersion(workflow_id=workflow.id, version=previous + 1, graph=graph,
+                                graph_hash=digest or graph_hash(graph), note=note or ""))
+    return previous + 1
+
+
+async def save_graph(session: AsyncSession, workflow: Workflow, graph: dict[str, Any], *,
+                     note: str | None = None, expected_revision: int | None = None) -> bool:
+    """画布与口径草稿共用的保存：只新增快照，不改任何旧版本；由调用方提交事务。
+
+    expected_revision 是客户端读到的 Workflow.version（乐观锁）：不给就只靠 CAS 挡住并发写，给了就先把「是不是
+    基于最新一版改的」也一起核对——两个页面先后保存旧数组时，后一个被拒，而不是盖掉前一个。
+    """
+    if graph == workflow.graph:
+        if expected_revision is not None and expected_revision != workflow.version:
+            raise StaleRevision(stale_revision_message(workflow.version, expected_revision), workflow.version)
+        return False
+    await append_version(session, workflow, graph, note=note or "", expected_revision=expected_revision)
+    return True
+
+
+# --------------------------------------------------------------------------
+# 写入幂等（K02）：同一主体在同一份资产上的同一个 request_id 只落一次
+# --------------------------------------------------------------------------
+
+#: claim_write 的三种判定
+WRITE_NEW = "new"
+WRITE_REPLAY = "replay"
+WRITE_CONFLICT = "conflict"
+
+
+@dataclass(frozen=True)
+class WriteClaim:
+    """一次写入请求的幂等判定。new：第一次见；replay：同键同内容，按上一次做完的结果交回；conflict：同键不同内容。"""
+
+    state: str
+    revision: int | None = None
+
+
+def write_fingerprint(payload: Any) -> str:
+    """这次请求的内容指纹：只算要落下去的那几项（标题、指标、消掉的问题、目标卡），不算基准版本——
+    同一个 request_id 带着已经过期的基准版本重放，认得出是同一次请求，不报内容冲突。"""
+    from app.core.artifact_store import canonical_json, content_hash
+
+    return content_hash(canonical_json(payload))
+
+
+def _write_key(*, actor: str | None, workflow_id: str, target: str | None, request_id: str) -> Any:
+    return select(CaliberWriteRequest).where(
+        CaliberWriteRequest.actor == (actor or ""), CaliberWriteRequest.workflow_id == workflow_id,
+        CaliberWriteRequest.card_id == (target or ""), CaliberWriteRequest.request_id == request_id)
+
+
+async def claim_write(session: AsyncSession, *, actor: str | None, workflow_id: str, target: str | None,
+                      request_id: str | None, payload_hash: str) -> WriteClaim:
+    """查这一次写入请求是不是已经做过：没给 request_id 就按每次都写（老客户端）。
+
+    顺序重试用得上：上一次已经提交、这次再发的同键同内容请求在这里认出来，直接交回上一次的结果，不再写一遍。
+    幂等判定在版本检查之前：重放即使基准版本已经过期也要成功。
+
+    并发下的收敛不靠这里（两次同时查都可能看到「还没有」）：一条路是 CAS 只有一个能写出新版本，另一条路是
+    记请求时撞 (actor, workflow_id, card_id, request_id) 唯一键，调用方按 IntegrityError 再查一次，落到重放。
+    """
+    if not request_id:
+        return WriteClaim(WRITE_NEW)
+    row = (await session.execute(_write_key(actor=actor, workflow_id=workflow_id, target=target,
+                                            request_id=request_id))).scalar_one_or_none()
+    if row is None:
+        return WriteClaim(WRITE_NEW)
+    if row.payload_hash != payload_hash:
+        return WriteClaim(WRITE_CONFLICT)
+    revision = (row.result or {}).get("revision") if isinstance(row.result, dict) else None
+    return WriteClaim(WRITE_REPLAY, revision if isinstance(revision, int) else None)
+
+
+async def remember_write(session: AsyncSession, *, actor: str | None, workflow_id: str, target: str | None,
+                         request_id: str | None, payload_hash: str, revision: int | None) -> None:
+    """记下这一次写入请求（和这次改图同一个事务提交）：同键不同内容的下一次来就认得出是冲突。
+
+    顺序重试不用走这里（claim_write 已经按上一次的结果交回了）；两路真并发时两边都可能没查到记录，最后靠
+    (actor, workflow_id, card_id, request_id) 唯一键收敛——后到的那一路在这一步撞完整性错误，调用方回滚后
+    重查记录：赢的那一路写的图还在，按它的结果当重放交回。
+    """
+    if not request_id:
+        return
+    session.add(CaliberWriteRequest(actor=actor or "", workflow_id=workflow_id, card_id=target or "",
+                                    request_id=request_id, payload_hash=payload_hash,
+                                    result={"revision": revision}))
 
 
 class RetireRefused(Exception):
@@ -29,6 +177,23 @@ class RetireRefused(Exception):
         self.status_code = status_code
         self.message = message
         self.code = code
+
+
+def taken_over(workflow: Any) -> bool:
+    """这份资产是不是已经接管到工作流上了（K02）：文档起草建出来的口径卡，以及从草稿接上一次运行建出来的
+    （docattach）。
+
+    两类都是「口径草稿的产物」，图上只有口径卡和取数，改它要走和草稿页同一条并发规矩。新的起草产物在 origin
+    里写 kind=doc_draft；docattach 的产物（含以前建的）没有写 kind，只能按它建时打的标签认——两处都打了
+    tags=["doc_draft"]（app/ledger/authoring.py、app/ledger/docattach.py），别的创建路径（手建、蓝图
+    blueprint、从运行提取 extracted、固化 certified）都没有这个标签，不会误伤。
+
+    对它的图写入必须带基准版本（expected_revision）：老页面、老客户端照旧无条件写会绕过并发保护，这里拒绝。
+    """
+    origin = getattr(workflow, "origin", None)
+    if isinstance(origin, dict) and origin.get("kind") == "doc_draft":
+        return True
+    return "doc_draft" in (getattr(workflow, "tags", None) or ())
 
 
 def is_published(version: Any, *, current: int | None = None) -> bool:
@@ -64,7 +229,12 @@ async def published_versions(session: AsyncSession, workflow_id: str) -> list[An
 
 
 async def latest_published(session: AsyncSession, workflow_id: str) -> Any | None:
-    """最新的「已发布且未退役」的版本；没有就是 None。口径升版的判定用它（替换 governance.py 的 func.max）。"""
+    """**最高**的「已发布且未退役」的版本；没有就是 None。
+
+    **只用于升级发现**（K07）：告诉人「有一版更新的」、口径升版的处置判定（engine/governance）都按它比。默认调用
+    （目录、look、账本挑候选、正式运行的默认版本）读的是**推荐版**——Workflow.published_version 指的那一版，见
+    app/apps/publications.recommended / resolve。重发一版旧版之后，推荐版是那个旧版，这里仍然是最高版。
+    """
     current = await _current(session, workflow_id)
     return (await session.execute(
         select(WorkflowVersion).where(WorkflowVersion.workflow_id == workflow_id, _published_clause(current))
@@ -228,9 +398,12 @@ async def formal_run_count(session: AsyncSession, workflow_id: str, version: int
 
 async def usage(session: AsyncSession, workflow_id: str, version: int) -> dict[str, Any]:
     """{apps, effects, formal_runs}：版本详情、账本接口、退役确认给的同一份。"""
+    from app.apps.impact import dependents
+
     return {"apps": await pinning_apps(session, workflow_id, version),
             "effects": await effect_count(session, workflow_id, version),
-            "formal_runs": await formal_run_count(session, workflow_id, version)}
+            "formal_runs": await formal_run_count(session, workflow_id, version),
+            **await dependents(session, workflow_id, version)}
 
 
 # --------------------------------------------------------------------------
@@ -260,15 +433,18 @@ async def retire_version(session: AsyncSession, workflow_id: str, version: int, 
                             RETIRE_CURRENT)
     if not is_published(row, current=workflow.published_version):
         raise RetireRefused(409, f"v{version} 没有发布过，不需要退役", RETIRE_UNPUBLISHED)
+    from app.apps.impact import dependents
+
     affected = await pinning_apps(session, workflow_id, version)
+    impact = await dependents(session, workflow_id, version)
     row.retired_at = utcnow()
     row.retired_by = actor
     row.retire_note = (note or "").strip() or None
     await record(session, action="workflow_version.retire", subject_kind="workflow_version",
                  subject_id=f"{workflow_id}:{version}", actor=actor,
                  data={"workflow_id": workflow_id, "workflow_name": workflow.name, "version": version,
-                       "note": row.retire_note, "affected_apps": affected})
+                       "note": row.retire_note, "affected_apps": affected, "impact": impact})
     await session.commit()
     return {"retired": {"workflow_id": workflow_id, "version": version, "retired_at": row.retired_at,
                         "retired_by": actor, "retire_note": row.retire_note},
-            "affected_apps": affected}
+            "affected_apps": affected, "impact": impact}

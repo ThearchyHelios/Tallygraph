@@ -77,3 +77,28 @@ def test_a_job_without_a_lane_skips_the_queue():
 
     run = _NoLane("whatever")
     assert run.lane_of(object()) is None
+
+
+def test_starting_an_active_job_twice_does_not_orphan_the_first_task():
+    async def go():
+        calls = []
+        finish = asyncio.Event()
+
+        class Job:
+            def __init__(self, job_id):
+                self.job_id, self.task = job_id, None
+
+            async def run(self):
+                calls.append(self.job_id)
+                await finish.wait()
+
+        manager = job_runtime.JobManager(Job, label="幂等启动测试", name="test_start_once")
+        manager.start("one")
+        manager.start("one")
+        await asyncio.sleep(0)
+        assert calls == ["one"] and manager.running("one")
+        finish.set()
+        await manager.wait("one")
+        assert not manager.running("one")
+
+    asyncio.run(go())

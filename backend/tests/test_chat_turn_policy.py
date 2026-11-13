@@ -45,6 +45,12 @@ def test_next_step_branches():
     assert turn.next_step(_final(issues=[ERROR])) == "fail", "自查过还有 error：判失败，不再整轮重来"
     assert turn.next_step(_final(issues=[ERROR]), self_checked=False) == "retry", "老服务端没自查：重来一次"
     assert turn.next_step(_final(issues=[ERROR], autorun=False)) == "fail", "没过检查比只建不跑优先"
+    # 这一轮的运行已经在生成里跑完了（固定执行的 final 带 execution.run_id）：运行已经发生，不能再按 ready / run 解释一遍
+    done = _final(autorun=False, execution={"via": "querycore", "run_id": "run-1", "status": "succeeded"})
+    assert turn.next_step(done) == "done"
+    assert turn.next_step(done, self_checked=False) == "done"
+    assert turn.next_step(_final(execution={"via": "querycore"})) == "run", "没有运行 id：不算已经跑过"
+    assert turn.next_step(_final(execution={"run_id": None})) == "run"
     assert turn.next_step({"op": "reply", "text": "已经查过了"}) == "reply"
     assert turn.next_step({"op": "error", "message": "x"}) == "fail"
     empty = {"op": "error", "message": "助手本轮未完成：模型没有给出任何修改，也没有说明原因",
@@ -53,7 +59,7 @@ def test_next_step_branches():
     assert turn.error_reason(empty) == "模型没有给出任何修改，也没有说明原因"
     assert turn.error_reason({"op": "error", "message": "助手本轮未完成：接入返回了 502"}) == "接入返回了 502"
     assert turn.next_step(None) == "asked", "流结束时只有反问"
-    assert set(turn.NEXT_STEPS) == {"run", "ready", "fail"}
+    assert set(turn.NEXT_STEPS) == {"run", "ready", "done", "fail"}
 
 
 # --------------------------------------------------------------------------

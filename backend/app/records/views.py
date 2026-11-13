@@ -22,6 +22,7 @@ import copy
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,8 +36,10 @@ logger = logging.getLogger(__name__)
 #: {"version", "seq": None, "missing": True}——汇总里没有它，印章（apps/resolve.stamp_of）、查询快照照实说
 MISSING = "missing"
 PIN_KEYS = ("name", "origin", "table", "version", "seq", "older", "rows", "viewer")
-#: 旧版本挂在查询连接上的库名：records_v<版本>
+#: 旧版本挂在查询连接上的库名：records_v<版本>；超过 SQLite 10 库挂接上限时，早期版本汇总进单库多表 records_archive
 ATTACH_PREFIX = "records_v"
+ARCHIVE_SCHEMA = "records_archive"
+MAX_DIRECT_ATTACH = 8
 
 
 @dataclass
@@ -89,27 +92,70 @@ class Older:
     path: str
     columns: list[store.Column]
     high_water: int | None
+    schema_name: str | None = None
+    table_name: str = store.TABLE
 
     @property
     def schema(self) -> str:
-        return f"{ATTACH_PREFIX}{int(self.version)}"
+        return self.schema_name or f"{ATTACH_PREFIX}{int(self.version)}"
+
+
+def _infer_table_key(older: tuple[Older, ...] | list[Older]) -> str | None:
+    for item in older:
+        stem = Path(item.path).name
+        if stem.endswith(".db") and ".v" in stem[:-3]:
+            key, _, ver = stem[:-3].rpartition(".v")
+            if key and ver.isdigit():
+                return key
+    return None
+
+
+def _materialize_older(older: tuple[Older, ...] | list[Older], *, table_key: str | None = None) -> tuple[Older, ...]:
+    items = tuple(older)
+    if len(items) <= MAX_DIRECT_ATTACH or any(o.schema_name is not None for o in items):
+        return items
+    key = table_key or _infer_table_key(items)
+    if not key:
+        return items
+    direct = items[:MAX_DIRECT_ATTACH - 1]
+    overflow = items[MAX_DIRECT_ATTACH - 1:]
+    present = [o for o in overflow if Path(o.path).is_file()]
+    if not present:
+        return items
+    arch = store.sync_archive(
+        key,
+        [store.ArchiveSpec(version=o.version, path=o.path, columns=o.columns) for o in present],
+    )
+    arch_str = str(arch)
+    present_versions = {o.version for o in present}
+    mapped = tuple(
+        Older(o.version, arch_str, o.columns, o.high_water, schema_name=ARCHIVE_SCHEMA,
+              table_name=store.archive_table_name(o.version))
+        if o.version in present_versions else o
+        for o in overflow
+    )
+    return (*direct, *mapped)
 
 
 def bind_view(source: Any, columns: list[store.Column], *, high_water: int | None, rows: str = "all",
               viewer: str | None = None, older: list[Older] | tuple[Older, ...] = (),
-              missing: list[int] | tuple[int, ...] = ()) -> RecordsView:
+              missing: list[int] | tuple[int, ...] = (), table_key: str | None = None) -> RecordsView:
     """数据源行 + 高水位 + 行级过滤（+ 并进来的旧版本；missing 是数据文件不在了、并不进来的旧版本号）→ RecordsView。"""
     rows = rows if rows in ("all", "mine", "none") else "none"
-    older = tuple(older)
+    older = _materialize_older(older, table_key=table_key)
+    attach_map: dict[str, str] = {}
+    for o in older:
+        attach_map.setdefault(o.schema, o.path)
     return RecordsView(
         id=source.id, name=source.name, database=source.database, options=dict(source.options or {}),
         description=source.description or "", schema_cache=copy.deepcopy(source.schema_cache or {}),
         schema_synced_at=getattr(source, "schema_synced_at", None), enabled=bool(source.enabled),
         last_check=getattr(source, "last_check", None), high_water=high_water, rows=rows, viewer=viewer,
         prelude=store.view_prelude(columns, high_water=high_water, scope=rows, viewer=viewer,
-                                   older=[store.OlderVersion(o.schema, o.columns, o.high_water) for o in older]),
-        attach=tuple((o.schema, o.path) for o in older),
-        forbid_schemas=("main", *(o.schema for o in older)),
+                                   older=[store.OlderVersion(o.schema, o.columns, o.high_water, o.table_name)
+                                          for o in older]),
+        attach=tuple(attach_map.items()),
+        forbid_schemas=("main", *attach_map.keys()),
         older=(*({"version": o.version, "seq": o.high_water} for o in older),
                *({"version": int(v), "seq": None, MISSING: True} for v in missing)))
 
@@ -145,6 +191,7 @@ async def resolve(session: AsyncSession, source: Any, entry: Any = None) -> Reco
     from app.records.tables import columns_of, path_of, table_of_source
 
     table = await table_of_source(session, source.id)
+    table_key = table.table_key if table is not None else None
     columns = columns_of(table) if table is not None else columns_of_source(source)
     older_rows = await _older_versions(session, table)
     if isinstance(entry, dict):
@@ -156,16 +203,21 @@ async def resolve(session: AsyncSession, source: Any, entry: Any = None) -> Reco
         older = [Older(row.version, str(path_of(row)), columns_of(row),
                        int(pinned[row.version]) if isinstance(pinned[row.version], int) else 0)
                  for row in older_rows if row.version in pinned]
+        if len(older) > MAX_DIRECT_ATTACH:
+            older = list(await asyncio.to_thread(_materialize_older, older, table_key=table_key))
         return bind_view(source, columns, high_water=int(seq) if isinstance(seq, int) else 0,
                          rows=str(entry.get("rows") or "none"), viewer=entry.get("viewer"), older=older,
-                         missing=missing)
+                         missing=missing, table_key=table_key)
     older = [Older(row.version, str(path_of(row)), columns_of(row), None) for row in older_rows
              if path_of(row).is_file()]
+    if len(older) > MAX_DIRECT_ATTACH:
+        older = list(await asyncio.to_thread(_materialize_older, older, table_key=table_key))
     missing = [row.version for row in older_rows if not path_of(row).is_file()]
     if missing:
         logger.warning("记录表 %s 第 %s 版的数据文件不在了，跨版本汇总里不含这几版", table.table_key,
                        "、".join(str(v) for v in missing))
-    return bind_view(source, columns, high_water=None, rows="all", older=older, missing=missing)
+    return bind_view(source, columns, high_water=None, rows="all", older=older, missing=missing,
+                     table_key=table_key)
 
 
 def default_view(source: Any) -> RecordsView:
@@ -225,6 +277,22 @@ def cache_token(entry: Any) -> Any:
         return None
     older = [[o.get("version"), o.get("seq")] for o in entry.get("older") or [] if isinstance(o, dict)]
     return [entry.get("seq"), older] if older else entry.get("seq")
+
+
+def inherit_scope(versions: dict[str, Any] | None) -> None:
+    """派生的子运行**继承**父 Run 已授权的 data_versions 时，记录表的行级范围原样带着，不重算（K10）。
+
+    重算是错的：子运行按 exploratory 重算，一个正式父 Run 的 all 会被收成 mine/none——父已授权、子看得更少，
+    同一次口径查询算出来的数就和父 Run 自己的不一样了；父 Run 发起之后管理员改了授权，同一次运行的前后两段
+    也会看到不同的行。范围在父 Run 发起时定下（records.access.scope_of_run），子运行既不放大也不缩小。
+    缺 rows 的项（升级前发起的运行、手工拼的）按最窄的 none 算，绝不当成 all。"""
+    from app.records.access import SCOPES
+
+    for entry in (versions or {}).values():
+        if not isinstance(entry, dict) or entry.get("origin") != RECORDS_ORIGIN:
+            continue
+        if entry.get("rows") not in SCOPES:
+            entry["rows"] = "none"
 
 
 def is_records(source: Any) -> bool:

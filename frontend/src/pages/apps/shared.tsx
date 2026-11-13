@@ -37,36 +37,58 @@ export function useLoad<T>(load: (signal: AbortSignal) => Promise<T>, deps: unkn
   const seq = useRef(0)
   const loadRef = useRef(load)
   loadRef.current = load
-  const run = useCallback((keep: boolean) => {
+  const pending = useRef<{ controller: AbortController; promise: Promise<void> } | null>(null)
+  const run = useCallback((keep: boolean): Promise<void> => {
+    // 明确刷新可能发生在保存之后，必须重新读取；旧请求即使忽略 abort，也不能覆盖新状态。
+    pending.current?.controller.abort()
     const me = ++seq.current
-    const ctrl = new AbortController()
+    const controller = new AbortController()
     setState((s) => (keep ? { ...s, loading: true } : { loading: true }))
-    loadRef.current(ctrl.signal).then(
+    const promise = Promise.resolve().then(() => loadRef.current(controller.signal)).then(
       (data) => { if (me === seq.current) setState({ data, loading: false }) },
       (error) => {
         if (me !== seq.current || error?.name === 'AbortError') return
         setState((s) => ({ data: keep ? s.data : undefined, error, loading: false }))
       },
-    )
-    return () => ctrl.abort()
+    ).finally(() => { if (me === seq.current) pending.current = null })
+    pending.current = { controller, promise }
+    return promise
   }, [])
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => run(false), deps)
-  const reload = useCallback(() => { run(true) }, [run])
+  useEffect(() => {
+    void run(false)
+    return () => {
+      seq.current++
+      pending.current?.controller.abort()
+      pending.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps)
+  const reload = useCallback(() => run(true), [run])
   useOnReconnect(reload)
   return { ...state, reload }
 }
 
 /** 每 ms 毫秒调一次 fn，只在 active 时、页面可见时；回到前台立刻补一次 */
-export function usePoll(fn: () => void, ms: number, active: boolean) {
+export function usePoll(fn: () => void | Promise<unknown>, ms: number, active: boolean) {
   const ref = useRef(fn)
+  const busy = useRef(false)
   ref.current = fn
   useEffect(() => {
     if (!active) return
-    const tick = () => { if (!document.hidden) ref.current() }
-    const t = setInterval(tick, ms)
-    document.addEventListener('visibilitychange', tick)
-    return () => { clearInterval(t); document.removeEventListener('visibilitychange', tick) }
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout>
+    const schedule = () => { if (!stopped) timer = setTimeout(() => { void tick() }, ms) }
+    const tick = async () => {
+      clearTimeout(timer)
+      if (stopped) return
+      if (document.hidden || busy.current) { schedule(); return }
+      busy.current = true
+      try { await ref.current() } finally { busy.current = false; schedule() }
+    }
+    const visible = () => { if (!document.hidden && !busy.current) void tick() }
+    schedule()
+    document.addEventListener('visibilitychange', visible)
+    return () => { stopped = true; clearTimeout(timer); document.removeEventListener('visibilitychange', visible) }
   }, [ms, active])
 }
 

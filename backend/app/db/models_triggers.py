@@ -85,7 +85,7 @@ class TriggerDelivery(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     schedule_id: Mapped[str] = mapped_column(ForeignKey("schedules.id", ondelete="CASCADE"))
-    event_id: Mapped[str] = mapped_column(ForeignKey("trigger_events.id", ondelete="CASCADE"))
+    event_id: Mapped[str] = mapped_column(ForeignKey("trigger_events.id", ondelete="CASCADE"), index=True)
     #: 同事件的发生时刻（去抖窗口按它算）
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     status: Mapped[str] = mapped_column(String(20), default="pending")

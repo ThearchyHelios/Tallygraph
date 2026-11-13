@@ -60,10 +60,11 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from app.analysis.contract import LEDGER_KIND, OP_LABELS, catalog_result, method_label
+from app.data.source_health import LEDGER_KIND as HEALTH_KIND, is_health_result
 from app.engine.evidence import _Reason, _violation, iter_units
 
 #: 说法表的版本：改了判断词、类、绑定规则就升版本，老版本留在 LEXICONS 里给老文档复核用
-LEXICON_VERSION = 1
+LEXICON_VERSION = 2
 #: 报告节点 analysis_claims 的取值里要核的两种（off 不核、文档里也不记）
 MODES = ("check", "strict")
 #: 报告文档里记下核对处置和说法表版本的字段
@@ -278,7 +279,35 @@ _V1 = Lexicon(
         r"|转化率|退款率|退款额|退货率|毛利|利润|收入|营收|客流|流量|访客|GMV", re.I),
 )
 
-LEXICONS: dict[int, Lexicon] = {1: _V1}
+_ONTOLOGY_CLAIMS: tuple[Claim, ...] = (
+    Claim("reconcile_bad", "对账不一致", "reconcile", re.compile(
+        r"对账(?:不一致|差异|不平|偏离|异常)|勾稽(?:不一致|不平)|双源(?:不一致|对不上)|核对不平"),
+        flip="reconcile_ok"),
+    Claim("reconcile_ok", "对账一致", "reconcile", re.compile(
+        r"对账(?:一致|吻合|相符)|勾稽一致|双源一致|核对一致"),
+        flip="reconcile_bad", negative=True),
+    Claim("cochange", "跨源联动", "cochange", re.compile(
+        r"同步(?:异动|波动|上升|下降|增长|下滑)|联动(?:波动|异动|上升|下降)|同频(?:波动|异动)"
+        r"|同向(?:波动|异动|上升|下降)|反向(?:波动|异动|上升|下降)|伴随(?:出现)?(?:同步)?(?:波动|异动|上升|下降)"),
+        flip="no_cochange"),
+    Claim("no_cochange", "无跨源联动", "cochange", re.compile(
+        r"(?:无|没有|未见|并无)(?:明显|显著)?(?:的)?(?:同步异动|同步波动|联动波动|同频波动)|走势独立|独立波动"),
+        negative=True),
+    Claim("data_fault", "数据源异常", HEALTH_KIND, re.compile(
+        r"数据源(?:延迟|停更|断更|缺数|中断)|同步(?:中断|停滞|断流)|上游断流|表未更新|码值漂移|新增未知码值")),
+)
+
+_V2 = replace(
+    _V1,
+    version=2,
+    claims=(*_ONTOLOGY_CLAIMS, *_V1.claims),
+    plan_ahead=re.compile(
+        r"建议|(?<!非)计划(?!完成|达成|内|外|数|值|量|停机)|预计|争取|力争|打算|希望|下一步|下阶段|下一阶段|接下来|下周|下个?月|下季度"
+        r"|明年|避免|防止|以免|以防|防范|谨防"
+    ),
+)
+
+LEXICONS: dict[int, Lexicon] = {1: _V1, 2: _V2}
 
 #: 能挂「主要来自」这类来源判断的拆解判定（判定语就是这么说的）：一段或一个因子为主、集中在前几段，比率拆解里结构为主、
 #: 各段自身为主
@@ -290,8 +319,8 @@ _SOURCE_KEYS = frozenset({"source", "source_not", "dispersed", "offset", "mix"})
 _NAMING_SIDES = frozenset({"after", "inside", "before", "cause"})
 #: 比率拆解的结构为主、各段自身为主：判定语说的是「主要来自结构变化」「主要来自各段自身的变化」，句子这么说也算点了名
 _EFFECTS = {"mix_driven": re.compile(r"结构|占比"), "rate_driven": re.compile(r"自身")}
-#: 判定语引用（[[a:A1]]，不含具名标量 [[a:A1.键]]）的片段 ref
-_PHRASE_REF = re.compile(r"^a:\s*([A-Za-z]+\d+)\s*$")
+#: 判定语引用（[[a:A1]] 或 [[h:H1]]，不含具名标量 [[a:A1.键]]）的片段 ref
+_PHRASE_REF = re.compile(r"^[ah]:\s*([A-Za-z]+\d+)\s*$")
 #: 拆解结果表里不是维度的列（params.by 对不上时按「不是度量列」认维度，跳过这些）
 _MEASURE_COLUMNS = frozenset({
     "base", "target", "delta", "pct", "share", "flag", "n_base", "n_target", "d_base", "d_target", "w_base",
@@ -769,6 +798,25 @@ def _check(lex: Lexicon, hit: Hit, result: Mapping[str, Any], names: str, *, spa
         return None
     if key == "no_diff":
         return None if code == "no_evidence" else _verdict_miss(result)
+    if key == "reconcile_bad":
+        return None if code in ("diverged", "missing_counterpart") else _verdict_miss(result)
+    if key == "reconcile_ok":
+        return None if code in ("aligned", "reconciled") else _verdict_miss(result)
+    if key == "cochange":
+        if code not in ("co_anomalous", "synchronous", "lagged"):
+            return _verdict_miss(result)
+        phrase_txt = _phrase(result)
+        is_opp = verdict.get("direction") == "opposite" or "反向伴随异动" in phrase_txt
+        is_same = verdict.get("direction") == "same" or "同向伴随异动" in phrase_txt
+        if "同向" in hit.word and is_opp:
+            return _Miss("判的是反向伴随异动，不是同向", "判定的是反向伴随异动，与「同向」相反")
+        if "反向" in hit.word and is_same:
+            return _Miss("判的是同向伴随异动，不是反向", "判定的是同向伴随异动，与「反向」相反")
+        return None
+    if key == "no_cochange":
+        return None if code in ("target_normal", "primary_normal", "independent") else _verdict_miss(result)
+    if key == "data_fault":
+        return None if code == "anomalous" else _verdict_miss(result)
     return None
 
 
@@ -811,11 +859,16 @@ _FALLBACK = {
     "baseline": "只写本期的数和变化，不说「异常」「大幅」「显著下降」「激增」「历史新高」「正常波动」这类判断",
     "trend": "只写各期的数，不说「持续」「趋势」「连续」这类判断",
     "differ": "只写各组各自的数，不说「显著高于」「明显高于」「差异不大」这类判断",
+    "reconcile": "只陈述两侧各自的数值，不下「对账一致」「对账不一致」这类判断",
+    "cochange": "只陈述两个指标各自的变化，不下「同步异动」「联动波动」这类判断",
+    HEALTH_KIND: "只陈述查到的最新日期和行数，不下「数据源停更」「同步中断」「码值漂移」这类判断",
 }
 
 
 def _op_text(claim: Claim) -> str:
     """这一类要挂的分析怎么叫：算子、模式的叫法从契约取（结构变化是「变化拆解（比率）」）。"""
+    if claim.op == HEALTH_KIND:
+        return "数据源健康核查"
     return method_label(claim.op, claim.mode) if claim.mode else OP_LABELS.get(claim.op or "", claim.op or "")
 
 
@@ -826,12 +879,18 @@ def _snippet(shown: str, start: int, end: int, limit: int = 16) -> str:
     return piece or shown[start:end]
 
 
+def _inline_marker_of(alias: str, op: str | None = None) -> str:
+    head = "h" if alias.startswith("H") or op == HEALTH_KIND else "a"
+    return f"[[{head}:{alias}]]"
+
+
 def _uncited(claim: Claim, word: str, available: Mapping[str, list[str]]) -> _Reason:
     op_text = _op_text(claim)
     pool = available.get(f"{claim.op}:{claim.mode}" if claim.mode else claim.op or "", [])
-    fallback = _FALLBACK["mix" if claim.mode == "ratio" else claim.op or "decompose"]
+    fallback = _FALLBACK.get("mix" if claim.mode == "ratio" else claim.op or "decompose", _FALLBACK["decompose"])
     if pool:
-        model = (f"「{word}」要挂{op_text}的结论：照它的判定写、句末挂 [[see:{pool[0]}]]，或者直接引用判定 [[a:{pool[0]}]]；"
+        inline = _inline_marker_of(pool[0], claim.op)
+        model = (f"「{word}」要挂{op_text}的结论：照它的判定写、句末挂 [[see:{pool[0]}]]，或者直接引用判定 {inline}；"
                  f"判定和你想写的不一样就照判定写，否则{fallback}")
     else:
         model = f"这次没有{op_text}的结论，不能写「{word}」：{fallback}"
@@ -839,12 +898,19 @@ def _uncited(claim: Claim, word: str, available: Mapping[str, list[str]]) -> _Re
 
 
 def _mismatch(alias: str, snippet: str, miss: _Miss) -> _Reason:
+    inline = _inline_marker_of(alias)
     return _Reason(f"「{snippet}」与所挂的分析结论 {alias} 对不上：{miss.human}",
-                   f"{alias} {miss.model}，不能写「{snippet}」：照判定改写（或者直接引用判定 [[a:{alias}]]），"
+                   f"{alias} {miss.model}，不能写「{snippet}」：照判定改写（或者直接引用判定 {inline}），"
                    "或者删掉这个判断")
 
 
-def _causal(snippet: str) -> _Reason:
+def _causal(snippet: str, *, cochange: bool = False) -> _Reason:
+    if cochange:
+        return _Reason(
+            f"「{snippet}」是原因判断：跨源联动检验只证明统计同步异动，不能直接写成因果",
+            f"「{snippet}」没有因果依据：跨源联动检验不能写成「导致/由于/造成」；请改写为「伴随…同步异动」，"
+            "或引用知识库原话，或写成「可能与…有关，待核实」",
+        )
     return _Reason(f"「{snippet}」是原因判断，这句没有知识库原话或运行输入作依据，也没有写成推测",
                    f"「{snippet}」没有依据：数据只能说明变化来自哪里；要写原因，引用知识库原话，或写成「可能与…有关，待核实」")
 
@@ -895,10 +961,14 @@ def _said_cause(cause: str) -> bool:
     return bool(rest) and _POINTER.fullmatch(rest) is None
 
 
+_CUTOFF_CAVEAT = re.compile(r"只到|截断|截止|未覆盖|不完整|样本|省略|篇幅")
+_DATA_FAULT_CAUSE = re.compile(r"停更|断更|中断|断流|延迟|缺数|对账|码值|单位|换算")
+
+
 def check_sentence(sentence: Sentence, results: Mapping[str, Mapping[str, Any]], *,
                    available: Mapping[str, list[str]] | None = None, version: int | None = None) -> list[dict[str, Any]]:
-    """一句话的说法违规。results 是写作目录里的分析结论 {A 编号: 结论}，available 是 {op: [这次有的 A 编号]}（没挂时
-    告诉写作者可以挂哪一份），不给就按 results 算。"""
+    """一句话的说法违规。results 是写作目录里的分析结论 {A 编号: 结论}（含数据源健康 H 编号），available 是 {op: [这次有的编号]}
+    （没挂时告诉写作者可以挂哪一份），不给就按 results 算。"""
     lex = lexicon(version)
     if available is None:
         available = _available(results)
@@ -909,6 +979,12 @@ def check_sentence(sentence: Sentence, results: Mapping[str, Mapping[str, Any]],
     #: 这句挂的拆解（原因点名的是它的段就按来源核），和目录里所有的拆解（没挂时认原因是不是哪份拆解的段）
     decomposes = [r for _, r in mine if r.get("op") == "decompose"]
     known = [r for r in results.values() if r.get("op") == "decompose"]
+    has_cochange = any(r.get("op") == "cochange" for _, r in mine)
+    has_data_fault = any(
+        (r.get("op") == HEALTH_KIND and _verdict(r).get("code") == "anomalous")
+        or (r.get("op") == "reconcile" and _verdict(r).get("code") in ("diverged", "missing_counterpart"))
+        for _, r in mine
+    )
     out: list[dict[str, Any]] = []
     #: 同一分句里同一类只报一处（「由于促销结束导致下降」是一处没依据的原因，不是两处）
     seen: set[tuple[str, str, int]] = set()
@@ -921,7 +997,11 @@ def check_sentence(sentence: Sentence, results: Mapping[str, Mapping[str, Any]],
         spans = _object(sentence, hit, left, right)
         if claim.key == "causal":
             clause = sentence.text[left:right]
-            if sentence.quoted or sentence.inputs or guessed or lex.method.search(clause):
+            method_exempt = bool(
+                (_CUTOFF_CAVEAT.search(clause) or (not has_cochange and lex.method.search(clause)))
+                or (has_data_fault and _DATA_FAULT_CAUSE.search(clause))
+            )
+            if sentence.quoted or sentence.inputs or guessed or method_exempt:
                 continue
             cause = _cause(sentence, hit, left, right)
             if not _said_cause(cause):
@@ -936,7 +1016,7 @@ def check_sentence(sentence: Sentence, results: Mapping[str, Mapping[str, Any]],
                 key = (CAUSAL, claim.key, left)
                 if key not in seen:
                     seen.add(key)
-                    out.append(_record(CAUSAL, _causal(snippet), sentence, hit, claim, mine))
+                    out.append(_record(CAUSAL, _causal(snippet, cochange=has_cochange), sentence, hit, claim, mine))
                 continue
         candidates = [(a, r) for a, r in mine if r.get("op") == claim.op]
         if not candidates:
@@ -1002,9 +1082,32 @@ def results_of(catalog: Mapping[str, Any], load: Any = None) -> dict[str, dict[s
     return out
 
 
+def healths_of(catalog: Mapping[str, Any], load: Any = None) -> dict[str, dict[str, Any]]:
+    """写作目录里的数据源健康结论：{H 编号: 归一化为分析结论形状的字典}。"""
+    out: dict[str, dict[str, Any]] = {}
+    for alias, entry in catalog.items():
+        if not isinstance(entry, dict) or entry.get("kind") != HEALTH_KIND:
+            continue
+        cand = entry.get("result") if is_health_result(entry.get("result")) else entry.get("health")
+        raw = cand if is_health_result(cand) else None
+        if raw is None and load is not None:
+            loaded = load(str(alias), entry)
+            raw = loaded if is_health_result(loaded) else None
+        if isinstance(raw, dict):
+            out[str(alias)] = {
+                "status": "ok",
+                "op": HEALTH_KIND,
+                "mode": None,
+                "verdict": {"code": str(raw.get("verdict") or ""), "subjects": list(raw.get("sources") or [])},
+                "phrase": str(raw.get("phrase") or ""),
+                "issues": list(raw.get("issues") or []),
+            }
+    return out
+
+
 def _sentence(unit: dict[str, Any], aliases: Iterable[str], results: Mapping[str, Any]) -> Sentence | None:
     """文档里的一个句子单元 → Sentence。写作者自己写的字（文字片段、没有出处的数字）留在 text；引用渲染出来的值、表名
-    字段名留在 names（点名用）；判定语（a:）、知识库原话（q:）、排版符号两边都涂掉，判定语另记下位置（phrases）。"""
+    字段名留在 names（点名用）；判定语（a: / h:）、知识库原话（q:）、排版符号两边都涂掉，判定语另记下位置（phrases）。"""
     segments = [s for s in unit.get("segments") or [] if isinstance(s, dict)]
     if not segments:
         return None
@@ -1023,11 +1126,11 @@ def _sentence(unit: dict[str, Any], aliases: Iterable[str], results: Mapping[str
         if kind == "structural":
             scan_parts.append(blank)
             name_parts.append(blank)
-        elif head in ("a", "q"):
+        elif head in ("a", "h", "q"):
             scan_parts.append(blank)
             name_parts.append(blank)
             quoted = quoted or (head == "q" and seg.get("state") == "deterministic")
-            if head == "a" and (phrase := _PHRASE_REF.match(ref)):
+            if head in ("a", "h") and (phrase := _PHRASE_REF.match(ref)):
                 phrases.append((pos, pos + len(text), phrase.group(1)))
         elif ref or kind == "entity":
             scan_parts.append(blank)
@@ -1050,8 +1153,8 @@ def _sentence(unit: dict[str, Any], aliases: Iterable[str], results: Mapping[str
 def check_doc(doc: dict[str, Any], catalog: Mapping[str, Any], *, cited: Mapping[int, list[str]] | None = None,
               version: int | None = None, load: Any = None) -> list[dict[str, Any]]:
     """一份报告文档的说法违规。cited 是 {id(unit): 这句按重新解析的引用算的依据}（verify_doc 交进来），不给就用文档里
-    记的 cites；load 取回只带摘要的条目的整份结论（results_of）。标题、代码块、表格（表头和正文的格）不核。"""
-    results = results_of(catalog, load)
+    记的 cites；load 取回只带摘要的条目的整份结论（results_of / healths_of）。标题、代码块、表格（表头和正文的格）不核。"""
+    results = {**results_of(catalog, load), **healths_of(catalog, load)}
     available = _available(results)
     out: list[dict[str, Any]] = []
     for block, unit in iter_units(doc):
@@ -1146,14 +1249,29 @@ ANALYSIS_REPAIR_PROMPT = ("判断词照分析结论的判定写并挂上依据�
                           "原因没有依据的写成待核实的推测。")
 
 
+ONTOLOGY_CLAIMS_PROMPT = (
+    "跨源对账、联动与数据源健康规则：\n"
+    "- 「对账一致」「对账不一致」「勾稽不平」只能挂跨源对账结论（reconcile），直接引用 [[a:An]] 或句末挂 [[see:An]]。\n"
+    "- 「同步异动」「同向波动」「反向波动」「伴随波动」只能挂跨源联动检验结论（cochange），且跨源联动检验仅代表统计同频，"
+    "严禁写成因果（「由于…导致」「造成」），必须写为「伴随…同步异动」或「可能与…有关，待核实」。\n"
+    "- 「数据源停更」「数据源延迟」「同步中断」「码值漂移」只能挂数据源健康核查结论（[[h:Hn]] 或 [[see:Hn]]）。"
+)
+
+
 def rules_prompt(catalog: Mapping[str, Any]) -> str:
-    """写作规则里说判断词的那一段：目录里有分析结论和没有时各一种说法。"""
-    return ANALYSIS_RULES_PROMPT if results_of(catalog) else ANALYSIS_NONE_PROMPT
+    """写作规则里说判断词的那一段：目录里有分析结论和没有时各一种说法；含对账/联动/健康核查时追加本体规则。"""
+    results = results_of(catalog)
+    healths = healths_of(catalog)
+    if not results and not healths:
+        return ANALYSIS_NONE_PROMPT
+    if healths or any(r.get("op") in ("reconcile", "cochange") for r in results.values()):
+        return f"{ANALYSIS_RULES_PROMPT}\n{ONTOLOGY_CLAIMS_PROMPT}"
+    return ANALYSIS_RULES_PROMPT
 
 
 __all__ = [
     "ANALYSIS_NONE_PROMPT", "ANALYSIS_REPAIR_PROMPT", "ANALYSIS_RULES_PROMPT", "CAUSAL", "CODES", "DOC_FIELD",
-    "LEXICONS", "LEXICON_VERSION", "MISMATCH", "MODES", "UNCITED", "Claim", "Hit", "Lexicon", "Sentence",
-    "check_doc", "check_sentence", "counts", "lexicon", "record", "recorded", "results_of", "rules_prompt", "scan",
-    "summary", "verify",
+    "LEXICONS", "LEXICON_VERSION", "MISMATCH", "MODES", "ONTOLOGY_CLAIMS_PROMPT", "UNCITED", "Claim", "Hit", "Lexicon",
+    "Sentence", "check_doc", "check_sentence", "counts", "healths_of", "lexicon", "record", "recorded", "results_of",
+    "rules_prompt", "scan", "summary", "verify",
 ]

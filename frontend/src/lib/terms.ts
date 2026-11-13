@@ -964,6 +964,24 @@ export const upgradeNewerText = (latest: number, pinned: number) =>
   `上游已有 v${latest}（固定的是 v${pinned}）：发起正式运行前须在下方声明升版处置，否则正式运行将被拦截`
 
 /**
+ * 保存被服务端按 stale_revision 拒了（K02）：同一张图有人先改过。画布上的修改原样留着（还是「未保存」），
+ * 也不自动重发；页面上给两条明确的路让人自己选
+ */
+export const STALE_SAVE_TEXT = {
+  banner: (base: number, current: number | null) => current == null
+    ? `这张图有人先改过（你基于 v${base}）：画布上你的修改还在，没有替你重发`
+    : `这张图有人先改过（你基于 v${base}，服务端现在是 v${current}）：画布上你的修改还在，没有替你重发`,
+  rebase: '用最新版本再保存',
+  rebaseHint: '按服务端现在这一版为基准再存一版：画布上这份成为新的一版，别人刚改的那一版留在版本历史里',
+  reload: '载入最新版本',
+  reloadHint: '丢掉画布上还没保存的改动，换成服务端现在这一版',
+  reloadTitle: '载入最新版本？',
+  reloadBody: '画布上还没保存的修改会被丢掉，换成服务端上现在这一版。',
+  reloadConfirm: '载入最新版本',
+  dismiss: '先不改了',
+} as const
+
+/**
  * 发布前检查与自动修复：发布弹窗和问题面板的「发布前检查」共用一套说法。
  * 原则写在话里：修复只出预览、人确认了才存草稿，永远不替人发布
  */
@@ -5482,6 +5500,7 @@ export const ORIGIN_LABEL: Record<OriginKind, string> = {
   ledger_issue: '按口径正式出具',
   reconcile: '口径对账',
   recall: '口径召回',
+  caliber_trial: '口径试运行',
 }
 
 export const ORIGIN_TEXT = {
@@ -6316,6 +6335,7 @@ export const TOOL_ENDPOINT_TEXT = {
   query: '查询参数（JSON，可插值）',
   body: '请求体（JSON，可插值）',
   noEndpoints: '还没有登记的端点，在「工具 → 端点」中登记',
+  loadFailed: '端点列表加载失败，已保留当前绑定的端点',
 }
 
 /**

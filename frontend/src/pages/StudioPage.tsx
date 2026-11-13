@@ -5,7 +5,7 @@ import {
   Redo2, RotateCw, Save, ShieldCheck, Square, Undo2, Variable, Wand2, XCircle,
 } from 'lucide-react'
 import clsx from 'clsx'
-import { api } from '../api/client'
+import { api, ApiError } from '../api/client'
 import { FlowCanvas } from '../canvas/FlowCanvas'
 import { Palette, PALETTE_SEARCH_ID } from '../canvas/Palette'
 import { InspectorSheet, revealField } from '../canvas/InspectorSheet'
@@ -24,12 +24,12 @@ import { topology } from '../run/derive'
 import { EDIT_LOCK_TEXT, editLockOf, toGraph, useEditLock, useStudio } from '../store/studio'
 import { useCatalog, useOnReconnect } from '../store/catalog'
 import {
-  EmptyState, ErrorState, IconButton, Spinner, isComposing, promptDialog, toast,
+  EmptyState, ErrorState, IconButton, Spinner, confirmDialog, isComposing, promptDialog, toast,
 } from '../components/ui'
 import { isNetworkError } from '../lib/errors'
 import { formatClock } from '../lib/format'
 import { formatShortcut, isTypingTarget, matchShortcut } from '../lib/keys'
-import { VERSION_LABEL_TEXT, WORKFLOW_STATUS_LABEL, publishedLevelOf } from '../lib/terms'
+import { STALE_SAVE_TEXT, VERSION_LABEL_TEXT, WORKFLOW_STATUS_LABEL, publishedLevelOf } from '../lib/terms'
 import type { Workflow } from '../types'
 
 // 三栏的收起状态存在这台浏览器里。读写都可能抛（隐私模式、存储被禁），抛了就用默认值
@@ -124,6 +124,9 @@ export function StudioPage() {
   const redo = useStudio((s) => s.redo)
   const attachRun = useStudio((s) => s.attachRun)
   const analyzeNow = useStudio((s) => s.analyzeNow)
+  /** 保存被拒（stale_revision）时记下的两版：横幅按它写「你基于哪一版、服务端现在是哪一版」 */
+  const staleSave = useStudio((s) => s.staleSave)
+  const clearStaleSave = useStudio((s) => s.clearStaleSave)
 
   /** 正在按 id 去取哪张图。防止 effect 重入时重复发请求、重复弹提示 */
   const resolving = useRef<string | null>(null)
@@ -339,20 +342,51 @@ export function StudioPage() {
     if (selectedId && selectedId !== prev && !assistantRef.current) toggleAssistant(true)
   }, [selectedId, toggleAssistant])
 
-  const doSave = useCallback(async (note?: string) => {
+  const doSave = useCallback(async (note?: string, opts?: { expectedRevision?: number }) => {
     const s = useStudio.getState()
     if (!s.workflow || s.copilot.active) return
     setSaving(true)
     try {
-      await save(note)
+      await save(note, opts)
       toast.ok(note ?? s.pendingNote ? `已保存：${note ?? s.pendingNote}` : '已保存')
       void refresh()
     } catch (e) {
-      toast.error(e)
+      // 冲突由画布上的横幅说清（两条路也在那里），不再叠一条同样的 toast——它正好落在横幅上，两条消息会盖住彼此
+      if (!(e instanceof ApiError && e.status === 409 && e.code === 'stale_revision')) toast.error(e)
     } finally {
       setSaving(false)
     }
   }, [save, refresh])
+
+  /**
+   * 冲突横幅上的「用最新版本再保存」：以服务端现在那一版为基准再存一次。这是人明确点的一次保存（横幅也是这么写的），
+   * 不是自动重放——没人点，画布上的修改就一直留着、不会自己发出去
+   */
+  const saveOnLatest = useCallback(async () => {
+    const s = useStudio.getState()
+    if (!s.workflow) return
+    const base = s.staleSave?.current ?? (await api.workflows.get(s.workflow.id)).version
+    await doSave(undefined, { expectedRevision: base })
+  }, [doSave])
+
+  /** 冲突横幅上的「载入最新版本」：丢掉画布上的改动，换成服务端现在这一版。先问一句，不静默丢弃 */
+  const reloadLatest = useCallback(async () => {
+    const s = useStudio.getState()
+    if (!s.workflow) return
+    const ok = await confirmDialog({
+      title: STALE_SAVE_TEXT.reloadTitle, body: STALE_SAVE_TEXT.reloadBody,
+      consequences: ['画布上还没保存的修改会丢失', '载入之后可以照最新一版重新改'],
+      confirmLabel: STALE_SAVE_TEXT.reloadConfirm, danger: true,
+    })
+    if (!ok) return
+    try {
+      const fresh = await api.workflows.get(s.workflow.id)
+      useStudio.getState().load(fresh)
+      toast.info(`已载入服务端现在这一版（v${fresh.version}）`)
+    } catch (e) {
+      toast.error(e)
+    }
+  }, [])
 
   const saveWithNote = useCallback(async () => {
     const note = await promptDialog({
@@ -627,6 +661,27 @@ export function StudioPage() {
         {/* 停靠栏做成挤压式而不是浮层：React Flow 的 Controls 和 MiniMap
             是绝对定位在画布容器里的，浮层会把它俩埋掉，挤压会把它俩顶上去 */}
         <main className="relative flex min-w-0 flex-1 flex-col">
+          {staleSave && (
+            /* 保存被拒（有人先改过同一张图）：画布上的修改原样留着，也不自动重发；这里给两条明确的路 */
+            <div data-stale-save className="flex flex-wrap items-center gap-2 border-b px-3 py-1.5 text-2xs"
+                 style={{ background: 'var(--st-waiting-soft)' }}>
+              <AlertTriangle size={12} style={{ color: 'var(--warn)' }} />
+              <span className="min-w-0 flex-1 truncate" title={STALE_SAVE_TEXT.banner(staleSave.base, staleSave.current)}>
+                {STALE_SAVE_TEXT.banner(staleSave.base, staleSave.current)}
+              </span>
+              <button className="btn shrink-0" data-stale-save-rebase onClick={() => void saveOnLatest()}
+                      disabled={saving} title={STALE_SAVE_TEXT.rebaseHint}>
+                {STALE_SAVE_TEXT.rebase}
+              </button>
+              <button className="btn shrink-0" data-stale-save-reload onClick={() => void reloadLatest()}
+                      title={STALE_SAVE_TEXT.reloadHint}>
+                {STALE_SAVE_TEXT.reload}
+              </button>
+              <button className="btn btn-ghost shrink-0" onClick={() => clearStaleSave()}>
+                {STALE_SAVE_TEXT.dismiss}
+              </button>
+            </div>
+          )}
           <div className="relative min-h-0 flex-1">
             {loadError && loadError.id === workflowId && !workflow
               ? <ErrorState error={loadError.error} onRetry={() => resolve(loadError.id)} className="h-full" />

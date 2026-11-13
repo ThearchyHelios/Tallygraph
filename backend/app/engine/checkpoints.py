@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +64,12 @@ async def open_sqlite_saver(path: Path | str) -> AsyncIterator[BaseCheckpointSav
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
     async with AsyncSqliteSaver.from_conn_string(str(path)) as saver:
+        conn = getattr(saver, "conn", None)
+        if conn is not None:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA synchronous=NORMAL")
+            await conn.execute("PRAGMA journal_size_limit=67108864")
+            await conn.execute("PRAGMA busy_timeout=5000")
         yield saver
 
 
@@ -73,6 +79,39 @@ def open_saver() -> contextlib.AbstractAsyncContextManager[BaseCheckpointSaver]:
     if conninfo:
         return open_postgres_saver(conninfo)
     return open_sqlite_saver(settings.checkpoint_path)
+
+
+async def _delete_on(saver: Any, ids: list[str]) -> None:
+    adelete = getattr(saver, "adelete_thread", None)
+    if not callable(adelete):
+        return
+    setup = getattr(saver, "setup", None)
+    if callable(setup):
+        with contextlib.suppress(Exception):
+            await setup()
+    for tid in ids:
+        with contextlib.suppress(Exception):
+            await adelete(tid)
+
+
+async def delete_threads(thread_ids: Iterable[str]) -> None:
+    """运行被彻底删除或评测明细被回收时，一并清理断点库里对应的 thread。
+
+    注意：正常运行结束（succeeded / cancelled）时不能删，因为 GET /api/runs/{id}/state 和 /checkpoints
+    还要回看历史断点；只有在运行记录本身从数据库删除之后才调这里。
+    """
+    ids = sorted({str(t) for t in thread_ids if t})
+    if not ids:
+        return
+    from app.engine.runner import run_manager
+
+    saver = run_manager._checkpointer
+    if saver is not None:
+        await _delete_on(saver, ids)
+        return
+    if settings.checkpoint_conninfo or settings.checkpoint_path.is_file():
+        async with open_saver() as opened:
+            await _delete_on(opened, ids)
 
 
 async def count(saver: Any, thread_id: str | None = None) -> tuple[int, int]:

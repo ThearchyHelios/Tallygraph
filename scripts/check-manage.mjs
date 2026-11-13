@@ -4089,7 +4089,10 @@ await section('数据 · 表格：改配方后回答保留', async () => {
 await section('知识库', async () => {
   const { page, sent, natives, errors, close } = await open('/knowledge/kb', {
     uploadProgress: true,
-    handlers: [[/^POST \/kb\/upload$/, delayed(1200, {
+    // 本节验证从语义向量降级到本地哈希；隔离空库默认已是 local，重复选中会正确禁用。
+    handlers: [[/^GET \/kb\/embedding$/, json({ ...embedding, kind: 'openai', model: 'check-embedding',
+      embedder: 'openai:check-embedding', has_semantics: true, fallback: false })],
+      [/^POST \/kb\/upload$/, delayed(1200, {
       id: 'fake-doc', collection: 'default', title: 'note.md', source: 'note.md', mime: 'text/markdown',
       chunk_count: 0, status: 'processing', meta: { progress: { done: 1, total: 4 } },
     }, 201)]],

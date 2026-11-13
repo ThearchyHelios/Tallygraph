@@ -41,6 +41,8 @@ import { capabilities, endpoints, notify } from './capabilities'
 import { blueprints, files, personal, templates } from './blueprints'
 // 问数据的一轮在服务端跑（编排完善第 1 波）：发起、看、停，实时流在 chatTurns.ts 的 streamChatTurn
 import { chatTurns } from './chatTurns'
+import { ontology } from './ontology'
+import { semanticMetrics } from './semanticMetrics'
 
 // 请求层搬到了 http.ts（见那边的说明）。原先从这里导出的照旧从这里导出，调用方不用改；
 // 请求函数也一并转出，给不在 api/ 下、又想直接发请求的地方用。api/ 下的命名空间文件请直接从 http.ts 导入
@@ -257,7 +259,10 @@ export const api = {
       name: string; description?: string; graph?: GraphSpec; tags?: string[]
       origin?: { run_id: string; conversation_id?: string; turn_id?: string }
     }) => post<Workflow>('/workflows', body),
-    update: (id: string, body: Partial<Workflow> & { note?: string }) =>
+    /** 改工作流：带 graph 就是保存一版。expected_revision 是读到的 Workflow.version（K02 的乐观锁）：对不上回
+     *  409 stale_revision（另带 current_version），这时页面保留自己的编辑、也不自动重放，人确认后再按最新一版
+     *  显式重试（或载入最新版本） */
+    update: (id: string, body: Partial<Workflow> & { note?: string; expected_revision?: number }) =>
       patch<Workflow>(`/workflows/${id}`, body),
     remove: (id: string) => del(`/workflows/${id}`),
     duplicate: (id: string) => post<Workflow>(`/workflows/${id}/duplicate`),
@@ -864,6 +869,10 @@ export const api = {
       get<{ report?: { node_id?: string; doc_artifact?: string }; alias?: string; rendered?: string | null
             chain?: EvidenceSegmentDetail['chain']; seal?: EvidenceSegmentDetail['seal']; redacted?: EvidenceSegmentDetail['redacted'] }>(
         `/runs/${encodeURIComponent(runId)}/evidence/analyses/${encodeURIComponent(alias)}${qs({ report: opts?.report })}`, opts),
+    health: (runId: string, alias: string, opts?: RequestOptions & { report?: string }) =>
+      get<{ report?: { node_id?: string; doc_artifact?: string }; alias?: string; rendered?: string | null
+            chain?: EvidenceSegmentDetail['chain']; seal?: EvidenceSegmentDetail['seal']; redacted?: EvidenceSegmentDetail['redacted'] }>(
+        `/runs/${encodeURIComponent(runId)}/evidence/health/${encodeURIComponent(alias)}${qs({ report: opts?.report })}`, opts),
     /**
      * 审计表：每个有状态的片段按状态分组（有出处 / 无证据 / 可疑实体 / 旧运行猜测），附上封存核对的结果。
      * groups 只要这几组（none、suspicious…）
@@ -999,6 +1008,10 @@ export const api = {
 
   // 问数据的一轮（服务端跑整轮：发起、看、停）
   chatTurns,
+  // 业务本体：标准业务实体与跨口径指标拓扑
+  ontology,
+  // 独立语义指标库（SemanticMetric）：即存即生效指标卡片、在线试算与智能提取
+  semanticMetrics,
 }
 
 /**
@@ -1192,6 +1205,7 @@ export function streamRun(
   /** 握手连续失败（一次都没打开过就断了）几次 */
   let refused = 0
   let pollTimer: ReturnType<typeof setTimeout> | undefined
+  let wsRetryTimer: ReturnType<typeof setTimeout> | undefined
 
   const finish = (status?: string) => {
     if (closed) return
@@ -1240,7 +1254,8 @@ export function streamRun(
     socket = new WebSocket(`${proto}://${location.host}/api/runs/${runId}/stream?after=${lastSeq}`)
 
     socket.onmessage = (ev) => {
-      const event = parseBody(ev.data) as RunEvent & { type: string; status?: string }
+      const event = parseBody(ev.data) as (RunEvent & { type?: string; status?: string }) | null
+      if (!event || typeof event !== 'object' || typeof event.type !== 'string') return
       if (event.type === 'stream.end') {
         socket?.close()
         // 新后端放在 data.status，老后端放在顶层 status
@@ -1248,7 +1263,7 @@ export function streamRun(
         return
       }
       if (event.seq) lastSeq = Math.max(lastSeq, event.seq)
-      onEvent(event)
+      onEvent(event as RunEvent)
     }
     socket.onclose = () => {
       if (closed) return
@@ -1260,12 +1275,14 @@ export function streamRun(
       }
       // 指数退避重连，最多等 5 秒
       retry += 1
-      setTimeout(connect, Math.min(300 * 2 ** retry, 5000))
+      clearTimeout(wsRetryTimer)
+      wsRetryTimer = setTimeout(connect, Math.min(300 * 2 ** retry, 5000))
     }
     socket.onopen = () => {
       opened = true
       refused = 0
       retry = 0
+      clearTimeout(wsRetryTimer)
       report(true)
     }
   }
@@ -1274,6 +1291,7 @@ export function streamRun(
   return () => {
     closed = true
     clearTimeout(pollTimer)
+    clearTimeout(wsRetryTimer)
     socket?.close()
   }
 }

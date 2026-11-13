@@ -81,6 +81,14 @@ When everything passes (or can't be checked), the periods are comparable; with o
 
 When a change decomposition is given two queries, it runs this check automatically first; when the fluctuation baseline, the trend test, or a change decomposition over a single query checks whether the current period is complete, it uses the whole-period item of this check. It also runs once automatically when a caliber card metric uses two queries of the same shape that differ only in their dates (this week versus last week), with the result attached to the metric (see [Caliber cards](evidence.md#caliber-cards)).
 
+### Cross-source reconciliation and co-movement
+
+Alongside the five single-source analyses, cross-source ontology investigation adds two deterministic cross-metric operators and a data-source health probe:
+
+- **Cross-source reconciliation (`reconcile`)**: compares two `reconciles_with` mirror calibers or queries row by row along aligned entity keys. It supports deterministic unit scaling (`scale`, such as `1000` between kWh and MWh) plus absolute and relative tolerances, returning `aligned`, `diverged` (naming the out-of-tolerance segments), or `missing_counterpart`.
+- **Co-movement (`cochange`)**: tests whether a focal metric and an `upstream_driver` series both exceed their robust historical fluctuation bands (median and MAD) within a configured lag window (`lag_periods` from `0` to `3`), reporting descriptive Spearman rank correlation alongside verdicts `co_anomalous`, `target_normal` (ruling out that upstream driver), or `opposite_move`. Both the verdict phrase and the analysis claim check frame `cochange` strictly as **synchronous statistical co-movement**, forbidding causal assertions ("caused by", "led to") unless backed by an explicit knowledge-base rule.
+- **Source health probe (`source_health`)**: performs read-only checks on target data sources or caliber backing tables for stalled dates (`date_stalled`), date gaps (`date_gap`), recent row-volume drops (`volume_drop`), and uncataloged new code values (`codes_new`). Results are sealed as `H1`, `H2`, ... artifacts, cited with `[[h:H1]]` / `[[see:H1]]`, and inspected in the evidence drawer.
+
 ## When an analysis can't be done
 
 An analysis that can't be done doesn't fail the agent or the node. It is recorded as a conclusion, with a verdict phrase along the lines of "Fluctuation baseline not done: only 5 periods of history, at least 8 needed", and it goes into the ledger and can be cited and checked:

@@ -151,7 +151,9 @@ def _apply_contract(
     from datetime import datetime, timezone
 
     from app.engine.governance import board_only
-    from app.engine.issuance import decide_tier, incomplete_gaps, no_data_gaps, sql_check_findings, trace_numbers
+    from app.engine.issuance import (
+        decide_tier, external_stale_gaps, incomplete_gaps, no_data_gaps, sql_check_findings, trace_numbers,
+    )
 
     nodes = state.get("nodes") or {}
     # 写了 report_from 就是引用模式：按报告文档逐段复核，不再按数值回指叙述
@@ -194,6 +196,15 @@ def _apply_contract(
     gaps.extend(incomplete_gaps(metrics))
     # 输入取自「查询区间里这张表没有数据」的列的指标：数回指得上、复算一致，但那个 0 不代表真的是 0，不能完整出具
     gaps.extend(no_data_gaps(metrics))
+    # 外部常量过了有效期：值还是那个值，但已经不能代表现在
+    gaps.extend(external_stale_gaps(metrics))
+    from app.engine.validation import additional_metric_gaps
+
+    gaps.extend(additional_metric_gaps(metrics))
+    for output in (state.get("nodes") or {}).values():
+        investigation = output.get("investigation") if isinstance(output, dict) else None
+        if isinstance(investigation, dict) and investigation.get("active") and investigation.get("status") != "complete":
+            gaps.append("异常调查未完成：" + str(investigation.get("reason") or "证据不足"))
     # 来源查询没通过 SQL 检查（error 级：重复计算、存量跨期加总）：口径卡复算得一致，算的却是错数。
     # 报告直接引用的查询要等引用核对之后才知道，缺口放在这个位置，下面一起算
     sql_at = len(gaps)
@@ -384,8 +395,8 @@ def _untraced_gaps(metrics: list[dict[str, Any]], ctx: NodeContext) -> list[str]
 
 def _comparability(metrics: list[dict[str, Any]]) -> tuple[list[str], list[dict[str, Any]]]:
     """口径卡指标上的可比性（contract.MetricComparability，口径卡跨两份同形查询算环比、同比时自动做的检查）：
-    (缺口, 出具声明里的那一项)。metrics 是要看的指标（报告引用了的、契约必需的，调用方挑好）：两期不可比的记缺口（降档，
-    同 sql_check_failed），有条件可比的只标注。没有可比性记录的指标不在里面；同一条指标只看一次。"""
+    (缺口, 出具声明里的那一项)。metrics 是要看的指标（报告引用了的、契约必需的，调用方挑好）：两期不可比或尚有条件的
+    都记缺口并降档，不能把尚未核实的可比性当成通过。没有可比性记录的指标不在里面；同一条指标只看一次。"""
     gaps: list[str] = []
     declared: list[dict[str, Any]] = []
     seen: set[int] = set()
@@ -403,7 +414,7 @@ def _comparability(metrics: list[dict[str, Any]]) -> tuple[list[str], list[dict[
         declared.append({"metric": mid, "name": name, "verdict": verdict, "phrase": phrase,
                          "reasons": [str(r) for r in found.get("reasons") or [] if r],
                          **({"artifact": found["artifact"]} if found.get("artifact") else {})})
-        if verdict == "incomparable":
+        if verdict in ("incomparable", "conditional"):
             gaps.append(f"指标「{name}」{phrase or '两期不可比'}")
     return gaps, declared
 

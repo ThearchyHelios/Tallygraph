@@ -6,7 +6,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 用法：./scripts/package-docker.sh [--platform linux/arm64|linux/amd64] [--version <版本>] [--out <目录>] [--gzip] [--no-microvm]
-                                  [--no-postgres]
+                                  [--no-postgres] [--keep <数量>]
 
   --platform <平台>  目标机的平台。默认按本机架构取 linux/<arch>。64 位系统的 ARM 单板机是 linux/arm64，
                      普通 PC 和服务器是 linux/amd64。和本机架构不同时 docker 用模拟构建，会慢很多。
@@ -18,6 +18,7 @@ usage() {
   --no-postgres      不带内置 PostgreSQL 的镜像（postgres-image.tar，约 160 MB）。只用 SQLite 或外接 PostgreSQL 时用不上；
                      不带的包在目标机上 install --postgres 要先 docker pull 到同一个标签。默认带上，标签取 deploy.sh 里的
                      POSTGRES_IMAGE（只在那一处定）。
+  --keep <数量>      在产物目录里最多保留最近几份同架构的离线包（默认取 AGENTLAB_KEEP_RELEASES，未设时为 3；传 0 不清理旧包）。
   -h, --help         显示这段说明。
 
 产物：<out>/agentlab-<版本>-linux-<arch>.tar，里面有 image.tar、postgres-image.tar、deploy.sh、agentlab.env、README.md、
@@ -34,6 +35,7 @@ OUT="$ROOT/release"
 GZIP=""
 WITH_MICROVM=1
 WITH_POSTGRES=1
+KEEP_RELEASES="${AGENTLAB_KEEP_RELEASES:-3}"
 need_value() { [ $# -ge 2 ] && [ -n "$2" ] || { echo "$1 后面要跟一个值"; echo; usage; exit 2; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -46,11 +48,16 @@ while [ $# -gt 0 ]; do
     --gzip) GZIP=1 ;;
     --no-microvm) WITH_MICROVM=0 ;;
     --no-postgres) WITH_POSTGRES=0 ;;
+    --keep) need_value "$@"; KEEP_RELEASES="$2"; shift ;;
+    --keep=*) KEEP_RELEASES="${1#--keep=}" ;;
     -h|--help) usage; exit 0 ;;
     *) echo "认不出的参数：$1"; echo; usage; exit 2 ;;
   esac
   shift
 done
+case "$KEEP_RELEASES" in
+  ''|*[!0-9]*) echo "--keep 需要是非负整数：$KEEP_RELEASES"; exit 2 ;;
+esac
 
 # ---- 平台 ----
 if [ -z "$PLATFORM" ]; then
@@ -181,6 +188,29 @@ fi
 if [ -n "$GZIP" ]; then
   echo "==> 压缩 $TAR.gz"
   if command -v pigz >/dev/null 2>&1; then pigz -c "$TAR" > "$TAR.gz"; else gzip -c "$TAR" > "$TAR.gz"; fi
+fi
+
+# ---- 4. 清理旧离线包 ----
+if [ "$KEEP_RELEASES" -gt 0 ]; then
+  SEEN_STEMS=" ${NAME} "
+  KEPT_COUNT=1
+  while IFS= read -r OLD_FILE; do
+    [ -n "${OLD_FILE}" ] && [ -f "${OLD_FILE}" ] || continue
+    BASE_NAME="$(basename "${OLD_FILE}")"
+    STEM="${BASE_NAME%.gz}"
+    STEM="${STEM%.tar}"
+    case "${SEEN_STEMS}" in
+      *" ${STEM} "*) ;;
+      *)
+        SEEN_STEMS="${SEEN_STEMS}${STEM} "
+        KEPT_COUNT=$((KEPT_COUNT + 1))
+        ;;
+    esac
+    if [ "${KEPT_COUNT}" -gt "${KEEP_RELEASES}" ] && [ "${STEM}" != "${NAME}" ]; then
+      echo "==> 清理旧离线包 ${OLD_FILE}（保留最近 ${KEEP_RELEASES} 份）"
+      rm -f "${OLD_FILE}"
+    fi
+  done < <(ls -1t "${OUT}"/agentlab-*-linux-"${ARCH}".tar "${OUT}"/agentlab-*-linux-"${ARCH}".tar.gz 2>/dev/null || true)
 fi
 
 size() { du -h "$1" | awk '{print $1}'; }

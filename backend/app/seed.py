@@ -396,6 +396,51 @@ TEMPLATES: list[dict[str, Any]] = [
             _e("check", "write"), _e("write", "done"),
         ],
     },
+    {
+        "name": "⑫ 跨源指标异动与对账诊断",
+        "description": "先核查数据源健康与跨源对账口径，再做同源维度定位与已确认本体穿透，出具带引用与非因果约束的诊断报告。",
+        "tags": ["分析", "本体", "对账", "证据"],
+        "nodes": [
+            _n("start", "input", "诊断问题", fields=[
+                {"name": "question", "required": True,
+                 "default": "星河智造昨日设备有效运转率为何异常异动？请先核查数据源健康与跨源对账，再定位重点产线。",
+                 "description": "要排查的指标异常或跨源对账问题"},
+                {"name": "period", "default": "2026-10-21", "description": "目标统计周期"}]),
+            _n("investigate", "agent", "跨源本体排查 Agent",
+               system="你是跨源指标诊断研究员：严格遵循先核数据源健康与对账、再同源拆解切片、最后沿已确认本体穿透的三段式纪律；"
+                      "一旦发现源表断更、断档或对账失配即停止业务下钻。",
+               prompt="围绕统计周期 {{ input.period }} 排查问题：{{ input.question }}\n"
+                      "1. 先调用本体邻居查询查看目标口径已确认的构成因子、跨源对账镜像与上游驱动关系，并调用数据源健康核查检查"
+                      "涉及的数据源是否存在断更、断档、行数骤降或新增未识别编码；若存在对账镜像，调用口径查询取数后做跨源对账。\n"
+                      "2. 若数据源健康正常且主指标超出波动基线，先在同源做变化拆解锁定贡献最大的业务实体切片。\n"
+                      "3. 将异常切片传入本体邻居查询获取对齐后的调用参数，调用口径查询拉取已确认邻居指标并检验伴随异动（最多穿透 2 跳）。",
+               tools=[
+                   "caliber_query",
+                   "ontology_neighbors",
+                   "source_health",
+                   "analysis_comparable",
+                   "analysis_baseline",
+                   "analysis_decompose",
+                   "analysis_reconcile",
+                   "analysis_cochange",
+               ],
+               approval="dangerous",
+               assign_to="investigation_notes"),
+            _n("write", "report", "诊断报告撰写", numbers="strict", on_violation="fail", claims="require_citation",
+               analysis_claims="strict",
+               system="你是经营诊断撰写人：结论先行，判断严格引用分析结论与数据源健康判定语，统计伴随异动绝不写成因果定论。",
+               instructions="围绕统计周期 [[i:period]] 回答：{{ input.question }}（排查摘要：{{ vars.investigation_notes }}）。"
+                            "按「核查结论 / 数据源健康与跨源对账 / 切片定位与伴随异动」三段组织正文：数据源健康结论引用 [[h:H1]]，"
+                            "分析判定直接引用 [[a:A1]] 等判定语，口径与单元格按证据引用；伴随异动一律表述为统计同步异动，"
+                            "没有明确规则依据时写成待核实的推测。"),
+            _n("done", "output", "出具",
+               fields=[{"name": "跨源诊断报告", "value": "{{ nodes.write.text }}"}],
+               contract={"report_from": "write", "cells": True, "strict": True}),
+        ],
+        "edges": [
+            _e("start", "investigate"), _e("investigate", "write"), _e("write", "done"),
+        ],
+    },
 ]
 
 

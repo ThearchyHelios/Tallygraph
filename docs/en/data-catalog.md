@@ -194,4 +194,20 @@ Scheduled Maintenance on the data source card:
 
 - Choose the steps (introspect the schema, profile the tables that need it, value observation; several can be chosen) and an off-peak time window; this is saved as a schedule whose target is the data source. There is none by default.
 - It queues with drafting and profiling on the same data source, and steps that didn't run record the reason as it is.
-- Schedules of this kind don't accept webhooks (they return 422); notifications go through channel subscriptions under Settings → Notifications.
+- Schedules of this kind don't accept webhooks (they return 422); notifications go through channel subscriptions under Settings -> Notifications.
+
+## Canonical business entity bridges
+
+Different business databases often represent the same real-world object with different table names, column names, and code prefixes (for example, `L1` in `mfg_ops` versus `EQ-L1` in `equip_master`). The Data Catalog header provides a Canonical Entities view (`?view=entities`) to govern cross-source canonical business entities (`CanonicalEntity`):
+
+- **Two-column governance**: the left pane manages entity keys (such as `prod_line`), display names, and lifecycle status; the right pane maintains physical table-column bindings (`bindings`), caliber input parameter mappings (`caliber_params`), and cross-source member code dictionaries (`members`).
+- **Candidate review and runtime gate**: mappings drafted from documentation or proposed by collaborators start as `proposed` and can be confirmed or rejected item by item in the Canonical Entities view. Only `confirmed` / `verified` bindings and parameter mappings participate in runtime cross-source input translation (`align_caliber_inputs`) and Copilot entity-bridge hints.
+- **Caliber semantic reference**: in a caliber's query semantics editor, dimensions can directly select a registered `entity_key` instead of duplicating cross-database key mappings on every caliber.
+
+### Agent-assisted governance and business documents
+
+On the Canonical Entities page, alongside manual form editing, maintainers can govern cross-source entities through an interactive assistant and background discovery jobs:
+
+- **Entity Assistant**: click Entity Assistant in the header to open the right-hand chat drawer (`POST /api/ontology/entities/assistant`). By default, the assistant scopes its context strictly to the current data source (preventing tables or calibers from unrelated business domains from leaking in); maintainers can expand the scope selector at the top of the drawer to check additional data sources when cross-source alignment is needed. Within the selected sources, the assistant inspects schemas, catalog entries, and caliber inputs (`inspect_sources`), runs read-only masked SQL queries to verify live code values (`run_query`), reads attached business documents (`read_document`), and emits structured diff proposals (`propose_entity_changes`). Proposals never write to the database automatically; maintainers keep or drop individual items and click Save Changes to apply them as `confirmed` with optimistic-concurrency version checks (`POST /api/ontology/entities/apply-patch`).
+- **Scan for Candidate Entities**: click Scan for Candidate Entities (`POST /api/ontology/discovery-jobs`), which defaults to the current data source and allows checking additional sources in the same business domain. The background scan inspects the selected data sources, linked calibers, and documents. Discovered bindings and caliber parameter mappings are always recorded as `proposed` (`source="ai"`), never overwrite `confirmed`, `verified`, or `rejected` items, and remain gated out of live runtime cross-source penetration until reviewed and confirmed by a maintainer.
+- **Business document and mapping sheet attachments**: both the Entity Assistant drawer and the Scan for Candidate Entities dialog accept `.md`, `.docx`, `.pdf`, `.xlsx`, and `.csv` business rules or master-data code mapping sheets (`POST /api/ontology/entities/attachments`), as well as existing Knowledge Base documents. Maintainers can check "Also save to Knowledge Base for future reuse" (`save_to_kb`) and pick a target collection so an uploaded mapping sheet immediately serves both entity alignment and downstream Ask-Data retrieval.

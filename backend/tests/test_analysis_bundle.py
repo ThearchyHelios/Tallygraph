@@ -105,9 +105,9 @@ def test_the_analysis_and_its_input_travel_with_the_file_and_verify():
     analysis_item = item(bundle, a)
     assert analysis_item["kind"] == ARTIFACT_KIND and "b64" in analysis_item and analysis_item["node_id"] == "an"
     # 导出时服务端真的复算了一遍：按封存的输入快照（这份文件里哈希对得上的原字节）重算，逐字段相同
-    assert analysis_item["recheck"] == {"status": "same", "method": "decompose.additive@1",
+    assert analysis_item["recheck"] == {"status": "same", "method": "decompose.additive@2",
                                         "text": "复算一致：按封存的输入重新计算，结论逐项相同"}
-    # 方法的叫法由服务端带上（和导出页同一份），核对页只显示「变化拆解（可加） · decompose.additive@1」
+    # 方法的叫法由服务端带上（和导出页同一份），核对页只显示「变化拆解（可加） · decompose.additive@2」
     assert analysis_item["method_label"] == "变化拆解（可加）"
     [query] = [x for x in bundle["artifacts"] if x["kind"] == "query"]
     assert "b64" in query

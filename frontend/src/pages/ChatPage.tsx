@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import {
-  AlertCircle, ArrowRight, BookOpen, Check, ChevronDown, ChevronRight, CloudOff, Database, History, LayoutGrid, ListTree,
-  MessageSquare, PenLine, Play, RotateCw, Settings2, StepForward, Trash2, Wrench,
+  AlertCircle, ArrowRight, BookOpen, Check, ChevronDown, ChevronRight, CloudOff, Database, History, Layers, LayoutGrid, ListTree,
+  MessageSquare, PenLine, Play, RotateCw, Settings2, ShieldCheck, StepForward, Tag, Trash2, Wrench, Zap,
 } from 'lucide-react'
 import clsx from 'clsx'
+import type { ChatDepth, GroundingSummary } from '../api/chatTurns'
 import { ApiError, api } from '../api/client'
 import { ApprovalCard } from '../run/RunPanel'
 import { AssistantStream, type StreamTurn, type TurnFailure } from '../run/AssistantStream'
@@ -47,7 +48,14 @@ import {
  * dense 一个开关。两边各写一套的话，同一次运行在两个页面会讲出不同的故事。
  */
 export function ChatPage() {
-  const { ask, stop, load, hydrate, recheck, setScope } = useChat()
+  const ask = useChat((s) => s.ask)
+  const stop = useChat((s) => s.stop)
+  const load = useChat((s) => s.load)
+  const hydrate = useChat((s) => s.hydrate)
+  const recheck = useChat((s) => s.recheck)
+  const setScope = useChat((s) => s.setScope)
+  const setDepth = useChat((s) => s.setDepth)
+  const depth = useChat((s) => s.depth)
   const { conversationId } = useParams()
   const navigate = useNavigate()
   const currentId = useConversations((s) => s.currentId)
@@ -58,7 +66,12 @@ export function ChatPage() {
   const turns = useChat((s) => (currentId ? s.byConversation[currentId] : undefined))
   const loadState = useChat((s) => (currentId ? s.loadState[currentId] : undefined))
   const loadError = useChat((s) => (currentId ? s.loadError[currentId] : undefined))
-  const byConversation = useChat((s) => s.byConversation)
+  const elsewhereId = useChat((s) => {
+    for (const [id, ts] of Object.entries(s.byConversation)) {
+      if (id !== currentId && isBusy(ts)) return id
+    }
+    return null
+  })
   const backend = useCatalog((s) => s.backend)
   // 在回收站里的对话可以点开看，但不能接着问：问了它也还在回收站里，左栏找不到
   const trashed = useConversations((s) => (currentId ? s.trash.find((c) => c.id === currentId) : undefined))
@@ -145,13 +158,10 @@ export function ChatPage() {
   const trashBusy = !!trashed && stillRunning(trashed, turns)
   // 另一个会话在跑：这里照样能问（各跑各的），但得让人知道那边没停
   const elsewhere = useMemo(() => {
-    for (const [id, ts] of Object.entries(byConversation)) {
-      if (id !== currentId && isBusy(ts)) {
-        return { id, title: list.find((c) => c.id === id)?.title || ts[ts.length - 1].question }
-      }
-    }
-    return null
-  }, [byConversation, currentId, list])
+    if (!elsewhereId) return null
+    const ts = useChat.getState().byConversation[elsewhereId]
+    return { id: elsewhereId, title: list.find((c) => c.id === elsewhereId)?.title || ts?.[ts.length - 1]?.question || '' }
+  }, [elsewhereId, list])
 
   const blocked = loadState === 'loading' ? '正在加载对话历史…'
     : loadState === 'error' ? '对话历史加载失败，请点击上方的「重试」'
@@ -219,10 +229,16 @@ export function ChatPage() {
 
   // 库列表还在取、或者没取回来时也挂着：从上一问接过来的范围照样会发出去，得看得见。
   // 没东西可摆时它自己不画
-  const picker = usable.length > 0 || scope.length > 0 || sources.state !== 'ready'
+  const scopePicker = usable.length > 0 || scope.length > 0 || sources.state !== 'ready'
     ? <ScopePicker sources={usable} scope={scope} onChange={pickScope}
                    unconfirmed={sources.state === 'loading' ? '正在确认' : sources.state === 'error' ? '状态获取失败' : undefined} />
-    : undefined
+    : null
+  const picker = (
+    <div className="flex min-w-0 flex-wrap items-center gap-1">
+      <DepthPicker depth={depth} onChange={setDepth} />
+      {scopePicker}
+    </div>
+  )
 
   const dock = (
     <div className="shrink-0 border-t px-4 pb-3 pt-2">
@@ -561,9 +577,11 @@ function TurnExtras({ turnId, readOnly }: {
   readOnly: boolean
 }) {
   const conversationId = useConversations((s) => s.currentId)
-  const turn = useChat((s) => (conversationId ? s.byConversation[conversationId]?.find((t) => t.id === turnId) : undefined))
+  const turns = useChat((s) => (conversationId ? s.byConversation[conversationId] : undefined))
+  const turn = turns?.find((t) => t.id === turnId)
+  const isLast = turns?.[turns.length - 1]?.id === turnId
   const approvals = useCatalog((s) => s.approvals)
-  const { reattach, runNow, toggleSteps } = useChat.getState()
+  const { reattach, runNow, toggleSteps, retryTurn, ask } = useChat.getState()
   const busy = useChat((s) => (conversationId ? isBusy(s.byConversation[conversationId]) : false))
   // 做成应用进蓝图：搭建者建共享的；使用者在管理员开了个人应用时建个人的，都不是就没有这个按钮
   const makeScope = useCreateScope()
@@ -572,12 +590,21 @@ function TurnExtras({ turnId, readOnly }: {
   const pending = runId ? approvals.filter((a) => a.run_id === runId && a.status === 'pending') : []
   const canSteps = !!turn.restored && !!runId && !BUSY.has(turn.phase)
   const scoped = !!turn.scope?.length
+  const hasGrounding = !!turn.grounding && (
+    (turn.grounding.metrics?.length ?? 0) > 0
+    || (turn.grounding.entities?.length ?? 0) > 0
+    || (turn.grounding.tables?.length ?? 0) > 0
+    || (turn.grounding.guardrails?.length ?? 0) > 0
+  )
   // 回答成功、有运行的轮次可以做成应用：带着这次运行进蓝图
   const canApp = !!runId && turn.phase === 'done' && !readOnly && !!makeScope
+  // 快速直查完成的轮次支持一键升级为深度分析（搭建多步工作流 + 撰写报告 + 复核）
+  const canUpgradeDeep = turn.phase === 'done' && turn.depth === 'fast' && !turn.asked && !readOnly
 
-  if (!pending.length && !turn.pendingRun && !canSteps && !scoped && !canApp) return null
+  if (!pending.length && !turn.pendingRun && !canSteps && !scoped && !hasGrounding && !canApp && !canUpgradeDeep) return null
   return (
     <>
+      {hasGrounding && <GroundingStrip grounding={turn.grounding!} depth={turn.depth} />}
       {/* 和「没查库」一样，写在结论前面：这个答案只看了这几个库 */}
       {scoped && (
         <div className="mt-2 flex items-center gap-1 text-2xs text-faint" data-turn-scope="">
@@ -585,7 +612,7 @@ function TurnExtras({ turnId, readOnly }: {
           <span className="min-w-0 truncate">本轮只查 {turn.scope!.map((s) => s.name).join('、')}</span>
         </div>
       )}
-      {(turn.pendingRun || canSteps || canApp) && (
+      {(turn.pendingRun || canSteps || canApp || canUpgradeDeep) && (
         <div className="mt-2 flex flex-wrap items-center gap-1.5">
           {turn.pendingRun && (
             <button className="btn btn-xs btn-primary" disabled={busy || readOnly}
@@ -600,6 +627,19 @@ function TurnExtras({ turnId, readOnly }: {
                     onClick={() => void toggleSteps(conversationId, turn.id)}>
               {turn.steps === 'loading' ? <Spinner size={11} /> : <ListTree size={11} />}
               {turn.steps === 'loading' ? '正在加载执行过程…' : stepsVisible(turn) ? '收起执行过程' : '查看执行过程'}
+            </button>
+          )}
+          {canUpgradeDeep && (
+            <button className="btn btn-xs btn-ghost" disabled={busy} data-turn-switch-deep=""
+                    title={busy ? '本对话仍有一轮在运行' : '切换为深度分析模式：搭建多步分析工作流、撰写证据报告并进行结果复核'}
+                    onClick={() => {
+                      if (isLast) {
+                        retryTurn(conversationId, turn.id, { depth: 'deep' })
+                      } else if (ask(conversationId, turn.question, { scope: turn.scope, depth: 'deep' })) {
+                        toast.info('已在对话末尾按深度分析模式重新提问')
+                      }
+                    }}>
+              <Layers size={11} aria-hidden /> 切换深度分析
             </button>
           )}
           {canApp && <MakeAppButton runId={runId!} scope={makeScope!} />}
@@ -699,14 +739,42 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
       setResuming(false)
     }
   }
-  const again = (opts?: { maxSteps?: number; rerun?: boolean; scope?: ScopeSource[] }) => {
+  const again = (opts?: { maxSteps?: number; rerun?: boolean; escalate?: boolean; scope?: ScopeSource[] }) => {
     if (last) retryTurn(conversationId, turn.id, opts)
     else if (ask(conversationId, turn.question, opts?.scope ? { scope: opts.scope } : undefined)) {
       toast.info('已在对话末尾用同一问题重新提问')
     }
   }
+  const escalation = turn.phase === 'done'
+    ? (() => {
+      const esc = (turn.review ?? turn.reviewRaw)?.anomaly_escalation
+      return esc?.available && !esc.auto_escalate ? esc : null
+    })()
+    : null
 
   const buttons: ReactNode[] = []
+  if (escalation) {
+    buttons.push(
+      <button key="escalate" data-remedy-escalate=""
+              className={clsx('btn btn-xs', !canContinue && !fixFirst && 'btn-primary')}
+              disabled={off}
+              title={offNote ?? (escalation.reason || '沿已确认的指标本体关系核查关联数据源健康状态与对账差异')}
+              onClick={() => {
+                if (last) {
+                  retryTurn(conversationId, turn.id, { escalate: true })
+                  return
+                }
+                const nextQuestion = escalation.follow_up_instruction
+                  ? `${turn.question}\n${escalation.follow_up_instruction}`
+                  : `${turn.question}（请沿指标本体排查关联数据源与健康状态）`
+                if (ask(conversationId, nextQuestion, turn.scope ? { scope: turn.scope } : undefined)) {
+                  toast.info('已在对话末尾发起跨源本体排查')
+                }
+              }}>
+        <ArrowRight size={11} /> {escalation.button_label || '指标触发异常，沿本体排查关联数据源'}
+      </button>,
+    )
+  }
   if (kind === 'unknown') {
     buttons.push(
       <button key="recheck" className="btn btn-xs" onClick={() => void recheck(conversationId, turn.id)}
@@ -743,7 +811,7 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
     const plain = (kind === 'cancelled' || kind === 'suspended' || !!turn.failure?.rerun) && graphful
     const label = scopeGone ? '不限数据源重试' : !last ? '重新问一次' : plain ? '重新运行本轮' : '重试本轮'
     buttons.push(
-      <button key="retry" className={clsx('btn btn-xs', alarm && !canContinue && !fixFirst && 'btn-primary')}
+      <button key="retry" className={clsx('btn btn-xs', alarm && !canContinue && !fixFirst && !escalation && 'btn-primary')}
               disabled={off}
               title={offNote ?? (scopeGone ? '取消数据源限定，由助手自动选择数据库后重新提问'
                 : !last ? '在对话末尾用同一问题重新提问'
@@ -785,7 +853,12 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
     : null
 
   return (
-    <div className="w-full" data-remedy={kind ?? (turn.clipped ? 'clipped' : 'attempts')}>
+    <div className="w-full" data-remedy={kind ?? (escalation ? 'escalation' : turn.clipped ? 'clipped' : 'attempts')}>
+      {escalation?.reason && (
+        <div className="mb-1.5 text-xs leading-relaxed text-dim" data-remedy-escalation-reason="">
+          {escalation.reason}
+        </div>
+      )}
       {turn.clipped && (
         <div className="mb-1.5 rounded border px-2 py-1.5 text-2xs leading-relaxed text-dim"
              style={{ borderColor: 'color-mix(in srgb, var(--st-waiting) 40%, var(--border))' }} role="note">
@@ -809,7 +882,8 @@ function Remedies({ conversationId, turnId, last, onRephrase, readOnly }: {
 
 /** 这一轮下面有没有东西要摆：没有就不占位 */
 function hasRemedies(t: ChatTurn): boolean {
-  return !!remedyOf(t) || !!t.clipped || !!t.attempts?.length
+  const esc = t.phase === 'done' ? (t.review ?? t.reviewRaw)?.anomaly_escalation : null
+  return !!remedyOf(t) || !!t.clipped || !!t.attempts?.length || Boolean(esc?.available && !esc.auto_escalate)
 }
 
 /**
@@ -982,6 +1056,7 @@ function ChatHero({ sources, usable, scope, onScope, picker, inputRef, draft, se
   const collectionsState = useCatalogListState('collections')
   const toolsState = useCatalogListState('tools')
   const byConversation = useChat((s) => s.byConversation)
+  const depth = useChat((s) => s.depth)
   const list = sources.list
   // 停用的库 Copilot 看不见，拿它造句等于教人问一个答不了的问题
   const suggestions = useMemo(() => suggestFrom(usable), [usable])
@@ -997,7 +1072,11 @@ function ChatHero({ sources, usable, scope, onScope, picker, inputRef, draft, se
             <Database size={20} />
           </div>
           <h2 className="text-xl font-semibold">问你的数据</h2>
-          <p className="mt-1 text-xs text-faint">用一句话描述需求，助手会自动连接数据源、编写查询并给出结论，无需操作画布</p>
+          <p className="mt-1 text-xs text-faint">
+            {depth === 'fast'
+              ? '默认快速直查：毫秒级匹配标准指标、业务实体与数据目录，直连数据源快速返回结论；复杂归因可随时切换深度分析'
+              : '深度分析模式：自动搭建多步工作流、撰写带逐段证据的分析报告并进行结果复核'}
+          </p>
         </div>
 
         <PromptBox
@@ -1083,6 +1162,96 @@ const HERO_CHIPS = 6
 const scopeText = (scope: ScopeSource[]) => !scope.length ? '全部数据源'
   : scope.length <= 2 ? `只查 ${scope.map((s) => s.name).join('、')}`
   : `只查 ${scope.length} 个库`
+
+function DepthPicker({ depth, onChange }: { depth: ChatDepth; onChange: (depth: ChatDepth) => void }) {
+  return (
+    <div role="group" aria-label="问数模式"
+         className="inline-flex shrink-0 items-center rounded-md border bg-panel p-0.5 text-2xs">
+      <button type="button" data-chat-depth="fast" aria-pressed={depth === 'fast'}
+              title="快速直查：毫秒级匹配标准指标、业务实体与数据目录，单轮直连数据源返回结论"
+              className={clsx(
+                'inline-flex items-center gap-1 rounded px-1.5 py-0.5 transition-colors',
+                depth === 'fast' ? 'bg-accent-soft font-medium text-[var(--accent)]' : 'text-faint hover:text-dim',
+              )}
+              onClick={() => onChange('fast')}>
+        <Zap size={10} aria-hidden /> 快速直查
+      </button>
+      <button type="button" data-chat-depth="deep" aria-pressed={depth === 'deep'}
+              title="深度分析：自动搭建多步工作流、撰写带证据的分析报告并进行结果复核"
+              className={clsx(
+                'inline-flex items-center gap-1 rounded px-1.5 py-0.5 transition-colors',
+                depth === 'deep' ? 'bg-accent-soft font-medium text-[var(--accent)]' : 'text-faint hover:text-dim',
+              )}
+              onClick={() => onChange('deep')}>
+        <Layers size={10} aria-hidden /> 深度分析
+      </button>
+    </div>
+  )
+}
+
+function GroundingStrip({ grounding, depth }: { grounding: GroundingSummary; depth?: ChatDepth }) {
+  const metrics = grounding.metrics ?? []
+  const entities = grounding.entities ?? []
+  const tables = grounding.tables ?? []
+  const guardrails = grounding.guardrails ?? []
+  const msText = typeof grounding.elapsed_ms === 'number'
+    ? `${Math.max(1, Math.round(grounding.elapsed_ms))} ms`
+    : null
+  const guardrailNotes = guardrails.map((g) => g.note || g.filter || g.column || g.kind).filter(Boolean).join('\n')
+
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-1.5 rounded-md border bg-bg px-2.5 py-1.5 text-2xs"
+         data-turn-grounding="">
+      <span className="inline-flex items-center gap-1 font-medium text-dim">
+        <Zap size={11} className="text-[var(--accent)]" aria-hidden />
+        {depth === 'deep' ? '深度分析预命中' : '语义预命中'}
+        {msText && <span className="mono text-faint">· {msText}</span>}
+      </span>
+      {metrics.map((m) => (
+        <span key={m.id || m.key} data-grounding-metric={m.key}
+              title={m.sql_expression ? `${m.name}（${m.key}）：${m.sql_expression}` : `${m.name}（${m.key}）`}
+              className="inline-flex items-center gap-1 rounded border border-[var(--accent)]/30 bg-accent-soft px-1.5 py-0.5 text-[var(--accent)]">
+          <Tag size={10} aria-hidden />
+          指标：{m.name}{m.unit ? `（${m.unit}）` : ''}
+        </span>
+      ))}
+      {entities.map((e) => {
+        const memberLabel = e.matched_member?.canonical_label || e.matched_member?.canonical_value
+        const codePairs = e.matched_member?.target_codes
+          ? Object.entries(e.matched_member.target_codes).map(([src, codes]) => `${src} → ${codes.join(' / ')}`).join('；')
+          : ''
+        return (
+          <span key={e.entity_id || e.entity_key} data-grounding-entity={e.entity_key}
+                title={codePairs ? `标准业务实体编码对齐：${codePairs}` : e.label}
+                className="inline-flex items-center gap-1 rounded border bg-panel px-1.5 py-0.5 text-dim">
+            业务实体：{memberLabel ? `${e.label} · ${memberLabel}` : e.label}
+          </span>
+        )
+      })}
+      {tables.slice(0, 4).map((t) => (
+        <span key={`${t.datasource_id}:${t.table_name}`} data-grounding-table={t.table_name}
+              title={[
+                `${t.datasource_name}.${t.table_name}`,
+                t.grain ? `粒度：${t.grain}` : '',
+                t.business_date ? `业务时间列：${t.business_date}` : '',
+                t.valid_filter ? `有效过滤：${t.valid_filter}` : '',
+              ].filter(Boolean).join(' · ')}
+              className="inline-flex items-center gap-1 rounded border bg-panel px-1.5 py-0.5 text-faint">
+          <Database size={10} aria-hidden />
+          {t.label ? `${t.table_name}（${t.label}）` : t.table_name}
+        </span>
+      ))}
+      {tables.length > 4 && <span className="text-faint">等 {tables.length} 张目录表</span>}
+      {guardrails.length > 0 && (
+        <span title={guardrailNotes} data-grounding-guardrails={guardrails.length}
+              className="inline-flex items-center gap-1 rounded border bg-panel px-1.5 py-0.5 text-dim">
+          <ShieldCheck size={10} className="text-[var(--st-done)]" aria-hidden />
+          目录防错 {guardrails.length} 项
+        </span>
+      )}
+    </div>
+  )
+}
 
 /**
  * 这一问查哪些库，挂在输入框左边。默认不限：它自己挑。限定之后 Copilot 只拿得到这几个
@@ -1293,7 +1462,8 @@ interface SourcesState { state: 'loading' | 'ready' | 'error'; list: Source[] }
 function useDataSources(): SourcesState {
   // 列表是全站共用的那份；旧了（半分钟以上）进页面时后台重取，别的标签页、别人刚加的库
   // 不用整页刷新就能出现在范围、例句里
-  const { list, state: listState } = useDatasources()
+  const { key: routeKey } = useLocation()
+  const { list, state: listState } = useDatasources({ refreshKey: routeKey })
   const [tables, setTables] = useState<Record<string, string[]>>({})
   // 开了登录的使用者（D-c）只拿得到数据源的名字和说明，表结构接口只给搭建者：例句按名字和说明造，不去取表名
   const builder = useAtLeast('builder')

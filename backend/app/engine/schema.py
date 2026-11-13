@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 from collections import defaultdict
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any, Iterable, Literal
 
@@ -539,7 +540,11 @@ def _check_dual_check(node: GraphNode, spec: GraphSpec, result: ValidationResult
             "请把口径卡连到双盲复算之前", "card", "dual_check.card_invalid")
         return
     if target.config.get("caliber_from") not in (None, "", {}):
-        known = None
+        # 转抄卡：钉住那一版的指标清单不在本图里。带了指标选择（caliber_from.metrics，K08）时，这张卡这次只会算出选中的
+        # 那些——可选的指标清单就是它，按它校验；没带选择才认不出（照旧不查指标 ID）
+        ref = target.config.get("caliber_from")
+        selection = ref.get("metrics") if isinstance(ref, dict) else None
+        known = [str(m) for m in selection] if isinstance(selection, list) and selection else None
     else:
         known = [str(d.get("id")) for d in target.config.get("metrics") or [] if isinstance(d, dict) and d.get("id")]
     hint = ("，可选的指标 ID：" + "、".join(known[:12])) if known else ""
@@ -752,7 +757,7 @@ def analysis_issues(spec: GraphSpec, node: GraphNode) -> list[ValidationIssue]:
             add(f"{who}的「在验证什么」需要是一段文字", f"{at}.hypothesis", "analysis.item_invalid")
         both = all(isinstance(params.get(k), str) and params[k].strip() for k in ANALYSIS_NODE_PARAMS)
         if not (isinstance(item.get("from"), str) and item["from"].strip()) and not both:
-            two = "；基期、本期是两份查询时，在参数里选上这两个查询节点" if op in ("decompose", "comparable") else ""
+            two = "；基期、本期是两份查询时，在参数里选上这两个查询节点" if op in ("decompose", "comparable", "reconcile", "cochange") else ""
             add(f"{who}还没有选择输入：选一个上游的查询节点（调用数据库查询工具的「调用工具」节点，或「合并查询」）{two}",
                 f"{at}.from", "analysis.input_invalid")
         headline = params.get("headline")
@@ -1085,6 +1090,200 @@ def _check_challenge(node: GraphNode, spec: GraphSpec, result: ValidationResult)
                    field="model", code="challenge.same_model")
 
 
+#: 指标定义的类型：公式（表达式）、外部常量、单元格条件规则、评估评分。四种都在运行时能算；
+#: 不认识的类型仍在校验里挡住，免得被当成能算的指标
+METRIC_KINDS = ("formula", "external", "rule", "assessment")
+#: 定义卡参数的标量类型（和入口表单的字段类型同一套子集）
+METRIC_PARAM_TYPES = ("string", "number", "integer", "boolean")
+#: 规则条件能用的比较
+RULE_OPS = ("eq", "ne", "gt", "gte", "lt", "lte", "in", "not_in")
+
+
+def metric_definition_issues(node: GraphNode, metric: Any, index: int) -> list[ValidationIssue]:
+    """一条指标定义卡的结构：ID / 表达式、kind、定义文本、参数。形状错是 error，运行时没法按它算。"""
+    out: list[ValidationIssue] = []
+    field = f"metrics[{index}]"
+
+    def add(message: str, key: str = field, level: str = "error", code: str | None = None) -> None:
+        out.append(ValidationIssue(level=level, message=message, node_id=node.id, field=key, code=code))  # type: ignore[arg-type]
+
+    if not isinstance(metric, dict):
+        add("指标定义需要是一个对象")
+        return out
+    if metric.get("contract") is not None:
+        from app.engine.metric_spec import MetricContract
+
+        try:
+            MetricContract.model_validate(metric["contract"])
+        except ValueError as exc:
+            add(f"指标约束无效：{exc}", f"{field}.contract", code="metrics.contract_invalid")
+    if not metric.get("id") or not str(metric.get("id")).strip():
+        add(f"指标定义缺少 ID：{field}", code="metrics.id_missing")
+    kind = str(metric.get("kind") or "formula")
+    if kind not in METRIC_KINDS:
+        add(f"指标「{metric.get('id') or index + 1}」的类型「{kind}」不认识：现在支持「公式」（formula）、"
+            "「外部常量」（external）、「规则」（rule）、「评估」（assessment）",
+            f"{field}.kind", code="metrics.kind_unsupported")
+    if kind == "external":
+        external = metric.get("external")
+        if not isinstance(external, dict):
+            add("外部常量指标需要 external 对象（value / source / as_of / stale_after_days）",
+                f"{field}.external", code="metrics.external_invalid")
+        else:
+            value = external.get("value")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                add("external.value 需要是有限数值", f"{field}.external.value", code="metrics.external_invalid")
+            if not isinstance(external.get("source"), str) or not external["source"].strip():
+                add("external.source 需要写明来源", f"{field}.external.source", code="metrics.external_invalid")
+            raw = external.get("as_of")
+            try:
+                from datetime import date
+
+                date.fromisoformat(str(raw))
+            except (TypeError, ValueError):
+                add("external.as_of 需要是 YYYY-MM-DD", f"{field}.external.as_of", code="metrics.external_invalid")
+            days = external.get("stale_after_days")
+            if days is not None and (isinstance(days, bool) or not isinstance(days, int) or days < 0):
+                add("external.stale_after_days 需要是非负整数", f"{field}.external.stale_after_days",
+                    code="metrics.external_invalid")
+    elif kind == "rule":
+        rule = metric.get("rule")
+        if not isinstance(rule, dict):
+            add("规则型指标需要 rule 对象（inputs / all / then / else）", f"{field}.rule",
+                code="metrics.rule_invalid")
+        else:
+            inputs = rule.get("inputs")
+            if not isinstance(inputs, dict) or not inputs:
+                add("规则需要 inputs：输入名 → 取值路径（例如 cell(nodes.fetch, 0, 'status')）",
+                    f"{field}.rule.inputs", code="metrics.rule_invalid")
+                inputs = {}
+            else:
+                for name, path in inputs.items():
+                    if not isinstance(name, str) or not name.strip() or not isinstance(path, str) \
+                            or not path.strip():
+                        add("规则的每个输入都要有名字和取值路径", f"{field}.rule.inputs", code="metrics.rule_invalid")
+                    elif not any(token in path for token in ("cell(", "nodes.", "vars.", "input.")):
+                        add(f"规则输入「{name}」的取值路径要写成 cell(nodes.…)、vars.… 或 input.…；"
+                            "表列名是规则 DSL 编译接口的写法，不能直接写进口径卡",
+                            f"{field}.rule.inputs.{name}", code="metrics.rule_invalid")
+            conditions = rule.get("all")
+            if not isinstance(conditions, list) or not conditions:
+                add("规则需要 all：至少一条条件", f"{field}.rule.all", code="metrics.rule_invalid")
+                conditions = []
+            for j, cond in enumerate(conditions):
+                key = f"{field}.rule.all[{j}]"
+                if not isinstance(cond, dict) or cond.get("input") not in inputs:
+                    add("条件要指向一个已声明的输入", key, code="metrics.rule_invalid")
+                    continue
+                if cond.get("op") not in RULE_OPS:
+                    add(f"条件运算符只能是 {'、'.join(RULE_OPS)}", f"{key}.op", code="metrics.rule_invalid")
+                if cond.get("op") in ("in", "not_in"):
+                    if not isinstance(cond.get("values"), list) or not cond["values"]:
+                        add("in / not_in 需要非空的 values 列表", f"{key}.values", code="metrics.rule_invalid")
+                elif "value" not in cond:
+                    add("条件需要 value", f"{key}.value", code="metrics.rule_invalid")
+            for key in ("then", "else"):
+                if key in rule and (isinstance(rule[key], bool) or not isinstance(rule[key], (int, float))):
+                    add(f"规则的 {key} 需要是数", f"{field}.rule.{key}", code="metrics.rule_invalid")
+    elif kind == "assessment":
+        assessment = metric.get("assessment")
+        if not isinstance(assessment, dict):
+            add("评估型指标需要 assessment 对象（dimensions / levels）", f"{field}.assessment",
+                code="metrics.assessment_invalid")
+        else:
+            dimensions = assessment.get("dimensions")
+            if not isinstance(dimensions, list) or not dimensions:
+                add("评估需要 dimensions：至少一个维度", f"{field}.assessment.dimensions",
+                    code="metrics.assessment_invalid")
+                dimensions = []
+            names: set[str] = set()
+            for j, dimension in enumerate(dimensions):
+                key = f"{field}.assessment.dimensions[{j}]"
+                if not isinstance(dimension, dict):
+                    add("评估维度需要是一个对象", key, code="metrics.assessment_invalid")
+                    continue
+                name = dimension.get("name")
+                if not isinstance(name, str) or not name.strip() or name in names:
+                    add("评估维度需要唯一的名字", f"{key}.name", code="metrics.assessment_invalid")
+                else:
+                    names.add(name)
+                if not isinstance(dimension.get("input"), str) or not dimension["input"].strip():
+                    add("评估维度需要 input（取值路径）", f"{key}.input", code="metrics.assessment_invalid")
+                elif not any(token in dimension["input"] for token in ("cell(", "nodes.", "vars.", "input.")):
+                    add("评估维度的 input 要写成 cell(nodes.…)、vars.… 或 input.…",
+                        f"{key}.input", code="metrics.assessment_invalid")
+                weight = dimension.get("weight", 1)
+                if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight <= 0:
+                    add("评估维度的 weight 需要是正数", f"{key}.weight", code="metrics.assessment_invalid")
+                low, high = dimension.get("min", 0), dimension.get("max", 100)
+                if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in (low, high)) or high <= low:
+                    add("评估维度的 min / max 需要是数，且 max 大于 min", key, code="metrics.assessment_invalid")
+            levels = assessment.get("levels")
+            if not isinstance(levels, list) or not levels:
+                add("评估需要 levels：至少一个等级", f"{field}.assessment.levels",
+                    code="metrics.assessment_invalid")
+                levels = []
+            previous: float | None = None
+            for j, level in enumerate(levels):
+                key = f"{field}.assessment.levels[{j}]"
+                if not isinstance(level, dict):
+                    add("评估等级需要是一个对象", key, code="metrics.assessment_invalid")
+                    continue
+                if not isinstance(level.get("name"), str) or not level["name"].strip():
+                    add("评估等级需要名字", f"{key}.name", code="metrics.assessment_invalid")
+                minimum = level.get("min")
+                if isinstance(minimum, bool) or not isinstance(minimum, (int, float)) or not math.isfinite(minimum):
+                    add("评估等级的 min 需要是数", f"{key}.min", code="metrics.assessment_invalid")
+                elif previous is not None and minimum >= previous:
+                    add("评估等级要按 min 从高到低排列", f"{key}.min", code="metrics.assessment_invalid")
+                else:
+                    previous = float(minimum)
+            if levels and isinstance(levels[-1], dict) and isinstance(levels[-1].get("min"), (int, float)) \
+                    and not isinstance(levels[-1]["min"], bool) and levels[-1]["min"] > 0:
+                add("最后一个评估等级的 min 要不大于 0，否则低分没有等级可落",
+                    f"{field}.assessment.levels[-1].min", code="metrics.assessment_invalid")
+    elif not metric.get("expression"):
+        add(f"指标定义缺少表达式：{metric.get('id') or '（空）'}", code="metrics.expression_missing")
+
+    definition = metric.get("definition")
+    if definition is not None:
+        if not isinstance(definition, dict):
+            add("指标的定义说明需要是一个对象（text / scope / exclusions / owner / effective_from / citations）",
+                f"{field}.definition", code="metrics.definition_invalid")
+        else:
+            for key in ("text", "scope", "owner", "effective_from"):
+                if definition.get(key) is not None and not isinstance(definition[key], str):
+                    add(f"指标定义说明的「{key}」需要是文字", f"{field}.definition.{key}",
+                        code="metrics.definition_invalid")
+            if definition.get("exclusions") is not None and not isinstance(definition["exclusions"], list):
+                add("指标定义说明的「exclusions」需要是列表", f"{field}.definition.exclusions",
+                    code="metrics.definition_invalid")
+            if definition.get("citations") is not None and not isinstance(definition["citations"], list):
+                add("指标定义说明的「citations」需要是列表", f"{field}.definition.citations",
+                    code="metrics.definition_invalid")
+
+    params = metric.get("params")
+    if params is not None:
+        if not isinstance(params, list):
+            add("指标参数需要是一个列表", f"{field}.params", code="metrics.params_invalid")
+        else:
+            seen: set[str] = set()
+            for j, param in enumerate(params):
+                key = f"{field}.params[{j}]"
+                if not isinstance(param, dict) or not isinstance(param.get("name"), str) \
+                        or not param["name"].strip():
+                    add("参数需要是一个带 name 的对象", key, code="metrics.params_invalid")
+                    continue
+                name = param["name"].strip()
+                if name in seen:
+                    add(f"参数「{name}」重复了", f"{key}.name", code="metrics.params_invalid")
+                seen.add(name)
+                if param.get("type") not in METRIC_PARAM_TYPES:
+                    add(f"参数「{name}」的类型只能是 {'、'.join(METRIC_PARAM_TYPES)}，当前为「{param.get('type')}」",
+                        f"{key}.type", code="metrics.params_invalid")
+    return out
+
+
 def validate_graph(spec: GraphSpec) -> ValidationResult:
     """编译前的静态检查。错误会挡住运行，警告只在画布上提示。"""
     result = ValidationResult()
@@ -1172,9 +1371,17 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
             if not defs and not cfg.get("caliber_from"):
                 result.add("口径卡还没有定义指标", node_id=node.id, field="metrics")
             for i, d in enumerate(defs):
-                if not d.get("id") or not d.get("expression"):
-                    result.add(f"指标定义缺少 ID 或表达式：{d.get('id') or '（空）'}",
-                               node_id=node.id, field=f"metrics[{i}]")
+                for issue in metric_definition_issues(node, d, i):
+                    result.add(issue.message, level=issue.level, node_id=issue.node_id, field=issue.field,
+                               code=issue.code)
+            # K08：同一张卡上的指标 ID 要唯一。下游按 ID 与位置取数（nodes.<卡>.metrics[i]、出具契约、比例契约），
+            # 重复了分不清是哪一条——画布 / 发布前检查就拦住，别等到运行时把第一条静默算出来
+            from app.engine.nodes.metrics import duplicate_metric_ids
+
+            for duplicated in duplicate_metric_ids(defs):
+                result.add(f"指标 ID「{duplicated}」在这张口径卡上重复了：同一张卡上的指标 ID 要唯一（下游按 ID 与位置"
+                           f"取数，重复了分不清是哪一条）", node_id=node.id, field="metrics",
+                           code="metrics.id_duplicate")
         elif node.type == NodeType.DUAL_CHECK:
             _check_dual_check(node, spec, result)
         elif node.type == NodeType.REPORT:
@@ -1201,6 +1408,14 @@ def validate_graph(spec: GraphSpec) -> ValidationResult:
         elif node.type == NodeType.LOOP:
             if not spec.outgoing(node.id):
                 result.add("「循环」节点没有循环体", node_id=node.id)
+
+        if node.type == NodeType.AGENT and cfg.get("investigation") is not None:
+            from app.engine.investigation import InvestigationPolicy
+
+            try:
+                InvestigationPolicy.model_validate(cfg["investigation"])
+            except ValueError as exc:
+                result.add(f"调查策略无效：{exc}", node_id=node.id, field="investigation", code="agent.investigation_invalid")
 
         if node.type in (NodeType.LLM, NodeType.AGENT, NodeType.SUPERVISOR, NodeType.REPORT):
             if not (cfg.get("model") or spec.defaults.get("model")):
@@ -1645,6 +1860,9 @@ def text_parse_issues(spec: GraphSpec) -> list[ValidationIssue]:
 EVIDENCE_ROLES = ("source", "compute")
 _REF_HEAD = re.compile(r"^(vars|nodes)\.([\w-]+)")
 
+#: 口径卡上游取数 SQL 的书写问题（data/caliber_lint.py）：取整、补 0 应交给口径卡
+CALIBER_SQL_CODES = frozenset({"caliber.round_in_source", "caliber.zero_default"})
+
 
 def _caliber_inputs(card: GraphNode, spec: GraphSpec) -> list[tuple[int, GraphNode]]:
     """口径卡每个指标表达式里读到的节点：(指标下标, 产出它的节点)。"""
@@ -1667,6 +1885,40 @@ def _caliber_inputs(card: GraphNode, spec: GraphSpec) -> list[tuple[int, GraphNo
             else:
                 producers = [n for n in spec.nodes if str(n.config.get("assign_to") or "").strip() == name]
             out.extend((i, n) for n in producers)
+    return out
+
+
+def caliber_sql_issues(spec: GraphSpec) -> list[tuple[GraphNode, dict[str, Any]]]:
+    """口径卡上游取数节点里写坏了的取数 SQL：(取数节点, 问题)，每个节点最多一条。
+
+    取数 SQL 里的 ROUND、COALESCE(…, 0) 让未取整的查询永远认不成等价（ledger/match 只认规范化后完全相同），
+    取整、缺省值应当交给口径卡。定义来自上游的卡（caliber_from）不在本图，跳过；调用工具节点照 ledger/match
+    的认法：工具名以 QUERY_PREFIX 开头、SQL 里没有「{{」运行时模板。
+    """
+    from app.data.caliber_lint import issues_for_sql
+    from app.tools.datasource import QUERY_PREFIX
+
+    out: list[tuple[GraphNode, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for card in spec.nodes:
+        if card.type != NodeType.METRICS or card.config.get("caliber_from") not in (None, "", {}):
+            continue
+        for _, feeder in _caliber_inputs(card, spec):
+            if feeder.id in seen:
+                continue
+            seen.add(feeder.id)
+            if feeder.type != NodeType.TOOL:
+                continue
+            cfg = feeder.config
+            args = cfg.get("args")
+            sql = args.get("sql") if isinstance(args, Mapping) else None
+            if not str(cfg.get("tool") or "").startswith(QUERY_PREFIX):
+                continue
+            if not isinstance(sql, str) or not sql.strip() or "{{" in sql:
+                continue
+            found = issues_for_sql(sql)
+            if found:
+                out.append((feeder, found[0]))
     return out
 
 
@@ -1745,6 +1997,9 @@ def evidence_issues(spec: GraphSpec) -> list[ValidationIssue]:
                     "无法追溯出处。负责取数的代码节点请将「证据角色」设为「取数」；业务计算请移到口径卡的表达式中",
                     node, f"metrics[{i}].expression",
                     code="evidence.caliber_compute_input")
+    for feeder, problem in caliber_sql_issues(spec):
+        add(f"取数节点「{feeder.title}」：{problem['message']}（{problem['excerpt']}）",
+            feeder, "args.sql", code=problem["code"])
     return out
 
 
@@ -1785,6 +2040,16 @@ def _caliber_from_issues(node: GraphNode, policies: set[str], labels: dict[str, 
                 elif new not in upstream:
                     add(f"「{field_label('caliber_from')}」改名后的取数节点「{nodes[new].title}」不在口径卡的上游：口径卡计算时"
                         "它还没有执行。请把它连到口径卡之前", "caliber_from.nodes")
+    # K08：可选指标选择（caliber_from.metrics）。这里只看形状——钉住那一版的指标清单不在本图里，具体有没有这个指标
+    # 由运行时按那一版判（未知、空的选择运行时响亮失败，绝不退回整卡）
+    selection = ref.get("metrics")
+    if selection is not None:
+        if isinstance(selection, (str, bytes)) or not isinstance(selection, list) \
+                or any(not isinstance(m, str) or not m.strip() for m in selection):
+            add(f"「{field_label('caliber_from')}」的指标选择（metrics）要写成一串指标 id", "caliber_from.metrics")
+        elif not selection:
+            add(f"「{field_label('caliber_from')}」的指标选择（metrics）是空的：一个指标也不选。不写表示按整卡算，"
+                "要选就点名要算的指标", "caliber_from.metrics")
     if cfg.get("metrics"):
         add(f"已设置「{field_label('caliber_from')}」，将按所引用的口径卡计算，此处填写的「{field_label('metrics')}」"
             "不会生效", "metrics", level="warning")

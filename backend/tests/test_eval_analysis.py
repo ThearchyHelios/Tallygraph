@@ -368,7 +368,12 @@ async def test_an_estimate_that_cannot_be_computed_still_marks_the_calls_unprice
     async def no_estimate(*args, **kwargs):
         return None
 
+    async def no_sources(*args, **kwargs):
+        return []
+
     monkeypatch.setattr(runner, "estimate", no_estimate)
+    # 这道反问题只验证记账；不把其他测试留下的数据源纳入目录快照，以免先触发数据源数量上限。
+    monkeypatch.setattr(runner.EvalExecution, "_sources", no_sources)
     before = await eval_spend.daily()
     suite_id = await es.make_suite("none", cases=[{"question": "问 1", "expectations": [{"kind": "ask"}]}],
                                    budget={"max_parallel": 1})

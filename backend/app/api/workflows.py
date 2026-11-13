@@ -29,6 +29,8 @@ _GONE = "工作流不存在，可能已被删除"
 WORKFLOW_IN_USE = "workflow_in_use"
 #: 受管级发布、版本退役只给管理员（Q8）
 ADMIN_ONLY = "admin_only"
+#: 把已接管资产（口径卡）的接管标记改掉被拒（K02/K07）：那会同时丢掉改图的并发保护和发布依据的严格性
+PROTECTED_ASSET = "protected_asset"
 _LEVELS = ("published", "governed")
 _BAD_LEVEL = "发布级别只能是「已发布」或「受管」"
 #: 剩下的挡住发布的只有模型接入的问题、人又要交给助手时的说明：换成哪个接入要人拿主意，助手处理不了。发布弹窗里
@@ -65,6 +67,8 @@ class WorkflowPatch(BaseModel):
     graph: dict[str, Any] | None = None
     tags: list[str] | None = None
     note: str = ""
+    #: 客户端读到的 Workflow.version（K02 的乐观锁）：画布每次都带，已接管的资产（文档起草的口径卡）改图时必须带
+    expected_revision: int | None = Field(default=None, ge=1)
 
 
 class WorkflowOut(BaseModel):
@@ -100,14 +104,29 @@ async def _published_levels(session: AsyncSession, ids: list[str] | None = None)
 
 
 async def _same_as_published(session: AsyncSession, ids: list[str] | None = None) -> set[str]:
-    """画布这一版（Workflow.version）的图哈希和当前发布版相同的工作流 id。两边哈希都记着才比，不在前端比图。"""
+    """当前图与发布版执行内容相同；仅移动节点不算业务逻辑变化。旧封存哈希不改写。"""
+    from app.core.artifact_store import execution_hash
+
     current, published = aliased(WorkflowVersion), aliased(WorkflowVersion)
     stmt = select(Workflow.id, current.graph_hash, published.graph_hash).join(
         current, (current.workflow_id == Workflow.id) & (current.version == Workflow.version)).join(
         published, (published.workflow_id == Workflow.id) & (published.version == Workflow.published_version))
     if ids is not None:
         stmt = stmt.where(Workflow.id.in_(ids))
-    return {wid for wid, mine, theirs in (await session.execute(stmt)).all() if mine and mine == theirs}
+    rows = (await session.execute(stmt)).all()
+    same = {wid for wid, mine, theirs in rows if mine and mine == theirs}
+    changed = [wid for wid, _, _ in rows if wid not in same]
+    if not changed:
+        return same
+    # 常见的未改动版本直接用已存哈希；只有哈希不同的候选才读取图，避免列表每次反序列化全部发布图。
+    graphs = stmt.with_only_columns(Workflow.id, current.graph, published.graph).where(Workflow.id.in_(changed))
+    for wid, mine, theirs in (await session.execute(graphs)).all():
+        try:
+            if mine and theirs and execution_hash(mine) == execution_hash(theirs):
+                same.add(wid)
+        except (TypeError, ValueError):
+            continue  # 不能解析的历史图不宣称执行一致
+    return same
 
 
 async def _run_counts(session: AsyncSession, ids: list[str] | None = None) -> dict[str, int]:
@@ -230,6 +249,20 @@ async def _checked_name(session: AsyncSession, workflow: Workflow, given: str) -
     return name
 
 
+def _still_taken_over(workflow: Workflow, tags: list[str] | None) -> bool:
+    """换了这份标签之后还算不算「已接管」（K02/K07 的同一个标记）：origin 里记着文档起草的一直算；只靠标签认的
+    （从草稿接上一次运行建出来的那类）看新标签里还留着没有。tags 没给（这次不动它）按现在的算。
+
+    标记本身只在 apps/versions.taken_over 一处认，这里只是把「换了标签之后」的那份状态喂给它，不另抄一份规则。
+    """
+    from types import SimpleNamespace
+
+    from app.apps.versions import taken_over
+
+    return taken_over(SimpleNamespace(origin=getattr(workflow, "origin", None),
+                                      tags=getattr(workflow, "tags", None) if tags is None else list(tags)))
+
+
 @router.patch("/{workflow_id}", response_model=WorkflowOut)
 async def update_workflow(
     workflow_id: str, payload: WorkflowPatch, session: AsyncSession = Depends(get_session)
@@ -243,25 +276,33 @@ async def update_workflow(
     if payload.description is not None:
         workflow.description = payload.description
     if payload.tags is not None:
+        # 已接管的资产（文档起草的口径卡）不能靠改标签把自己降成普通工作流：K02 的并发保护、K07 的发布依据严格性都
+        # 认这同一个标记，清掉它等于一次请求同时关掉两道保护（别的入口绕不过去的话就没有意义了）。加的标签照旧收，
+        # 只有「原来算接管、换完不算了」才拒；普通工作流一条不受影响
+        from app.apps.versions import taken_over
+
+        if taken_over(workflow) and not _still_taken_over(workflow, payload.tags):
+            raise CodedHTTPException(
+                409, f"「{workflow.name}」已经接管到工作流上（现在是 v{workflow.version}）：不能靠改标签把它降成普通"
+                     "工作流。那会同时丢掉改图的并发保护和发布依据的严格性，已经发布的那些版本也不再按发布依据核对。"
+                     "标签可以照常增改，但这一项标记要留着", PROTECTED_ASSET,
+                extra={"current_version": workflow.version, "tags": [str(t) for t in workflow.tags or []]})
         workflow.tags = payload.tags
-    if payload.graph is not None and payload.graph != workflow.graph:
-        # 图有实际变化才留快照，避免改个名字就堆一堆版本
-        workflow.graph = payload.graph
-        workflow.version += 1
-        session.add(
-            WorkflowVersion(
-                workflow_id=workflow.id,
-                version=workflow.version,
-                graph=payload.graph,
-                graph_hash=graph_hash(payload.graph),
-                note=payload.note,
-            )
-        )
-        # status 说的是**当前画布**的状态，不是"这个工作流曾经发布过"。
-        # 改完图还挂着 governed，界面上就会显示一张从未过闸的图是受管模板——
-        # 已发布的那一版仍由 published_version 指着，formal 运行不受影响。
-        if workflow.status in ("published", "governed"):
-            workflow.status = "draft"
+    if payload.graph is not None:
+        from app.apps.versions import (REVISION_REQUIRED, STALE_REVISION, WorkflowChanged, save_graph,
+                                       taken_over)
+
+        if taken_over(workflow) and payload.expected_revision is None:
+            raise CodedHTTPException(
+                409, f"这份口径已经接管到工作流上（现在是 v{workflow.version}）：改图要带上你读到的版本"
+                     "（expected_revision），请刷新页面后再改", REVISION_REQUIRED,
+                extra={"current_version": workflow.version})
+        try:
+            await save_graph(session, workflow, payload.graph, note=payload.note,
+                             expected_revision=payload.expected_revision)
+        except WorkflowChanged as e:
+            raise CodedHTTPException(409, str(e), STALE_REVISION,
+                                     extra={"current_version": getattr(e, "current", workflow.version)}) from None
     await session.commit()
     await session.refresh(workflow)
     return await _workflow_out(session, workflow)
@@ -382,6 +423,9 @@ class VersionDetailOut(VersionOut):
     input_schema: dict[str, Any] = Field(default_factory=dict)
     #: 账本（L4）：固定这一版的应用、生效记录数、正式运行数
     usage: dict[str, Any] = Field(default_factory=dict)
+    #: 发布依据（K07）：这一版最近一次发布留下的清单 {id, manifest, level, at, actor, proven, problems}。
+    #: 加发布清单这一机制之前发布的版本为 null（老资产）
+    publication: dict[str, Any] | None = None
 
 
 @router.get("/{workflow_id}/versions/{version}", response_model=VersionDetailOut)
@@ -412,8 +456,10 @@ async def get_version(
                 if isinstance(f, dict)
             )
     from app.apps.forms import input_schema
+    from app.apps.publications import basis_rows, latest as latest_publication
     from app.apps.versions import usage
 
+    event = await latest_publication(session, workflow_id, snapshot.version)
     return VersionDetailOut(
         id=snapshot.id, version=snapshot.version, note=snapshot.note,
         created_at=snapshot.created_at, workflow_id=workflow_id, graph=graph,
@@ -426,6 +472,10 @@ async def get_version(
         input_schema=input_schema(fields), published_at=snapshot.published_at, published_by=snapshot.published_by,
         retired_at=snapshot.retired_at, retired_by=snapshot.retired_by, retire_note=snapshot.retire_note,
         usage=await usage(session, workflow_id, snapshot.version),
+        publication=({"id": event.id, "manifest": event.manifest, "level": event.level,
+                      "at": event.created_at.isoformat() if event.created_at else None, "actor": event.actor,
+                      "proven": bool(event.proven), "problems": basis_rows(event.cards)}
+                     if event is not None else None),
     )
 
 
@@ -459,10 +509,27 @@ def _require_admin(what: str) -> None:
         raise CodedHTTPException(403, f"{what}需要管理员权限", ADMIN_ONLY)
 
 
+class RestoreIn(BaseModel):
+    """回滚旧版本要带基准版本（K02）：和画布保存、草稿改口径同一条并发规矩，已接管的资产必须给。"""
+
+    expected_revision: int | None = Field(default=None, ge=1)
+
+
 @router.post("/{workflow_id}/versions/{version}/restore", response_model=WorkflowOut)
 async def restore_version(
-    workflow_id: str, version: int, session: AsyncSession = Depends(get_session)
+    workflow_id: str, version: int, payload: RestoreIn | None = None,
+    session: AsyncSession = Depends(get_session)
 ) -> WorkflowOut:
+    """回滚到某一版：在当前图上换成它的图、新增一版（旧版一条不动）。
+
+    和保存同一条 CAS 规矩（app/apps/versions.append_version）：带 expected_revision 就先核对，另一处已经先提交了
+    新版本也是 409 stale_revision（带 current_version），不会把别人刚改的图盖掉。已接管的资产（文档起草的口径卡）
+    必须给基准版本，缺了回 409 revision_required——老页面不能靠这个入口绕过并发保护。恢复旧版也是改图，和 PATCH
+    同一条规矩：旧图没过这次的闸，不能挂着受管 / 已发布。
+    """
+    from app.apps.versions import (REVISION_REQUIRED, STALE_REVISION, WorkflowChanged, append_version,
+                                   taken_over)
+
     workflow = await session.get(Workflow, workflow_id)
     if not workflow:
         raise HTTPException(404, _GONE)
@@ -477,20 +544,18 @@ async def restore_version(
     if not snapshot:
         raise HTTPException(404, f"不存在 v{version} 版本")
 
-    workflow.graph = snapshot.graph
-    workflow.version += 1
-    session.add(
-        WorkflowVersion(
-            workflow_id=workflow.id,
-            version=workflow.version,
-            graph=snapshot.graph,
-            graph_hash=graph_hash(snapshot.graph),
-            note=f"回滚到 v{version}",
-        )
-    )
-    # 恢复旧版也是改图，和 PATCH 同一条规矩：旧图没过这次的闸，不能挂着受管 / 已发布
-    if workflow.status in ("published", "governed"):
-        workflow.status = "draft"
+    expected = payload.expected_revision if payload is not None else None
+    if taken_over(workflow) and expected is None:
+        raise CodedHTTPException(
+            409, f"这份口径已经接管到工作流上（现在是 v{workflow.version}）：回滚要带上你读到的版本"
+                 "（expected_revision），请刷新页面后再做", REVISION_REQUIRED,
+            extra={"current_version": workflow.version})
+    try:
+        await append_version(session, workflow, snapshot.graph, note=f"回滚到 v{version}",
+                             expected_revision=expected, digest=graph_hash(snapshot.graph))
+    except WorkflowChanged as e:
+        raise CodedHTTPException(409, str(e), STALE_REVISION,
+                                 extra={"current_version": getattr(e, "current", workflow.version)}) from None
     await session.commit()
     await session.refresh(workflow)
     return await _workflow_out(session, workflow)
@@ -537,7 +602,7 @@ async def publish_workflow(
     if not snapshot:
         raise HTTPException(404, f"不存在 v{version} 版本：画布上的修改还没有保存，请先保存再发布")
 
-    issues = await gate_issues(session, snapshot.graph, payload.level)
+    issues = await gate_issues(session, snapshot.graph, payload.level, workflow_id=workflow_id)
     if issues is None:
         return {"ok": False, "issues": [{"level": "error", "message": _unparsed(snapshot.graph)}]}
     if any(i["level"] == "error" for i in issues):
@@ -560,39 +625,42 @@ def _unparsed(graph: Any) -> str:
     return "无法解析工作流结构"
 
 
-async def gate_issues(session: AsyncSession, graph: Any, level: str) -> list[dict[str, Any]] | None:
-    """发布这张图会遇到的问题（validate + 门禁），只读：不改库、不发布。图不成形时为 None。
-    发布接口和发布单的预检（blueprints/publish_plan.py）共用，口径只有这一份。"""
-    try:
-        spec = GraphSpec.model_validate(graph)
-    except Exception:  # noqa: BLE001
-        return None
-    checkers = await _sql_checkers(session, spec)
-    providers = await _providers(session, spec)
-    with with_subgraphs(await load_subgraphs(session, spec)):
-        issues = [i.model_dump() for i in publish_issues(spec, level=level, checkers=checkers, providers=providers)]
-    # 这一版直接引用的表上还没处理的结构变化（next-round 03 B1）：只是警告，不拦发布
-    return issues + await open_structure_issues(session, spec)
+# 保留导出供旧调用方使用，发布预检的实现位于应用服务。
+from app.apps.validation import gate_issues
 
 
 async def commit_publish(session: AsyncSession, workflow: Workflow, snapshot: WorkflowVersion, level: str,
                          actor: str | None) -> dict[str, Any]:
-    """把这一版立为正式版本并提交（调用方先过了 gate_issues、权限）。发布接口和发布单共用。"""
+    """把这一版立为正式版本并提交（调用方先过了 gate_issues、权限）。发布接口和发布单共用。
+
+    **发布只有一个入口**（K07）：这里追加一行不可变的发布事件、落一份内容寻址的清单工件，记下这一版按什么依据发布。
+    重发旧版产生新事件，旧事件和旧清单一个字不改；版本行上这几列发布元数据是最新投影。既有门禁与 HTTP 语义不变。
+    """
     # 发布时用到的能力的治理版本（F5）。在改这一版之前取：能力登记缺了的要另开会话同步、提交，这个会话手里不能先有写
+    from app.apps import publications
     from app.capabilities.registry import capability_versions_for
     from app.db.base import utcnow
     from app.engine.launch import graph_tool_names
 
     spec = GraphSpec.model_validate(snapshot.graph)
     capabilities = await capability_versions_for(session, graph_tool_names(snapshot.graph))
+    # 发布时的目录版本、表的结构版本（next-round 03 B1）：也是这一版图上的读取，先算好
+    catalog = await catalog_versions_for(session, spec)
+    schema = await schema_versions_for(session, spec)
+    # 发布依据（K07）：清单工件由另一个会话按内容寻址写下，所以必须在改这一版之前做（上面那句注释同一个道理，
+    # 这个会话手里先有未提交的写的话，两个会话会抢同一把写锁）。清单内容只由这一版不可变的图 + 引用的记录决定。
+    publication = await publications.publish(
+        session, workflow=workflow, snapshot=snapshot, level=level, actor=actor,
+        observed=await publications.observe(session, workflow=workflow, snapshot=snapshot, catalog=catalog,
+                                            schema=schema, capabilities=capabilities))
     if not snapshot.graph_hash:
         snapshot.graph_hash = graph_hash(snapshot.graph)
     # 级别记在这一版上：之后改画布（status 退回 draft），从这一版发起的正式运行照样按发布时的级别出具
     snapshot.level = level
     # 发布时的目录版本也记在这一版上：重新发布同一版等于按现在的目录重新认可它，跟着更新
-    snapshot.catalog_versions = await catalog_versions_for(session, spec)
-    # 表的结构版本同理（next-round 03 B1）：正式运行发起时和现在的比，变了写 schema.drift，只提醒、不拦
-    snapshot.schema_versions = await schema_versions_for(session, spec)
+    snapshot.catalog_versions = catalog
+    # 表的结构版本同理：正式运行发起时和现在的比，变了写 schema.drift，只提醒、不拦
+    snapshot.schema_versions = schema
     # 发布人、发布时间、用到的能力版本也记在这一版上（F5）：工作流上的 published_by 只记最近一次。退役过的版本重新
     # 发布等于重新认可它，退役信息清掉
     snapshot.published_at = utcnow()
@@ -602,6 +670,7 @@ async def commit_publish(session: AsyncSession, workflow: Workflow, snapshot: Wo
     workflow.status = level
     workflow.published_version = snapshot.version
     workflow.published_by = actor
+    # 发布事件和版本行上的最新投影同一个事务提交：发布这一步没提交，事件也不会落（「发布失败无事件」）
     await session.commit()
     # 口径账本（next-round 02 做法 8）：从问数据固化出的口径发布了，来源运行在后台按它补比一次（不挡发布）
     from app.ledger import recall as ledger_recall
@@ -617,6 +686,11 @@ async def commit_publish(session: AsyncSession, workflow: Workflow, snapshot: Wo
         "graph_hash": snapshot.graph_hash,
         "published_by": workflow.published_by,
         "catalog_versions": recorded_versions(snapshot.catalog_versions),
+        # K07：这一次发布实际留下的发布依据。旧键一个不动，下面这几项是新增的
+        "publication": {"id": publication["id"], "manifest": publication["manifest"], "format": publication["format"],
+                        "proven": publication["proven"], "required": publication["required"],
+                        "problems": publication["problems"], "cards": publication["cards"]},
+        "manifest": publication["manifest"],
     }
 
 
