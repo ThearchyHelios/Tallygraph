@@ -420,18 +420,18 @@ export function MetricEditorModal({
 
         <div className="grid gap-3 sm:grid-cols-2">
           <Field label="指标中文名称" required>
-            <input className="input w-full" value={name} onChange={(e) => setName(e.target.value)}
+            <input className="field w-full" value={name} onChange={(e) => setName(e.target.value)}
                    placeholder="例如：设备综合效率 OEE（跨表精算）" />
           </Field>
           <Field label="唯一英文标识" required hint="小写字母、数字与下划线，供问数工具调用">
-            <input className="input mono w-full" value={key} onChange={(e) => setKey(e.target.value)}
+            <input className="field mono w-full" value={key} onChange={(e) => setKey(e.target.value)}
                    placeholder="例如：oee_multi_table" />
           </Field>
         </div>
 
         <div className="grid gap-3 sm:grid-cols-3">
           <Field label="所属数据源" required>
-            <select className="input w-full" value={sourceId} onChange={(e) => { setSourceId(e.target.value); setTableName('') }}>
+            <select className="field w-full" value={sourceId} onChange={(e) => { setSourceId(e.target.value); setTableName('') }}>
               <option value="">请选择数据源</option>
               {sources.map((s) => (
                 <option key={s.id} value={s.id}>{s.name}</option>
@@ -441,19 +441,19 @@ export function MetricEditorModal({
           <Field label={isTemplate ? '主事实表（可选锚点）' : '物理表名'} required={!isTemplate}
                  hint={isTemplate ? '留空时自动从模板首张物理表识别' : undefined}>
             {tables.length > 0 ? (
-              <select className="input mono w-full" value={tableName} onChange={(e) => setTableName(e.target.value)}>
+              <select className="field mono w-full" value={tableName} onChange={(e) => setTableName(e.target.value)}>
                 <option value="">{isTemplate ? '（自动识别主物理表）' : '请选择物理表'}</option>
                 {tables.map((t) => (
                   <option key={t} value={t}>{t}</option>
                 ))}
               </select>
             ) : (
-              <input className="input mono w-full" value={tableName} onChange={(e) => setTableName(e.target.value)}
+              <input className="field mono w-full" value={tableName} onChange={(e) => setTableName(e.target.value)}
                      placeholder="物理表名" />
             )}
           </Field>
           <Field label="单位">
-            <input className="input w-full" value={unit} onChange={(e) => setUnit(e.target.value)}
+            <input className="field w-full" value={unit} onChange={(e) => setUnit(e.target.value)}
                    placeholder="例如：% / 秒 / 人次 / 元" />
           </Field>
         </div>
@@ -466,7 +466,7 @@ export function MetricEditorModal({
 
         {!isTemplate ? (
           <Field label="聚合 SQL 表达式" required hint="单表聚合表达式（禁止嵌套查询），点击下方列名可快速填入 SUM(列名)">
-            <input className="input mono w-full" value={sqlExpression} onChange={(e) => setSqlExpression(e.target.value)}
+            <input className="field mono w-full" value={sqlExpression} onChange={(e) => setSqlExpression(e.target.value)}
                    placeholder="例如：SUM(paid_amount) 或 ROUND(SUM(good_qty) * 100.0 / NULLIF(SUM(total_qty), 0), 2)" />
             {columns.length > 0 && (
               <div className="mt-1.5 flex max-h-20 flex-wrap gap-1 overflow-y-auto">
@@ -510,7 +510,7 @@ export function MetricEditorModal({
               ref={tplRef}
               rows={8}
               data-metric-sql-template=""
-              className="input mono w-full resize-y py-2 text-xs leading-relaxed"
+              className="field mono w-full resize-y py-2 text-xs leading-relaxed"
               value={sqlTemplate}
               onChange={(e) => setSqlTemplate(e.target.value)}
               placeholder={'WITH cf AS (\n  SELECT prod_code, AVG(conv_factor) AS conv_factor FROM dim_carrier_factor GROUP BY prod_code\n)\nSELECT\n  {{select_dims}}\n  ROUND(SUM(s.good_qty * COALESCE(cf.conv_factor, 0.5)) * 100.0 / NULLIF(SUM(s.total_qty), 0), 2) AS oee_val\nFROM mes_shift_daily s\nLEFT JOIN cf ON cf.prod_code = s.prod_code\nWHERE 1=1 {{and_where}}\n{{group_by}}\n{{order_by}}'}
@@ -521,23 +521,23 @@ export function MetricEditorModal({
         <div className="grid gap-3 sm:grid-cols-3">
           <Field label="业务时间列" hint={isTemplate ? '多表请带主表别名前缀，如 s.stat_date' : '用于按日期筛选与趋势分组'}>
             {!isTemplate && columns.length > 0 ? (
-              <select className="input mono w-full" value={dateColumn} onChange={(e) => setDateColumn(e.target.value)}>
+              <select className="field mono w-full" value={dateColumn} onChange={(e) => setDateColumn(e.target.value)}>
                 <option value="">（无时间列）</option>
                 {columns.map((c) => (
                   <option key={c.name} value={c.name}>{c.name}{c.label ? `（${c.label}）` : ''}</option>
                 ))}
               </select>
             ) : (
-              <input className="input mono w-full" value={dateColumn} onChange={(e) => setDateColumn(e.target.value)}
+              <input className="field mono w-full" value={dateColumn} onChange={(e) => setDateColumn(e.target.value)}
                      placeholder={isTemplate ? '例如：s.stat_date' : '例如：stat_date'} />
             )}
           </Field>
           <Field label="默认有效过滤条件" hint="自动拼入 WHERE 子句">
-            <input className="input mono w-full" value={filterSql} onChange={(e) => setFilterSql(e.target.value)}
+            <input className="field mono w-full" value={filterSql} onChange={(e) => setFilterSql(e.target.value)}
                    placeholder={isTemplate ? '例如：s.is_deleted = 0' : '例如：status = 1 AND is_deleted = 0'} />
           </Field>
           <Field label="默认时间粒度">
-            <select className="input w-full" value={defaultTimeGrain} onChange={(e) => setDefaultTimeGrain(e.target.value)}>
+            <select className="field w-full" value={defaultTimeGrain} onChange={(e) => setDefaultTimeGrain(e.target.value)}>
               <option value="day">按日（day）</option>
               <option value="month">按月（month）</option>
               <option value="hour">按小时（hour）</option>
@@ -547,11 +547,11 @@ export function MetricEditorModal({
 
         <div className="grid gap-3 sm:grid-cols-2">
           <Field label="口语别名（顿号或逗号分隔）" hint="帮助问数快速直查毫秒级命中，如：OEE、综合效率">
-            <input className="input w-full" value={aliasesText} onChange={(e) => setAliasesText(e.target.value)}
+            <input className="field w-full" value={aliasesText} onChange={(e) => setAliasesText(e.target.value)}
                    placeholder="例如：OEE、设备综合效率、跨表OEE" />
           </Field>
           <Field label="业务口径说明与判异提示" hint="统计范围、兜底系数、物理红线等说明">
-            <input className="input w-full" value={description} onChange={(e) => setDescription(e.target.value)}
+            <input className="field w-full" value={description} onChange={(e) => setDescription(e.target.value)}
                    placeholder="例如：无模具系数时按 0.5 兜底；超过 200% 视为异常数据" />
           </Field>
         </div>
@@ -575,12 +575,12 @@ export function MetricEditorModal({
             <div className="space-y-1.5">
               {dimensions.map((dim, idx) => (
                 <div key={idx} className="grid grid-cols-12 items-center gap-1.5">
-                  <input className="input mono col-span-3 text-xs" placeholder="维度键（如 line_code）" value={dim.key}
+                  <input className="field mono col-span-3 text-xs" placeholder="维度键（如 line_code）" value={dim.key}
                          onChange={(e) => setDimensions((ds) => ds.map((x, i) => (i === idx ? { ...x, key: e.target.value } : x)))} />
-                  <input className="input col-span-3 text-xs" placeholder="中文名（如 产线）" value={dim.label}
+                  <input className="field col-span-3 text-xs" placeholder="中文名（如 产线）" value={dim.label}
                          onChange={(e) => setDimensions((ds) => ds.map((x, i) => (i === idx ? { ...x, label: e.target.value } : x)))} />
                   {!isTemplate && columns.length > 0 ? (
-                    <select className="input mono col-span-3 text-xs" value={dim.column}
+                    <select className="field mono col-span-3 text-xs" value={dim.column}
                             onChange={(e) => setDimensions((ds) => ds.map((x, i) => (i === idx ? { ...x, column: e.target.value } : x)))}>
                       <option value="">选择物理列</option>
                       {columns.map((c) => (
@@ -588,10 +588,10 @@ export function MetricEditorModal({
                       ))}
                     </select>
                   ) : (
-                    <input className="input mono col-span-3 text-xs" placeholder={isTemplate ? 's.line_code' : '物理列名'} value={dim.column}
+                    <input className="field mono col-span-3 text-xs" placeholder={isTemplate ? 's.line_code' : '物理列名'} value={dim.column}
                            onChange={(e) => setDimensions((ds) => ds.map((x, i) => (i === idx ? { ...x, column: e.target.value } : x)))} />
                   )}
-                  <select className="input col-span-2 text-xs" value={dim.entity_key ?? ''}
+                  <select className="field col-span-2 text-xs" value={dim.entity_key ?? ''}
                           title="关联标准业务实体后，按名称筛选将自动转换为该数据源物理编码"
                           onChange={(e) => setDimensions((ds) => ds.map((x, i) => (i === idx ? { ...x, entity_key: e.target.value } : x)))}>
                     <option value="">无关联实体</option>
@@ -1249,7 +1249,7 @@ export function MetricSuggestModal({
 
             <div className="grid gap-3 sm:grid-cols-2">
               <Field label="目标数据源" required>
-                <select className="input w-full" value={sourceId} onChange={(e) => setSourceId(e.target.value)}>
+                <select className="field w-full" value={sourceId} onChange={(e) => setSourceId(e.target.value)}>
                   <option value="">请选择数据源</option>
                   {sources.map((s) => (
                     <option key={s.id} value={s.id}>{s.name}</option>
@@ -1257,7 +1257,7 @@ export function MetricSuggestModal({
                 </select>
               </Field>
               <Field label="补充拆解要求（可选）">
-                <input className="input w-full" value={note} onChange={(e) => setNote(e.target.value)}
+                <input className="field w-full" value={note} onChange={(e) => setNote(e.target.value)}
                        placeholder="例如：重点拆解 OEE 与 TEEP 跨表精算公式及产线维度" />
               </Field>
             </div>
@@ -1291,7 +1291,7 @@ export function MetricSuggestModal({
               {docMode === 'paste' && (
                 <div className="space-y-2 pt-1">
                   <input
-                    className="input w-full text-xs"
+                    className="field w-full text-xs"
                     value={docTitle}
                     onChange={(e) => setDocTitle(e.target.value)}
                     placeholder="文档标题（可选，留空时自动取首行标题，如：TEEP / OEE 及相关指标公式总表）"
@@ -1299,7 +1299,7 @@ export function MetricSuggestModal({
                   <textarea
                     rows={7}
                     data-decompose-paste-input=""
-                    className="input mono w-full resize-y py-2 text-xs leading-relaxed"
+                    className="field mono w-full resize-y py-2 text-xs leading-relaxed"
                     value={docText}
                     onChange={(e) => setDocText(e.target.value)}
                     placeholder="在此直接粘贴业务指标口径文档（支持 Markdown 表格、字段符号对照、跨表公式与判异红线说明）…"
@@ -1696,12 +1696,14 @@ export function SemanticMetricCardsSection({
 
                 <div className="flex flex-wrap items-end gap-2 rounded-md border bg-elev p-2.5">
                   <div>
-                    <label className="mb-0.5 block text-[11px] text-faint">起始日期（可选）</label>
-                    <input type="date" className="input text-xs" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
+                    <label className="mb-0.5 block text-[11px] text-faint">起始日期（可选）
+                      <input type="date" className="field mt-0.5 block text-xs" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
+                    </label>
                   </div>
                   <div>
-                    <label className="mb-0.5 block text-[11px] text-faint">结束日期（可选）</label>
-                    <input type="date" className="input text-xs" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
+                    <label className="mb-0.5 block text-[11px] text-faint">结束日期（可选）
+                      <input type="date" className="field mt-0.5 block text-xs" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
+                    </label>
                   </div>
                   {m.date_column && (
                     <label className="flex cursor-pointer items-center gap-1.5 pb-1.5 text-xs text-dim">

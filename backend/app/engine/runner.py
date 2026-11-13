@@ -107,9 +107,14 @@ class RunManager:
             # 接下来各处都按 last_seq 接号：本模块的几处另外兜了底，按需裁判记判定（api/evidence.py 的
             # _append_judged）没有，不改正的话它重启后第一次追加就撞上已有的序号。有 (run_id, seq) 索引，
             # 每次运行一次索引查找。updated_at 不动：这是补记录，不是运行有了变化
+            from sqlalchemy import exists
+
             latest = select(func.max(RunEvent.seq)).where(RunEvent.run_id == Run.id).scalar_subquery()
+            lagging = exists(
+                select(1).where(RunEvent.run_id == Run.id, RunEvent.seq > func.coalesce(Run.last_seq, 0))
+            )
             await session.execute(
-                update(Run).where(func.coalesce(Run.last_seq, 0) < latest)
+                update(Run).where(lagging)
                 .values(last_seq=latest, updated_at=Run.updated_at)
                 .execution_options(synchronize_session=False))
             await session.commit()
@@ -195,6 +200,8 @@ class RunManager:
         if self._cm is not None:
             with contextlib.suppress(Exception):
                 await self._cm.__aexit__(None, None, None)
+            self._cm = None
+            self._checkpointer = None
 
     @property
     def checkpointer(self) -> BaseCheckpointSaver:

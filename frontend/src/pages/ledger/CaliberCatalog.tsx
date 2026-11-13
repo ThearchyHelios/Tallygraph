@@ -230,7 +230,7 @@ export function CaliberCatalog() {
             </div>
             <label className="relative min-w-[240px] flex-1 sm:max-w-sm">
               <Search size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" aria-hidden />
-              <input className="input w-full pl-8" value={query} onChange={(e) => setQuery(e.target.value)}
+              <input className="field w-full pl-8" value={query} onChange={(e) => setQuery(e.target.value)}
                      placeholder="按指标名、标识、物理表或工作流查找" aria-label="查找口径" />
             </label>
           </div>

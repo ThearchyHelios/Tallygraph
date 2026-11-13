@@ -52,13 +52,13 @@ import {
   readFileSync, readdirSync, rmSync, writeFileSync,
 } from 'node:fs'
 import { createServer } from 'node:net'
-import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
+import { resolveChrome, resolvePython } from './lib/env.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
-const SYSTEM_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+const SYSTEM_CHROME = resolveChrome()
 
 // 先跑快的、不开浏览器的，再按页面从外壳往里跑；最后是连真数据的两项
 const ORDER = [
@@ -189,8 +189,8 @@ if (unknown.length) {
   process.exit(2)
 }
 const names = picked.length ? ORDER.filter((n) => picked.includes(n)) : ORDER
-// 纯静态的几项不用起服务
-const STATIC = new Set(['tokens', 'copy'])
+// 纯静态或内存转译单测项不用起前后端服务
+const STATIC = new Set(['tokens', 'copy', 'trace', 'decode'])
 const needsServers = names.some((n) => !STATIC.has(n))
 
 // ---------------------------------------------------------------- 收尾
@@ -421,11 +421,11 @@ async function warmUp(stacks) {
 let stacks = []
 if (stackCount > 0 && needsServers) {
   const dataSrc = process.env.CHECK_DATA_SRC && resolve(process.env.CHECK_DATA_SRC)
-  const python = process.env.CHECK_PYTHON ?? join(homedir(), 'miniforge3', 'envs', 'agentlab', 'bin', 'python')
+  const python = resolvePython({ requireBackend: true })
   const problems = []
   if (!dataSrc) problems.push('--stacks 要知道拿哪份数据：用 CHECK_DATA_SRC=<数据目录> 指定（里面有 agentlab.db 的那一层）')
   else if (!existsSync(join(dataSrc, 'agentlab.db'))) problems.push(`CHECK_DATA_SRC=${dataSrc} 里没有 agentlab.db`)
-  if (!existsSync(python)) problems.push(`找不到后端解释器 ${python}，用 CHECK_PYTHON 指定`)
+  if (!python) problems.push('找不到可用的后端 Python 解释器，请用 CHECK_PYTHON 指定')
   if (problems.length) {
     for (const p of problems) console.error(`✗ ${p}`)
     process.exit(2)

@@ -399,13 +399,12 @@ async def _metrics_from(sealed_run_id: str, *, card_id: str, metric_ids: Sequenc
     的时候，这里绝不能把值交出去。交回 (类型化指标, 原始指标)，原始那一份给质量报告用。
 
     memo 是这一次收尾里几处共用的封存证据（见 _sealed_of）：给了就用那一份，没给就自己读一次。"""
-    from app.api.evidence import _Masks, _metric_masks
-    from app.engine.evidence_reader import metric_cards
+    from app.engine.evidence_reader import metric_cards, open_masks, resolve_metric_masks
 
     sealed = await _sealed_of(sealed_run_id, memo)
     if not sealed.trusted:
         return [], {"trusted": False}
-    masks = _Masks(sealed)
+    masks = open_masks(sealed)
     found: dict[str, dict[str, Any]] = {}
     raw: dict[str, dict[str, Any]] = {}
     for node_id, artifact, card in metric_cards(sealed):
@@ -419,7 +418,7 @@ async def _metrics_from(sealed_run_id: str, *, card_id: str, metric_ids: Sequenc
                 continue
             # 同一张卡执行过多次时按**最后一次**的产出算（和「节点最后一次产出」同一个认法），
             # 不拿早先那次的值
-            _, hidden = await _metric_masks(metric, node_id, artifact, sealed, masks, card=card)
+            _, hidden = await resolve_metric_masks(metric, node_id, artifact, sealed, masks, card=card)
             found[metric_id] = _typed_metric(metric, hidden)
             raw[metric_id] = dict(metric)
     ordered = [found[mid] for mid in metric_ids if mid in found]

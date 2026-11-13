@@ -41,7 +41,7 @@ ParentResolver = Callable[[str], AnalysisResult | None]
 #: （row_out_of_range、headline_empty）；要比的组这期没有（unknown_group、too_few_groups）；要用的那一格这期为空
 #: （empty_cell：乘积拆解的乘积、因子，差异检验的计数）
 DATA_ERRORS = frozenset({"parent_refused", "parent_key_missing", "period_not_found", "row_out_of_range",
-                         "headline_empty", "unknown_group", "too_few_groups", "empty_cell"})
+                         "headline_empty", "unknown_group", "too_few_groups", "empty_cell", "too_many_rows"})
 
 
 def _op_mode(request: Mapping[str, Any]) -> tuple[str, str | None]:

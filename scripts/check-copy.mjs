@@ -23,11 +23,11 @@
 // 确实该保留的写在 scripts/copy-allow.json：每条写明文件、原文片段、规则和理由。白名单里有一条
 // 已经对不上任何命中（原文改掉了、挪走了），也算不通过：白名单只收现在还需要的例外。
 import { spawnSync } from 'node:child_process'
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { homedir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { resolvePython } from './lib/env.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
@@ -332,8 +332,7 @@ for p, rel in files:
 print(json.dumps(out, ensure_ascii=False))
 `
 
-const PYTHON = [process.env.CHECK_PYTHON, join(homedir(), 'miniforge3/envs/agentlab/bin/python'), 'python3']
-  .find((p) => p && (p === 'python3' || existsSync(p)))
+const PYTHON = resolvePython()
 
 function backStrings(root, only = []) {
   const r = spawnSync(PYTHON, ['-c', PY_EXTRACT, root, ...only], { encoding: 'utf8', maxBuffer: 256 << 20 })

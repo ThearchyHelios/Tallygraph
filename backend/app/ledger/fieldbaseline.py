@@ -28,6 +28,7 @@ readable=false：**有引用不等于真的有基线**，也不能在读草稿�
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -397,6 +398,115 @@ def status_of(payload: Any) -> dict[str, Any]:
             "source_snapshot_artifact_id": str(ref.get("source_snapshot_artifact_id") or "")}
 
 
+def editable_cards(graph: dict[str, Any]) -> list[dict[str, str]]:
+    """图里能写的一张张口径卡：[{id, title}]，按节点出现的顺序。
+
+    能写的是源头口径卡（metrics 节点、没有 caliber_from）：转抄别处的口径卡不是权威写入源（A01），改它等于在别处
+    另存一份定义。
+    """
+    from app.apps.tree import node_map
+
+    return [{"id": node_id, "title": str(node.get("title") or node_id)}
+            for node_id, node in node_map(graph).items()
+            if node.get("type") == "metrics" and not (node.get("config") or {}).get("caliber_from")]
+
+
+def contract_card(graph: dict[str, Any]) -> str | None:
+    """下游契约声明从哪张卡取指标（metrics_from 只写了一张时就是它）：多张卡时按它认这张草稿的权威卡。"""
+    for node in graph.get("nodes") or []:
+        config = ((node or {}).get("data") or {}).get("config") if isinstance(node, dict) else None
+        contract = config.get("contract") if isinstance(config, dict) else None
+        if not isinstance(contract, dict):
+            continue
+        sources = contract.get("metrics_from")
+        ids = [sources] if isinstance(sources, str) else [s for s in sources or [] if isinstance(s, str)]
+        if len(ids) == 1:
+            return ids[0]
+    return None
+
+
+def draft_card(graph: dict[str, Any]) -> tuple[str | None, list[dict[str, str]]]:
+    """这份草稿的权威口径卡，另交回全部能写的卡。
+
+    一张能写的卡时就是它；多张时认下游契约声明的那一张——不是「第一张」。都认不出来时交回 None：写的时候必须显式
+    给 target.card_id，读的时候页面也照实列候选。
+    """
+    cards = editable_cards(graph)
+    if len(cards) == 1:
+        return cards[0]["id"], cards
+    referenced = contract_card(graph)
+    if referenced and any(card["id"] == referenced for card in cards):
+        return referenced, cards
+    return None, cards
+
+
+def graph_entry_fields(graph: dict[str, Any]) -> list[dict[str, Any]]:
+    """图里入口节点（input）的字段；草稿页和试跑用它，画布改过的入口字段不会被 payload 的旧快照盖住。"""
+    from app.apps.tree import node_map
+
+    start = next((node for node in node_map(graph).values() if node.get("type") == "input"), None)
+    return [dict(field) for field in ((start or {}).get("config") or {}).get("fields") or []
+            if isinstance(field, dict)]
+
+
+def project_graph(graph: dict[str, Any], version: int, *, card_id: str | None = None) -> dict[str, Any]:
+    """从草稿工作流的某一版图里投影出指标、入口字段、取数 SQL 与分组结构（纯函数）。"""
+    from app.apps.tree import node_map
+    from app.look.calibers import _metric_paths
+
+    nodes = node_map(graph)
+    wanted, cards = draft_card(graph)
+    wanted = card_id or wanted or (cards[0]["id"] if cards else None)
+    card = nodes.get(wanted) if wanted else None
+    metrics = [metric for metric in ((card or {}).get("config") or {}).get("metrics") or []
+               if isinstance(metric, dict) and metric.get("id")]
+    fields = graph_entry_fields(graph)
+    fetches: list[tuple[str, str]] = []
+    for node_id, node in nodes.items():
+        config = node.get("config") if isinstance(node.get("config"), dict) else {}
+        args = config.get("args") if isinstance(config.get("args"), dict) else {}
+        sql = args.get("sql") if isinstance(args, dict) else None
+        if node.get("type") == "tool" and isinstance(sql, str) and sql.strip():
+            fetches.append((str(node_id), sql))
+    groups: list[dict[str, Any]] = []
+    for node_id, sql in fetches:
+        pattern = re.compile(rf"nodes\.{re.escape(node_id)}(?![\w])")
+        ids = [str(metric["id"]) for metric in metrics
+               if any(pattern.search(path) for path in _metric_paths(metric) or [])]
+        groups.append({"sql": sql, "entry_fields": [dict(field) for field in fields], "metric_ids": ids})
+    assigned = {metric_id for group in groups for metric_id in group["metric_ids"]}
+    loose = [str(metric["id"]) for metric in metrics if str(metric["id"]) not in assigned]
+    if loose:
+        if groups:
+            groups[0]["metric_ids"].extend(loose)
+        else:
+            groups = [{"sql": "", "entry_fields": [dict(field) for field in fields], "metric_ids": loose}]
+    return {
+        "version": version,
+        "metrics": metrics,
+        "entry_fields": [dict(field) for field in fields],
+        "sql": "\n\n".join(sql for _node, sql in fetches),
+        "groups": groups,
+        "blocks": len(fetches) or 1,
+    }
+
+
+async def draft_graph_projection(session: Any, workflow: Any, version: int, *,
+                                 card_id: str | None = None) -> dict[str, Any] | None:
+    """按 workflow_id + version 读取图版本并投影草稿视图所需字段（供重导入等领域层调用，不依赖 api/ledger）。"""
+    from sqlalchemy import select
+
+    from app.db.models import WorkflowVersion
+
+    row = (await session.execute(select(WorkflowVersion).where(
+        WorkflowVersion.workflow_id == workflow.id,
+        WorkflowVersion.version == int(version)))).scalar_one_or_none()
+    if row is None or not isinstance(row.graph, dict):
+        return None
+    return project_graph(row.graph, version, card_id=card_id)
+
+
 __all__ = ["CITATIONS_FIELD", "HISTORY_KEY", "KIND", "REF_KEY", "VERSION", "accepted_card", "advance",
-           "coverage_of", "document", "field_paths", "fields_of", "history", "put_metrics", "read", "ref_of",
-           "status_of", "value_at", "values"]
+           "contract_card", "coverage_of", "document", "draft_card", "draft_graph_projection", "editable_cards",
+           "field_paths", "fields_of", "graph_entry_fields", "history", "project_graph", "put_metrics", "read",
+           "ref_of", "status_of", "value_at", "values"]

@@ -105,9 +105,9 @@ async def attach(session: Any, *, payload: dict, name: str, run_id: str, draft_i
     {question?, metrics: [docdraft 的指标对象]}。不发布、不发起运行、不写审计。
     """
     from app.api.deps import can_read_run, current_principal, ensure_role
-    from app.api.evidence import _sealed
     from app.core.artifact_store import graph_hash, load
     from app.db.models import DataSource, Workflow, WorkflowVersion
+    from app.engine.evidence_reader import load_sealed as _sealed
     from app.ledger import certify, docdraft, store
 
     ensure_role("builder")

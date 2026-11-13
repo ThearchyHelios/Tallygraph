@@ -19,6 +19,17 @@ from pathlib import Path
 
 _TMP = Path(tempfile.mkdtemp(prefix="agentlab-tests-"))
 os.environ["AGENTLAB_DATA_DIR"] = str(_TMP)
+os.environ["AGENTLAB_DISABLE_DOTENV"] = "1"
+# 剥离宿主机环境里可能携带的真实模型密钥与地址，防止测试或 seed 误调线上付费接口；需要测环境变量回退的用例用 monkeypatch.setenv 单独设
+for _env_key in (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "AGENTLAB_USE_OPENAI_EMBEDDINGS",
+):
+    os.environ.pop(_env_key, None)
 # 下面这几项也都要在任何 app.* 导入之前设（两种库同一个顺序）：PostgreSQL 分支要先导入 app.db.base 装连接池，settings 在那一刻
 # 就按当时的环境定下来了——以前这两项写在那之后，PostgreSQL 上 AGENTLAB_SCHEDULER 没生效（scheduler_on 成了 True）
 # 别把真实的 key 带进测试环境

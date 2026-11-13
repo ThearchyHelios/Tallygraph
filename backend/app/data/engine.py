@@ -14,7 +14,7 @@ import re
 import sqlite3
 import time
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -297,7 +297,7 @@ def open_checked_sqlite(path: str, *, readonly: bool = True, immutable: bool = F
     mode = "ro" if readonly else "rwc"
     extra = "&immutable=1" if immutable else ""
     return sqlite3.connect(f"file:{quote(os.fspath(path))}?mode={mode}{extra}", uri=True,
-                           factory=_DqsOffConnection)
+                           timeout=5.0, factory=_DqsOffConnection)
 
 
 def open_memory_sqlite() -> sqlite3.Connection:
@@ -549,6 +549,8 @@ class EngineCache:
         #: 正在进行的快照核对，按（缓存键, 文件, 登记的哈希）合并。核对结束（不论成败）即移除，
         #: 失败结果不留：下次照常重新核对
         self._verifying: dict[tuple[str, str, str], asyncio.Future[Fingerprint]] = {}
+        #: 每个数据源的失效世代：get() 在锁外核对快照期间若赶上 invalidate()，进锁后看到世代变了就重来，绝不把旧连接装回缓存
+        self._epochs: dict[str, int] = {}
 
     def _hit(self, key: str, doomed: list[AsyncEngine]) -> AsyncEngine | None:
         """缓存里还可信的 engine。快照文件和核对时的指纹对不上的，摘出来放进 doomed 交给调用方关掉。"""
@@ -568,6 +570,7 @@ class EngineCache:
 
     async def get(self, source: Any) -> AsyncEngine:
         key = cache_key(source)
+        sid = _source_of(key)
         doomed: list[AsyncEngine] = []
         try:
             cached = self._hit(key, doomed)
@@ -577,34 +580,44 @@ class EngineCache:
             if getattr(source, "immutable", False) and not expected:
                 logger.warning("版本快照没有登记文件哈希，已拒绝：key=%s path=%s", key, source.database)
                 raise SnapshotTampered(_NO_HASH)
-            fingerprint: Fingerprint | None = None
-            if expected:
-                # 在锁外核对：哈希一个大文件要几秒，不能让别的数据源都排在它后面
-                fingerprint = await self._verify_once(key, source, expected)
-            async with self._lock:
-                cached = self._hit(key, doomed)
-                if cached is not None:
-                    return cached
-                url, extra = engine_args(source)
-                engine = create_async_engine(
-                    url,
-                    pool_size=3,
-                    max_overflow=2,
-                    pool_pre_ping=True,   # 长时间空闲后连接会被数据库掐掉，先探活再用
-                    pool_recycle=1800,
-                    **extra,
-                )
-                if fingerprint is not None:
-                    pin = _Pin(str(source.database or ""), fingerprint)
-                    _guard_pool(engine, pin, key)
-                    self._pins[key] = pin
-                self._engines[key] = engine
-                limit = max(1, self._max if self._max is not None else MAX_ENGINES)
-                while len(self._engines) > limit:
-                    old_key, old = self._engines.popitem(last=False)
-                    self._pins.pop(old_key, None)
-                    doomed.append(old)
-            return engine
+            while True:
+                epoch = self._epochs.get(sid, 0)
+                fingerprint: Fingerprint | None = None
+                if expected:
+                    # 在锁外核对：哈希一个大文件要几秒，不能让别的数据源都排在它后面
+                    fingerprint = await self._verify_once(key, source, expected)
+                async with self._lock:
+                    cached = self._hit(key, doomed)
+                    if cached is not None:
+                        return cached
+                    if self._epochs.get(sid, 0) != epoch:
+                        continue
+                    url, extra = engine_args(source)
+                    is_memory_sqlite = (source.kind or "").lower() == "sqlite" and (
+                        (source.database or "") == ":memory:" or url.endswith("/:memory:")
+                    )
+                    pool_kwargs: dict[str, Any] = {} if is_memory_sqlite else {
+                        "pool_size": 3,
+                        "max_overflow": 2,
+                        "pool_pre_ping": True,   # 长时间空闲后连接会被数据库掐掉，先探活再用
+                        "pool_recycle": 1800,
+                    }
+                    engine = create_async_engine(
+                        url,
+                        **pool_kwargs,
+                        **extra,
+                    )
+                    if fingerprint is not None:
+                        pin = _Pin(str(source.database or ""), fingerprint)
+                        _guard_pool(engine, pin, key)
+                        self._pins[key] = pin
+                    self._engines[key] = engine
+                    limit = max(1, self._max if self._max is not None else MAX_ENGINES)
+                    while len(self._engines) > limit:
+                        old_key, old = self._engines.popitem(last=False)
+                        self._pins.pop(old_key, None)
+                        doomed.append(old)
+                    return engine
         finally:
             for old in doomed:
                 # 正被借出的连接不受影响：dispose 只关池子里空闲的，借出的还回来时随旧池子回收
@@ -653,22 +666,27 @@ class EngineCache:
             from app.cluster import caches
 
             await caches.broadcast("datasource_engine", sid)
-        # 正在进行的核对也撇开：失效之后来的请求重新核对，不搭失效之前那一次的便车
-        for token in [t for t in self._verifying if _source_of(t[0]) == sid]:
-            del self._verifying[token]
-        keys = [key for key in list(self._engines) if _source_of(key) == sid]
-        doomed = [self._engines.pop(key) for key in keys]
-        for key in keys:
-            self._pins.pop(key, None)
+        async with self._lock:
+            self._epochs[sid] = self._epochs.get(sid, 0) + 1
+            # 正在进行的核对也撇开：失效之后来的请求重新核对，不搭失效之前那一次的便车
+            for token in [t for t in self._verifying if _source_of(t[0]) == sid]:
+                del self._verifying[token]
+            keys = [key for key in list(self._engines) if _source_of(key) == sid]
+            doomed = [self._engines.pop(key) for key in keys]
+            for key in keys:
+                self._pins.pop(key, None)
         for engine in doomed:
             await engine.dispose()
 
     async def close(self) -> None:
-        self._verifying.clear()
-        for engine in list(self._engines.values()):
+        async with self._lock:
+            self._verifying.clear()
+            doomed = list(self._engines.values())
+            self._engines.clear()
+            self._pins.clear()
+            self._epochs.clear()
+        for engine in doomed:
             await engine.dispose()
-        self._engines.clear()
-        self._pins.clear()
 
 
 engines = EngineCache()
@@ -743,10 +761,20 @@ class _Deadline:
     def __init__(self, seconds: float) -> None:
         self.seconds = seconds
         self.ends = time.monotonic() + seconds
-        #: SQLite 的进度回调真的掐过
+        #: SQLite 的进度回调真的按时限掐过
         self.fired = False
+        #: 调用方主动取消（CancelledError 等），进度回调同样立即中止工作线程里的语句
+        self.cancelled = False
         #: 语句已经结束。回调这时要是还挂在连接上（摘除没成功），也不能再掐别人的语句
         self.over = False
+        #: 由 _server_deadline 登记的底层驱动打断回调（如 sqlite3.Connection.interrupt / oracledb.cancel）
+        self._aborter: Callable[[], None] | None = None
+
+    def abort(self) -> None:
+        self.cancelled = True
+        if self._aborter is not None:
+            with suppress(Exception):
+                self._aborter()
 
     def remaining_ms(self) -> int:
         return max(1, int((self.ends - time.monotonic()) * 1000))
@@ -759,7 +787,11 @@ class _Deadline:
 
     def sqlite_progress(self) -> int:
         # 在 SQLite 执行语句的那个线程里被调用；返回非零，SQLite 就中止当前语句
-        if not self.over and time.monotonic() >= self.ends:
+        if self.over:
+            return 0
+        if self.cancelled:
+            return 1
+        if time.monotonic() >= self.ends:
             self.fired = True
             return 1
         return 0
@@ -843,9 +875,16 @@ async def _server_deadline(conn: AsyncConnection, kind: str, deadline: _Deadline
             logger.warning("Oracle call_timeout 没设上（%s），只剩后端兜底", e)
             yield
             return
+        cancel_fn = getattr(driver, "cancel", None) or getattr(driver, "breakexecution", None)
+        if callable(cancel_fn):
+            deadline._aborter = cancel_fn
         try:
             yield
+        except asyncio.CancelledError:
+            deadline.abort()
+            raise
         finally:
+            deadline._aborter = None
             try:
                 driver.call_timeout = before
             except Exception:  # noqa: BLE001 - 超时后连接可能已经被驱动关掉
@@ -854,15 +893,23 @@ async def _server_deadline(conn: AsyncConnection, kind: str, deadline: _Deadline
 
     if kind == "sqlite":
         driver = await _driver(conn)
+        raw_conn = getattr(driver, "_conn", None)
+        if raw_conn is not None:
+            deadline._aborter = raw_conn.interrupt
         await driver.set_progress_handler(deadline.sqlite_progress, _SQLITE_STEPS)
         try:
             yield
+        except BaseException:
+            deadline.abort()
+            raise
         finally:
-            deadline.over = True
+            deadline._aborter = None
             try:
                 await driver.set_progress_handler(None, 0)
-            except Exception:  # noqa: BLE001 - over 已经让它不再掐人
+            except Exception:  # noqa: BLE001 - over 保底不再掐后面的语句
                 pass
+            finally:
+                deadline.over = True
         return
 
     yield
@@ -887,7 +934,22 @@ async def _bounded(
             if deadline.expired():
                 raise SqlRejected(over)
             async with _server_deadline(conn, kind, deadline):
-                return await work(conn)
+                # 用 shield 保护内层 greenlet：收到 CancelledError 时先经 deadline.abort() 通知底层驱动
+                # （如 sqlite3_interrupt）正常中止查询，避免 CancelledError 直接打进 SQLAlchemy greenlet
+                # 触发半关闭连接上的 rollback ValueError("Connection closed") 与连接池泄漏。
+                work_task = asyncio.create_task(work(conn))
+                try:
+                    return await asyncio.shield(work_task)
+                except asyncio.CancelledError:
+                    deadline.abort()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(work_task), timeout=1.0)
+                    except BaseException:
+                        if not work_task.done():
+                            work_task.cancel()
+                            with suppress(BaseException):
+                                await work_task
+                    raise
 
     try:
         return await asyncio.wait_for(_exec(), timeout=limits.timeout_seconds + BACKSTOP_S)

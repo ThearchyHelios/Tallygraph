@@ -133,6 +133,7 @@ async def recall(
     )
 
     results: list[dict[str, Any]] = []
+    picked_rows: list[MemoryItem] = []
     now = datetime.now(timezone.utc)
     for idx, score, parts in ranked:
         row = rows[idx]
@@ -140,6 +141,7 @@ async def recall(
         boosted = score * (0.8 + 0.4 * row.importance) * (1 + min(row.use_count, 10) * 0.01)
         if boosted < min_score:
             continue
+        picked_rows.append(row)
         results.append(
             {
                 "id": row.id,
@@ -158,11 +160,9 @@ async def recall(
     if not track:
         return results
     # 记一下被召回过，作为下次排序的信号
-    for r in results:
-        item = await session.get(MemoryItem, r["id"])
-        if item:
-            item.use_count += 1
-            item.last_used_at = now
+    for item in picked_rows:
+        item.use_count += 1
+        item.last_used_at = now
     await session.commit()
     return results
 
@@ -241,28 +241,37 @@ async def reindex(
     路径——记忆这边悄悄退回关键词，而且没有任何恢复手段。
     on_progress(已完成, 总数) 每批提交之后回调一次。
     """
-    stmt = select(MemoryItem)
+    count_stmt = select(func.count(MemoryItem.id))
     if scope:
-        stmt = stmt.where(MemoryItem.scope == scope)
-    rows = list((await session.execute(stmt)).scalars())
-    if not rows:
+        count_stmt = count_stmt.where(MemoryItem.scope == scope)
+    total = int((await session.execute(count_stmt)).scalar_one() or 0)
+    if total == 0:
         return 0
 
     model_id, dim = embedder_id(), embedder_dim()
     from app.memory import kb
 
     batch = kb._EMBED_BATCH   # 和 kb 那边统一：一次几千条全发给远端接口必被限流
-    for i in range(0, len(rows), batch):
-        part = rows[i:i + batch]
+    done = 0
+    last_id = ""
+    while True:
+        stmt = select(MemoryItem).where(MemoryItem.id > last_id).order_by(MemoryItem.id.asc()).limit(batch)
+        if scope:
+            stmt = stmt.where(MemoryItem.scope == scope)
+        part = list((await session.execute(stmt)).scalars())
+        if not part:
+            break
+        last_id = part[-1].id
         vectors = await embed_texts([r.content for r in part])
         for row, vec in zip(part, vectors):
             row.embedding = to_blob(vec)
             row.embed_model = model_id
             row.embed_dim = dim
         await session.commit()
+        done += len(part)
         if on_progress:
-            on_progress(min(i + batch, len(rows)), len(rows))
-    return len(rows)
+            on_progress(min(done, total), total)
+    return done
 
 
 async def list_scopes(session: AsyncSession) -> list[dict[str, Any]]:

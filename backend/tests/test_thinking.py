@@ -63,13 +63,10 @@ def test_empty_reasoning_is_not_reported() -> None:
 
 
 def _anthropic(model: str, **spec_kw):
-    import os
-
     from app.db.models import Provider
     from app.providers.factory import ModelSpec, build_chat_model
 
-    os.environ.setdefault("ANTHROPIC_API_KEY", "test-only")
-    provider = Provider(name="t", kind="anthropic", api_key=None, models=[],
+    provider = Provider(name="t", kind="anthropic", api_key="test-only", models=[],
                         extra=spec_kw.pop("extra", {}) or {})
     return build_chat_model(provider, ModelSpec(model=model, **spec_kw))
 

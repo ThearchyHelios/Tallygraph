@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket,
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from app.api.coded import CodedHTTPException
 # 「人」的唯一入口搬到了 api/deps.py（开登录时返回认证过的用户名）。别处照旧从这里导入 actor_of
@@ -422,7 +423,7 @@ async def list_runs(
     没按来源筛时，系统派生的运行（评测、口径对账、口径召回：engine/origin.SYSTEM_ORIGINS）默认不列——几十道评测题的运行
     会把真实用户的运行挤出第一页；按来源点名就列。没列出几次由 GET /api/runs/unlisted 照实说，界面写在列表底下。
     """
-    stmt = _filtered(select(Run), workflow_id=workflow_id, status=status, run_class=run_class, q=q,
+    stmt = _filtered(select(Run).options(defer(Run.graph)), workflow_id=workflow_id, status=status, run_class=run_class, q=q,
                      schedule_id=schedule_id, origin_kind=origin_kind)
     stmt = stmt.order_by(Run.created_at.desc(), Run.id.desc()).limit(limit)
     if before is not None:
@@ -817,8 +818,25 @@ async def delete_run(
             "这是一次已封存的正式运行，是出具结果的追溯凭证。删除后其事件和工件将一并删除，"
             "封存清单无法再核对。如仍要删除，请选择「强制删除」",
         )
+    from sqlalchemy import delete as sql_delete
+
+    from app.core import artifact_store
+    from app.db.models import Artifact
+    from app.engine import checkpoints
+    from app.files import store as files_store
+
+    artifact_ids = list((await session.execute(select(Artifact.id).where(Artifact.run_id == run_id))).scalars())
+    if artifact_ids:
+        await session.execute(sql_delete(Artifact).where(Artifact.run_id == run_id)
+                              .execution_options(synchronize_session=False))
+    released_shas = await files_store.release_runs(session, [run_id])
     await session.delete(run)
     await session.commit()
+    if artifact_ids:
+        await artifact_store.forget(artifact_ids)
+    if released_shas:
+        await files_store.drop_unreferenced(released_shas)
+    await checkpoints.delete_threads([run_id])
 
 
 # --------------------------------------------------------------------------

@@ -1,3 +1,4 @@
+import '../../canvas/xyflow.css'
 import { useState, type JSX } from 'react'
 import { ReactFlow, ReactFlowProvider } from '@xyflow/react'
 import { Inspector } from '../../canvas/Inspector'

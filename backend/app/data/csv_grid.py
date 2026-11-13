@@ -110,29 +110,44 @@ class CsvTable:
     delimiter: str
 
 
+def _resolve_csv_meta(raw: bytes, delimiter: str | None) -> tuple[str, str, str]:
+    from app.data import tabular
+
+    enc, errors = tabular._detect_csv_encoding(raw)
+    if delimiter is None:
+        with tabular._open_csv_text(raw, encoding=enc, errors=errors, newline="") as probe_stream:
+            head = probe_stream.read(8192)
+        try:
+            delimiter = csv.Sniffer().sniff(head, delimiters=_DELIMITERS).delimiter
+        except csv.Error:
+            delimiter = ","       # 嗅不出来就按最常见的来
+    return enc, errors, delimiter
+
+
+def _iter_csv_records(raw: bytes, *, enc: str, errors: str, delimiter: str) -> Iterator[list[str]]:
+    from app.data import tabular
+
+    row_count = 0
+    try:
+        with tabular._open_csv_text(raw, encoding=enc, errors=errors, newline="") as stream:
+            for record in csv.reader(stream, delimiter=delimiter):
+                if row_count >= MAX_ROWS:
+                    raise UnsupportedTable(f"CSV 文件超过 {MAX_ROWS:,} 行，超出可以导入的上限")
+                if len(record) > MAX_COLS:
+                    raise UnsupportedTable(f"CSV 文件第 {row_count + 1} 行有 {len(record):,} 列，超过 {MAX_COLS:,} 列的上限")
+                row_count += 1
+                yield record
+    except csv.Error as e:
+        raise UnsupportedTable(f"无法按 CSV 读取这个文件：第 {row_count + 1} 行的写法不正确（{e}）。"
+                               "请在 Excel 中重新另存为 CSV 后上传") from e
+
+
 def parse(raw: bytes, delimiter: str | None = None) -> CsvTable:
     """原件 → 记录。编码照 tabular 读 CSV 的做法；delimiter 不给时嗅探（同 tabular）。字段太长、引号不配对读不了时抛
     UnsupportedTable。"""
-    from app.data import tabular
-
-    text = tabular._decode_csv(raw)
-    if delimiter is None:
-        try:
-            delimiter = csv.Sniffer().sniff(text[:8192], delimiters=_DELIMITERS).delimiter
-        except csv.Error:
-            delimiter = ","       # 嗅不出来就按最常见的来
-    records: list[list[str]] = []
-    try:
-        for record in csv.reader(io.StringIO(text, newline=""), delimiter=delimiter):
-            if len(records) >= MAX_ROWS:
-                raise UnsupportedTable(f"CSV 文件超过 {MAX_ROWS:,} 行，超出可以导入的上限")
-            if len(record) > MAX_COLS:
-                raise UnsupportedTable(f"CSV 文件第 {len(records) + 1} 行有 {len(record):,} 列，超过 {MAX_COLS:,} 列的上限")
-            records.append(record)
-    except csv.Error as e:
-        raise UnsupportedTable(f"无法按 CSV 读取这个文件：第 {len(records) + 1} 行的写法不正确（{e}）。"
-                               "请在 Excel 中重新另存为 CSV 后上传") from e
-    return CsvTable(records=records, delimiter=delimiter)
+    enc, errors, resolved_delim = _resolve_csv_meta(raw, delimiter)
+    records = list(_iter_csv_records(raw, enc=enc, errors=errors, delimiter=resolved_delim))
+    return CsvTable(records=records, delimiter=resolved_delim)
 
 
 def _cells(table: CsvTable) -> Iterator[tuple[int, list[tuple[int, GridCell]]]]:
@@ -155,15 +170,18 @@ def sheet_delimiter(sheet: Any) -> str | None:
 
 def scan(raw: bytes, *, delimiter: str | None = None) -> WorkbookScan:
     """CSV 原件 → 扫描结果：一张可见工作表（名字 CSV_SHEET、路径 CSV_PATH 加分隔符），边界、非空格数、逐行非空格数的
-    游程。没有合并区、隐藏行列、公式、错误值、离群格（CSV 里每一格都是写出来的，没有残留格式）。"""
-    table = parse(raw, delimiter)
-    sheet = SheetScan(name=CSV_SHEET, state="visible", path=CSV_PATH + table.delimiter)
+    游程。流式统计，不再先把整张 CSV 物化成全量字符串与二维列表。"""
+    enc, errors, resolved_delim = _resolve_csv_meta(raw, delimiter)
+    sheet = SheetScan(name=CSV_SHEET, state="visible", path=CSV_PATH + resolved_delim)
     lo_r = lo_c = hi_r = hi_c = 0
     runs: list[tuple[int, int, int]] = []
-    for r, cells in _cells(table):
-        n = len(cells)
+    for r, record in enumerate(_iter_csv_records(raw, enc=enc, errors=errors, delimiter=resolved_delim), 1):
+        nonempty_cols = [c for c, field in enumerate(record, 1) if cell_value(field) is not None]
+        if not nonempty_cols:
+            continue
+        n = len(nonempty_cols)
         sheet.nonempty += n
-        first, last = cells[0][0], cells[-1][0]
+        first, last = nonempty_cols[0], nonempty_cols[-1]
         if not lo_r:
             lo_r, lo_c, hi_c = r, first, last
         lo_c, hi_c, hi_r = min(lo_c, first), max(hi_c, last), r

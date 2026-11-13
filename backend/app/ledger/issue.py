@@ -210,9 +210,9 @@ async def plan_issue(session: Any, run: Run | None, content: dict[str, Any] | No
     """按 workflow_id@version 出具这次运行的打算（见模块说明）。content 是这次运行最新的比对工件内容（读不出为 None），
     hide 判一个绑定值是不是这次运行查到过的遮罩值。只读，不发起。"""
     from app.api.deps import can_read_run
-    from app.api.settings import ledger_settings
     from app.ledger import match as ledger_match
     from app.ledger.labels import caliber_key
+    from app.ledger.settings import ledger_settings
 
     plan = Plan(run_id=run.id if run else "", workflow_id=workflow_id, version=int(version),
                 caliber=caliber_key(workflow_id, int(version)), match_artifact=artifact)
@@ -257,12 +257,12 @@ async def check_target(session: Any, plan: Plan, workflow: Any, *, principal: An
     （ledger/params：缺参数、未声明参数、承载不了的值、认不出参数写在哪的模板都拒）；使用者只能按
     他有权使用的应用固定着的这一版（拍板 L5）；同一个来源（source_run）、同一版、同一组参数发起过的交回那一次；当天没超
     上限。填好 plan 的 level、expect_hash、inputs、granted_by_app、existing；不能出具的写进 plan.refuse，交回 None。"""
-    from app.api.settings import ledger_settings
     from app.apps import versions as app_versions
     from app.apps.backfill import graph_side_effect
     from app.apps.forms import input_schema, validate_form
     from app.apps.resolve import input_key
     from app.ledger.derive import entry_fields
+    from app.ledger.settings import ledger_settings
 
     workflow_id, version = plan.workflow_id, plan.version
     if workflow is None:
@@ -362,7 +362,7 @@ QUOTA = "ledger_issue"
 
 
 async def _hider(run_id: str) -> Any:
-    from app.api.evidence import _sealed
+    from app.engine.evidence_reader import load_sealed as _sealed
     from app.ledger.view import _hider as hider_of
 
     return (await hider_of(await _sealed(run_id))).hide
@@ -397,8 +397,8 @@ async def issue(run_id: str, workflow_id: str, version: int, *, principal: Any, 
                       **({"publication": plan.publication} if plan.publication else {})}
             actor = run.started_by if auto else principal.username
             # 先占一份今天的额度（库里带条件的加一，几个进程同时出具也正好到上限为止），发起不成退回
-            from app.api.settings import ledger_settings
             from app.cluster import quota
+            from app.ledger.settings import ledger_settings
 
             limit = int((await ledger_settings(session))["issue_daily_limit"])
             day = await quota.take(QUOTA, limit, seed=issued_today)

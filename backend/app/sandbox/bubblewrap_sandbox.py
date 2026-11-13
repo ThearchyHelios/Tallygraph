@@ -184,58 +184,82 @@ class BubblewrapSandbox(Sandbox):
         cmd_prefix = cmd_prefix if cmd_prefix is not None else interpreter.python_argv()
         entry = entry_name(ext)
         cmd = [*cmd_prefix, f"/work/{entry}"]
-        workdir = self._session_dir(session_id or f"tmp-{int(time.time() * 1000)}")
-        atomic.write_text(workdir / entry, code)
-        for rel, content in (files or {}).items():
-            target = (workdir / rel).resolve()
-            if not str(target).startswith(str(workdir.resolve())):
-                return ExecResult(ok=False, backend=self.name, error=f"非法文件路径：{rel}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            atomic.write_text(target, content)
-
-        argv = self._argv(workdir, limits, cmd, env)
-
-        started = time.perf_counter()
+        ephemeral = not session_id
+        workdir = self._session_dir(session_id or f"tmp-{int(time.time() * 1000)}-{os.urandom(4).hex()}")
+        work_root = workdir.resolve()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                # bwrap 自己也只拿最小的环境：沙箱里的进程靠上面的 --setenv，不从这里继承
-                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                preexec_fn=self._preexec(limits),
-            )
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=limits.timeout)
-        except asyncio.TimeoutError:
-            try:
-                os.killpg(os.getpgid(proc.pid), 9)
-            except (ProcessLookupError, PermissionError):
-                proc.kill()
-            await proc.wait()
-            return ExecResult(
-                ok=False, backend=self.name, timed_out=True, exit_code=124,
-                duration_ms=int((time.perf_counter() - started) * 1000),
-                error=f"执行超过 {limits.timeout} 秒，已终止",
-            )
-        except Exception as e:  # noqa: BLE001
-            # 起进程和收输出在同一个 try 里。首行只说原因，类名和 errno 这些留给日志
-            logger.warning("%s 沙箱进程出错：%s", self.name, raw(e))
-            return ExecResult(ok=False, backend=self.name, error=f"沙箱进程出错：{describe_exception(e)}")
+            atomic.write_text(workdir / entry, code)
+            for rel, content in (files or {}).items():
+                target = (workdir / rel).resolve()
+                if not target.is_relative_to(work_root):
+                    return ExecResult(ok=False, backend=self.name, error=f"非法文件路径：{rel}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                atomic.write_text(target, content)
 
-        stdout, t1 = truncate(out.decode(errors="replace"), limits.max_output)
-        stderr, t2 = truncate(err.decode(errors="replace"), limits.max_output)
-        code_ = proc.returncode or 0
-        return ExecResult(
-            ok=code_ == 0,
-            exit_code=code_,
-            stdout=stdout,
-            stderr=stderr,
-            truncated=t1 or t2,
-            timed_out=code_ in (-24, 152),
-            backend=self.name,
-            duration_ms=int((time.perf_counter() - started) * 1000),
-            files_written=[p.name for p in workdir.iterdir() if p.is_file() and not p.name.startswith(ENTRY_PREFIX)][:50],
-        )
+            argv = self._argv(workdir, limits, cmd, env)
+
+            started = time.perf_counter()
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    # bwrap 自己也只拿最小的环境：沙箱里的进程靠上面的 --setenv，不从这里继承
+                    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    preexec_fn=self._preexec(limits),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("%s 沙箱进程出错：%s", self.name, raw(e))
+                return ExecResult(ok=False, backend=self.name, error=f"沙箱进程出错：{describe_exception(e)}")
+
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=limits.timeout)
+            except asyncio.TimeoutError:
+                self._kill(proc)
+                await proc.wait()
+                return ExecResult(
+                    ok=False, backend=self.name, timed_out=True, exit_code=124,
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    error=f"执行超过 {limits.timeout} 秒，已终止",
+                )
+            except Exception as e:  # noqa: BLE001
+                if getattr(proc, "returncode", 0) is None:
+                    self._kill(proc)
+                    await proc.wait()
+                logger.warning("%s 沙箱进程出错：%s", self.name, raw(e))
+                return ExecResult(ok=False, backend=self.name, error=f"沙箱进程出错：{describe_exception(e)}")
+            except BaseException:
+                if getattr(proc, "returncode", 0) is None:
+                    self._kill(proc)
+                    await proc.wait()
+                raise
+
+            stdout, t1 = truncate(out.decode(errors="replace"), limits.max_output)
+            stderr, t2 = truncate(err.decode(errors="replace"), limits.max_output)
+            code_ = proc.returncode or 0
+            return ExecResult(
+                ok=code_ == 0,
+                exit_code=code_,
+                stdout=stdout,
+                stderr=stderr,
+                truncated=t1 or t2,
+                timed_out=code_ in (-24, 152),
+                backend=self.name,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                files_written=[p.name for p in workdir.iterdir() if p.is_file() and not p.name.startswith(ENTRY_PREFIX)][:50],
+            )
+        finally:
+            if ephemeral:
+                root_resolved = self._root.resolve()
+                if work_root != root_resolved and work_root.is_relative_to(root_resolved):
+                    shutil.rmtree(workdir, ignore_errors=True)
+
+    @staticmethod
+    def _kill(proc: asyncio.subprocess.Process) -> None:
+        try:
+            os.killpg(os.getpgid(proc.pid), 9)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
 
     async def cleanup(self, session_id: str) -> None:
         await asyncio.to_thread(shutil.rmtree, self._session_dir(session_id), True)

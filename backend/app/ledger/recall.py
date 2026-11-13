@@ -495,7 +495,7 @@ def _lock(key: tuple[str, int]) -> Any:
 async def launch(workflow_id: str, new_version: int, *, batch: str = "auto", actor: str | None = None) -> list[str]:
     """按计划发起一批召回运行，交回发起了的运行 id。auto：发布后自动的那一批，一次发布最多 recall_limit 组（已经自动发起
     过的扣掉，重复调幂等）；manual：「接着算」，再发起一批（上限是 0 时按缺省的组数）。"""
-    from app.api.settings import LEDGER_DEFAULTS, ledger_settings
+    from app.ledger.settings import LEDGER_DEFAULTS, ledger_settings
 
     if batch not in BATCHES:
         raise ValueError(f"不认识的召回批次：{batch}")
@@ -534,7 +534,7 @@ def _counts(plan: Plan) -> dict[str, int]:
 async def preview(session: Any, workflow_id: str, version: int) -> dict[str, Any]:
     """发布弹窗的召回预告：把 version 发布成新版本之后，旧版本被多少问数回答、导出、定时任务、应用用过，预计重算几组，超出
     上限的写明。只读、不发起（和发布之后真的召回走同一份计划，规模一致）。"""
-    from app.api.settings import ledger_settings
+    from app.ledger.settings import ledger_settings
 
     plan = await build_plan(session, workflow_id, int(version))
     limit = int((await ledger_settings(session))["recall_limit"])
@@ -598,7 +598,7 @@ async def batches(session: Any, workflow_id: str, version: int) -> dict[str, Any
     未重算」和能不能接着算（还有没算的组却不能接着算时 continue_reason 写为什么：之后又发布了更新的版本……）。
     接口只给搭建者（api/ledger 的 router）：参数原样给，同他在召回运行的输入里读到的一样；使用者
     看的是 recall 待办（task_payload，按遮罩换过）。"""
-    from app.api.settings import LEDGER_DEFAULTS, ledger_settings
+    from app.ledger.settings import LEDGER_DEFAULTS, ledger_settings
 
     plan = await build_plan(session, workflow_id, int(version))
     limit = int((await ledger_settings(session))["recall_limit"])
@@ -664,7 +664,7 @@ async def _settled(session: Any, run_id: str) -> dict[str, Any] | None:
 
 async def card_values(run_id: str) -> dict[str, dict[str, Any]]:
     """召回运行封存范围内的召回卡：{指标 id: 指标}（value、rendered……）。读不出为空。"""
-    from app.api.evidence import _sealed, _sealed_cards
+    from app.engine.evidence_reader import load_sealed as _sealed, metric_cards as _sealed_cards
     from app.ledger import derive
 
     sealed = await _sealed(run_id)
@@ -878,7 +878,7 @@ async def task_payload(session: Any, task: Any, principal: Any) -> dict[str, Any
     """recall 待办给处理人看的内容（待办箱、待办详情的 payload，process/tasks._describe 调）：旧口径的值、新口径的值、两版之差
     和原答案当时的值（每个都带出处：哪次运行、哪张卡、哪个指标，点得开），这一组的参数，能做的动作。使用者看到的值照样
     遮罩（按那次运行查到过的遮罩值，同账本接口）。"""
-    from app.api.evidence import _sealed
+    from app.engine.evidence_reader import load_sealed as _sealed
     from app.ledger.view import _hider
 
     run = await session.get(Run, task.run_id)
@@ -946,7 +946,7 @@ async def original_values(use: Mapping[str, Any], meta: Sequence[Mapping[str, An
     """原答案当时的值（每个比较一项）：正式运行读它封存的口径卡（固定了这一版的读转抄来的那张）；问数回答读等价的那条查询
     快照里那一格（口径卡的指标就是取数第一行某一列时，按列映射找这次的列）。读不出、原答案里没有单独这个数的为空，写为什么。
     hide_for：给使用者看，按那次运行查到过的遮罩值遮。"""
-    from app.api.evidence import _sealed, _sealed_cards
+    from app.engine.evidence_reader import load_sealed as _sealed, metric_cards as _sealed_cards
     from app.ledger.view import _hider
 
     run_id = str(use.get("run_id") or "")

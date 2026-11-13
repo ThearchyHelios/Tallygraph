@@ -51,6 +51,7 @@ class GroundingBundle:
     guardrails: list[dict[str, str]] = field(default_factory=list)
     system_context: str = ""
     ui_summary: dict[str, Any] = field(default_factory=dict)
+    has_enabled_metrics: bool = False
 
 
 def _term_in_text(term: str, text_lower: str, ascii_words: set[str]) -> bool:
@@ -395,13 +396,14 @@ async def ground_question(
     else:
         narrowed_sources = list(candidate_sources)
 
-    # 5. 数据目录 BM25 直选 + 指标底表 + 实体绑定表 -> 组装高信噪比表结构与防错护栏
+    # 5. 数据目录 BM25 直选 + 指标底表 + 实体绑定表 -> 跨源全局打分选表，避免首源独占全部槽位
     matched_tables: list[dict[str, Any]] = []
     guardrails: list[dict[str, str]] = []
     table_blocks: list[str] = []
     total_detail_chars = 0
 
-    for ds in narrowed_sources:
+    ds_ctx_list: list[dict[str, Any]] = []
+    for ds_idx, ds in enumerate(narrowed_sources):
         cache = ds.schema_cache if isinstance(ds.schema_cache, Mapping) else {}
         tables_map = (cache.get("tables") or {}) if isinstance(cache, Mapping) else {}
         if not isinstance(tables_map, Mapping) or not tables_map:
@@ -414,74 +416,112 @@ async def ground_question(
             facts = await catalog_profile_jobs.last_facts(session, ds.id)
         except Exception:  # noqa: BLE001
             facts = {}
-
-        picked_for_ds: list[str] = []
-        reasons_for_table: dict[str, str] = {}
-
-        # (a) 命中指标的底表优先入选
-        for mm in matched_metrics:
-            if mm["source_id"] == ds.id:
-                resolved = catalog.resolve_table_name(cache, mm["table_name"])
-                if resolved and resolved not in picked_for_ds:
-                    picked_for_ds.append(resolved)
-                    reasons_for_table[resolved] = f"指标「{mm['name']}」底表"
-
-        # (b) 命中实体的绑定表入选
-        for me in matched_entities:
-            for b in me["bindings"]:
-                if name_key(b["source_name"]) == name_key(ds.name):
-                    resolved = catalog.resolve_table_name(cache, b["table_name"])
-                    if resolved and resolved not in picked_for_ds and len(picked_for_ds) < MAX_GROUNDED_TABLES:
-                        picked_for_ds.append(resolved)
-                        reasons_for_table[resolved] = f"实体「{me['label']}」绑定表"
-
         masked = schema_view.masked_set(ds)
         try:
             rel_graph = schema_view.relation_graph(ds, raw_notes)
         except Exception:  # noqa: BLE001
             rel_graph = {}
 
-        def _include_companion_lookup(limit_cap: int) -> list[dict[str, Any]]:
-            if not picked_for_ds:
-                return []
-            comps = find_companion_lookup_tables(
-                tables_map,
-                picked_for_ds,
-                visible_by_table=visible_by_table,
-                rel_graph=rel_graph,
-                masked_set=masked,
+        ds_ctx_list.append(
+            {
+                "idx": ds_idx,
+                "ds": ds,
+                "cache": cache,
+                "tables_map": tables_map,
+                "raw_notes": raw_notes,
+                "visible_by_table": visible_by_table,
+                "facts": facts,
+                "masked": masked,
+                "rel_graph": rel_graph,
+                "picked": [],
+                "reasons": {},
+            }
+        )
+
+    total_picked = 0
+
+    def _pick_table(ctx: dict[str, Any], tname: str, reason: str, *, cap: int = MAX_GROUNDED_TABLES) -> bool:
+        nonlocal total_picked
+        if total_picked >= cap or tname in ctx["picked"]:
+            return False
+        ctx["picked"].append(tname)
+        ctx["reasons"][tname] = reason
+        total_picked += 1
+        return True
+
+    # (a) 命中指标的底表跨源最优先入选
+    for ctx in ds_ctx_list:
+        ds = ctx["ds"]
+        for mm in matched_metrics:
+            if mm["source_id"] == ds.id:
+                resolved = catalog.resolve_table_name(ctx["cache"], mm["table_name"])
+                if resolved:
+                    _pick_table(ctx, resolved, f"指标「{mm['name']}」底表", cap=MAX_GROUNDED_TABLES + 2)
+
+    # (b) 命中实体的绑定表跨源次优先入选
+    for ctx in ds_ctx_list:
+        ds = ctx["ds"]
+        for me in matched_entities:
+            for b in me["bindings"]:
+                if name_key(b["source_name"]) == name_key(ds.name):
+                    resolved = catalog.resolve_table_name(ctx["cache"], b["table_name"])
+                    if resolved:
+                        _pick_table(ctx, resolved, f"实体「{me['label']}」绑定表")
+
+    # (c) 各候选源 BM25 检索统一收集并按得分全局排序选表（0 LLM 调用）
+    if total_picked < MAX_GROUNDED_TABLES:
+        global_bm25_hits: list[tuple[float, int, int, dict[str, Any], str]] = []
+        for ctx in ds_ctx_list:
+            hits = schema_view.search_tables(
+                ctx["ds"],
+                ctx["visible_by_table"],
+                combined_q,
+                limit=MAX_GROUNDED_TABLES,
             )
-            for comp in comps:
-                if comp["col_count"] > 12:
-                    continue
-                ct_name = comp["table_name"]
-                if ct_name not in picked_for_ds and len(picked_for_ds) + len(matched_tables) < limit_cap:
-                    picked_for_ds.append(ct_name)
-                    reasons_for_table[ct_name] = "关联维表与字典"
+            for rank, h in enumerate(hits):
+                if h.in_scope and h.name not in ctx["picked"]:
+                    global_bm25_hits.append((float(h.score), -ctx["idx"], -rank, ctx, h.name))
+        global_bm25_hits.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        for _score, _neg_ds_idx, _neg_rank, ctx, tname in global_bm25_hits:
+            if total_picked >= MAX_GROUNDED_TABLES:
+                break
+            _pick_table(ctx, tname, "目录语义检索命中")
+
+    # (d) 若用户明确指定了该小库（<= 5 张表）且尚未命中任何表，直接全给
+    for ctx in ds_ctx_list:
+        ds = ctx["ds"]
+        if not ctx["picked"] and ds in explicit_sources and len(ctx["tables_map"]) <= 5:
+            for tname in list(ctx["tables_map"].keys()):
+                if not _pick_table(ctx, tname, "指定数据源核心表"):
                     break
-            return comps
 
-        _include_companion_lookup(MAX_GROUNDED_TABLES)
-
-        # (c) BM25 数据目录检索直选（0 LLM 调用）
-        remaining_slots = MAX_GROUNDED_TABLES - len(matched_tables) - len(picked_for_ds)
-        if remaining_slots > 0:
-            hits = schema_view.search_tables(ds, visible_by_table, combined_q, limit=remaining_slots + 2)
-            for h in hits:
-                if h.in_scope and h.name not in picked_for_ds and len(picked_for_ds) + len(matched_tables) < MAX_GROUNDED_TABLES:
-                    picked_for_ds.append(h.name)
-                    reasons_for_table[h.name] = "目录语义检索命中"
-
-        # (d) 若用户明确指定了该小库（<= 5 张表）且尚未命中任何表，直接全给
-        if not picked_for_ds and ds in explicit_sources and len(tables_map) <= 5:
-            for tname in list(tables_map.keys())[:MAX_GROUNDED_TABLES - len(matched_tables)]:
-                picked_for_ds.append(tname)
-                reasons_for_table[tname] = "指定数据源核心表"
-
-        companion_links = _include_companion_lookup(MAX_GROUNDED_TABLES + 1)
-
+    # 按数据源顺序补齐关联维表与一跳连接表，渲染表结构与护栏
+    for ctx in ds_ctx_list:
+        ds = ctx["ds"]
+        picked_for_ds: list[str] = ctx["picked"]
         if not picked_for_ds:
             continue
+        reasons_for_table: dict[str, str] = ctx["reasons"]
+        tables_map = ctx["tables_map"]
+        raw_notes = ctx["raw_notes"]
+        visible_by_table = ctx["visible_by_table"]
+        facts = ctx["facts"]
+        masked = ctx["masked"]
+        rel_graph = ctx["rel_graph"]
+
+        companion_links = find_companion_lookup_tables(
+            tables_map,
+            picked_for_ds,
+            visible_by_table=visible_by_table,
+            rel_graph=rel_graph,
+            masked_set=masked,
+        )
+        for comp in companion_links:
+            if comp["col_count"] > 12:
+                continue
+            ct_name = comp["table_name"]
+            if _pick_table(ctx, ct_name, "关联维表与字典", cap=MAX_GROUNDED_TABLES + 1):
+                break
 
         # 补一跳连接中间表（若有）
         try:
@@ -546,7 +586,7 @@ async def ground_question(
                 ds_sections.append("表间标准连接条件：\n" + "\n".join(join_lines[:12]))
 
         table_blocks.append("\n".join(ds_sections))
-        if len(matched_tables) >= MAX_GROUNDED_TABLES:
+        if len(matched_tables) >= MAX_GROUNDED_TABLES + 1:
             break
 
     elapsed_ms = max(1, int((time.perf_counter() - t0) * 1000))
@@ -719,4 +759,5 @@ async def ground_question(
         guardrails=guardrails,
         system_context="\n\n".join(ctx_parts),
         ui_summary=ui_summary,
+        has_enabled_metrics=bool(scoped_metrics),
     )

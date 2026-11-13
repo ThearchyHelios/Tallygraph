@@ -46,10 +46,10 @@ class _Hide:
     """按这次运行查到过的遮罩值遮：hide(值) 这个值给不给，shown(文字) 文字里的遮罩值换成「已遮罩」。"""
 
     def __init__(self, secrets: Any) -> None:
-        from app.api.evidence import _Shown
+        from app.engine.evidence_reader import ShownText
 
         self._secrets = secrets
-        self._shown = _Shown(secrets)
+        self._shown = ShownText(secrets)
 
     def hide(self, value: Any) -> bool:
         if self._secrets is None or value is None or isinstance(value, bool):
@@ -61,9 +61,9 @@ class _Hide:
 
 
 async def _hider(sealed: Any) -> _Hide:
-    from app.api.evidence import _Masks
+    from app.engine.evidence_reader import open_masks
 
-    return _Hide(await _Masks(sealed).run_secrets())
+    return _Hide(await open_masks(sealed).run_secrets())
 
 
 async def _names(ids: set[str]) -> dict[str, str]:
@@ -226,10 +226,8 @@ async def run_view(run_id: str) -> dict[str, Any]:
     """GET /api/runs/{run_id}/ledger 的答复：标签、整题判断、每条查询的比对、能做的动作。没比对过、能比的运行这时排上按需比对
     （trigger=on_demand），答复 state=pending；不比的照实说为什么。"""
     from app.api.coded import CodedHTTPException
-    from app.api.deps import restricted
-    from app.api.evidence import RUN_NOT_FOUND, _sealed
-
-    from app.api.deps import current_principal
+    from app.api.deps import current_principal, restricted
+    from app.engine.evidence_reader import RUN_NOT_FOUND, load_sealed as _sealed
     from app.ledger.recall import answer_marks
 
     ordinary = restricted()

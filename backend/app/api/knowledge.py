@@ -9,6 +9,7 @@ from fastapi import (
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from app.core.errors import explain, raw
 from app.core.config import settings
@@ -221,7 +222,12 @@ async def list_documents(
     collection: str | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> list[Document]:
-    stmt = select(Document).order_by(Document.created_at.desc(), Document.id.desc()).limit(300)
+    stmt = (
+        select(Document)
+        .options(defer(Document.content))
+        .order_by(Document.created_at.desc(), Document.id.desc())
+        .limit(300)
+    )
     if collection:
         stmt = stmt.where(Document.collection == collection)
     return list((await session.execute(stmt)).scalars())

@@ -69,9 +69,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 
 #: 参数问题的机器码（§4.4 的三条 + 值承载不了的一条）
@@ -184,13 +186,13 @@ def describe(problems: Iterable[Problem]) -> str:
 # ==========================================================================
 
 
-def slots_of(template: str) -> tuple[Slot, ...]:
+def slots_of(template: str, *, dialect: str | None = None) -> tuple[Slot, ...]:
     """模板里每一处 `{{ input.字段 }}`（含写在哪儿、带了什么过滤器）。认不出写法、写在表名列名里的抛
     ParameterRefused(unsupported_parameter)——判断和带值比对那一套（data/sql_semantics._template_slots）是同一份。"""
     from app.data.sql_semantics import _NotComparable, _template_slots
 
     try:
-        spans, _ = _template_slots(template)
+        spans, _ = _template_slots(template, dialect=dialect)
     except _NotComparable as e:
         raise ParameterRefused([Problem(UNSUPPORTED, str(e))]) from None
     return tuple(Slot(index=s.index, field=s.field, filters=tuple(s.filters), context=s.context) for _, _, s in spans)
@@ -299,8 +301,8 @@ def declared(fields: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
 
 #: 声明类型 → 规范类型。认不出的一律 string（各入口同一套：类型判定不依赖字段先后，R02 的一半）
 _TYPES = {"string": "string", "text": "string", "integer": "integer", "int": "integer", "number": "number",
-          "float": "number", "boolean": "boolean", "bool": "boolean", "date": "date", "datetime": "datetime",
-          "time": "time", "file": "file", "array": "array", "object": "object"}
+          "float": "number", "decimal": "number", "boolean": "boolean", "bool": "boolean", "date": "date",
+          "datetime": "datetime", "time": "time", "file": "file", "array": "array", "object": "object"}
 
 
 def field_type(field: Mapping[str, Any]) -> str:
@@ -314,7 +316,7 @@ def value_kind(value: Any) -> str:
         return "null"
     if isinstance(value, bool):
         return "boolean"
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float, Decimal)):
         return "number"
     if isinstance(value, str):
         return "text"
@@ -366,9 +368,27 @@ def resolve(fields: Iterable[Mapping[str, Any]], values: Mapping[str, Any]) -> d
 def _written(value: Any) -> str:
     if isinstance(value, str):
         return value
+    if isinstance(value, Decimal):
+        from app.engine.expressions import _format_decimal
+
+        return _format_decimal(value)
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False, default=str)
     return str(value)
+
+
+def _bare_scalar_ok(value: Any) -> bool:
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, Decimal):
+        return value.is_finite()
+    if isinstance(value, str):
+        return bool(_NUMBER.match(value))
+    return False
 
 
 def _unresolved(name: str, field: Mapping[str, Any] | None, values: Mapping[str, Any]) -> bool:
@@ -390,14 +410,13 @@ def _unresolved(name: str, field: Mapping[str, Any] | None, values: Mapping[str,
 def literal_problem(name: str, value: Any, contexts: Iterable[str]) -> str | None:
     """值写在 SQL 的哪个位置、旧适配器（内联文本替换）承载得了吗：承载不了给一句原因，承载得了为 None。
 
-    引号里的字里再出现引号 / 反斜杠 / 换行、裸写的位置上不是数、注释里带换行或注释结束符——这些都会让渲染出来的语句
+    引号里的字里再出现引号 / 反斜杠 / 换行、裸写的位置上不是有限数值或布尔值、注释里带换行或注释结束符——这些都会让渲染出来的语句
     不再等于「那一版口径的 SQL」。真支持特殊字符要等驱动级参数绑定（见模块说明），那之前明确拒绝，不硬塞。"""
     text = _written(value)
     where = set(contexts)
     if "quoted" in where and any(ch in text for ch in ("'", "\\", "\n", "\r")):
         return QUOTED_TEXT.format(name=name)
-    if "bare" in where and not (isinstance(value, (int, float)) and not isinstance(value, bool)) \
-            and not (isinstance(value, str) and _NUMBER.match(value)):
+    if "bare" in where and not _bare_scalar_ok(value):
         return BARE_TEXT.format(name=name, value=text[:40])
     if "comment" in where and ("\n" in text or "\r" in text or "*/" in text):
         return COMMENT_TEXT.format(name=name)
@@ -405,13 +424,14 @@ def literal_problem(name: str, value: Any, contexts: Iterable[str]) -> str | Non
 
 
 def check_template(template: str, *, fields: Mapping[str, Mapping[str, Any]], values: Mapping[str, Any] | None = None,
-                   node_id: str | None = None, where: str = "入口字段") -> list[Problem]:
+                   node_id: str | None = None, where: str = "入口字段",
+                   dialect: str | None = None) -> list[Problem]:
     """一条取数模板按声明的入口字段过一遍：未声明、认不出的写法；给了 values 的，再判缺值与值承载不了。
 
     values 为 None 是「此刻还没有这次调用的值」（读一版口径时就是这样）：只判模板和声明对不对得上。
     认不出写法（unsupported）时不接着往下判——值写在哪儿都还没定，别的结论不可靠。"""
     try:
-        slots = slots_of(template)
+        slots = slots_of(template, dialect=dialect)
     except ParameterRefused as e:
         return [Problem(UNSUPPORTED, UNREADABLE_TEXT.format(reason=p.message), node_id=node_id) for p in e.problems]
     problems: list[Problem] = []
@@ -450,7 +470,8 @@ def _sql_of(node: Mapping[str, Any]) -> str | None:
 
 
 def check_nodes(nodes: Iterable[Mapping[str, Any]], *, fields: Iterable[Mapping[str, Any]],
-                values: Mapping[str, Any] | None = None, where: str = "入口字段") -> list[Problem]:
+                values: Mapping[str, Any] | None = None, where: str = "入口字段",
+                dialect: str | None = None) -> list[Problem]:
     """几个调用工具节点（原始 JSON）的 args.sql 各过一遍，问题按节点先后合起来。values 不给就只判模板与声明。"""
     declared_fields = declared(fields)
     out: list[Problem] = []
@@ -461,7 +482,7 @@ def check_nodes(nodes: Iterable[Mapping[str, Any]], *, fields: Iterable[Mapping[
         if sql is None:
             continue
         out += check_template(sql, fields=declared_fields, values=values, node_id=str(node.get("id") or "") or None,
-                              where=where)
+                              where=where, dialect=dialect)
     return out
 
 
@@ -515,7 +536,8 @@ def _hash(text: str) -> str:
 
 
 def material(template: str, *, values: Mapping[str, Any], declared_fields: Mapping[str, Mapping[str, Any]],
-             source: Mapping[str, Any] | None = None, with_template: bool = True) -> dict[str, Any]:
+             source: Mapping[str, Any] | None = None, with_template: bool = True,
+             dialect: str | None = None) -> dict[str, Any]:
     """查询快照要记的那一份：源模板、源模板哈希、规范化输入哈希、参数契约、每个参数的类型与写在哪儿、承载方式。
 
     绑定值不在这里再存一份——内联方式下它就写在实际执行语句里，而实际语句本身在快照里（payload["sql"]）。
@@ -526,7 +548,7 @@ def material(template: str, *, values: Mapping[str, Any], declared_fields: Mappi
     names = input_refs(template)
     bound: list[dict[str, Any]] = []
     try:
-        by_field = {s.field: s.context for s in slots_of(template)}
+        by_field = {s.field: s.context for s in slots_of(template, dialect=dialect)}
     except ParameterRefused:
         by_field = {}
     for name in names:
@@ -553,7 +575,7 @@ def material(template: str, *, values: Mapping[str, Any], declared_fields: Mappi
 
 def plan(template: str, *, fields: Iterable[Mapping[str, Any]], values: Mapping[str, Any],
          source: Mapping[str, Any] | None = None, node_id: str | None = None,
-         where: str = "入口字段") -> Statement:
+         where: str = "入口字段", dialect: str | None = None) -> Statement:
     """「现在就发一条 SQL」的入口用：先按声明的字段把这次的值定下来（resolve：显式非空值优先、否则声明缺省值），
     再判参数完整性，过了才渲染成字面语句，附快照材料——检查、渲染、材料里的输入哈希用的是**同一份 resolved values**。
 
@@ -567,11 +589,13 @@ def plan(template: str, *, fields: Iterable[Mapping[str, Any]], values: Mapping[
     check_nodes / check_template 判过）——它是给下一个入口（QueryCore 的固定执行）准备的共享层接口，行为由测试锁住。"""
     declared_fields = declared(fields)
     resolved = resolve(declared_fields.values(), values)
-    problems = check_template(template, fields=declared_fields, values=resolved, node_id=node_id, where=where)
+    problems = check_template(template, fields=declared_fields, values=resolved, node_id=node_id, where=where,
+                              dialect=dialect)
     if problems:
         raise ParameterRefused(problems)
     return Statement(statement=render(template, resolved),
-                     material=material(template, values=resolved, declared_fields=declared_fields, source=source))
+                     material=material(template, values=resolved, declared_fields=declared_fields, source=source,
+                                       dialect=dialect))
 
 
 # ==========================================================================

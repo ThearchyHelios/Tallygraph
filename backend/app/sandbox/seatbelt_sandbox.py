@@ -78,6 +78,7 @@ def build_policy(workdir: Path, *, language: str, network: bool) -> str:
     """
     work = _real(workdir)
     home = _real(Path.home())
+    data = _real(settings.data_dir)
     lines = [
         "(version 1)",
         "(allow default)",
@@ -98,8 +99,9 @@ def build_policy(workdir: Path, *, language: str, network: bool) -> str:
         ' (literal "/dev/stderr") (literal "/dev/dtracehelper"))',
         '(allow file-write* (subpath "/private/var/folders"))',  # 临时目录，Python 要用
         "",
-        ";; ---- 读：家目录挡住，放行工作区和解释器 ----",
+        ";; ---- 读：家目录与平台数据目录挡住，放行工作区和解释器 ----",
         f'(deny file-read* (subpath "{home}"))',
+        *([f'(deny file-read* (subpath "{data}"))'] if data != home else []),
         f'(allow file-read* (subpath "{work}"))',
     ]
     for root in _interpreter_roots(language):
@@ -194,83 +196,99 @@ class SeatbeltSandbox(Sandbox):
 
         ext, cmd_of = _LANG[language]
         entry = entry_name(ext)
-        workdir = self._session_dir(session_id or f"tmp-{int(time.time() * 1000)}")
-        atomic.write_text(workdir / entry, code)
-
-        for rel, content in (files or {}).items():
-            target = (workdir / rel).resolve()
-            if not str(target).startswith(str(workdir.resolve())):
-                return ExecResult(ok=False, backend=self.name, error=f"非法文件路径：{rel}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            atomic.write_text(target, content)
-
-        self._policies.mkdir(parents=True, exist_ok=True)
-        policy_file = self._policies / f"{workdir.name}-{language}.sb"
-        atomic.write_text(policy_file, build_policy(workdir, language=language, network=limits.network))
-
-        argv = [SANDBOX_EXEC, "-f", str(policy_file), *cmd_of(), entry]
-
-        # HOME 指向工作区：既挡住家目录，又让解释器的缓存有地方落
-        child_env = {
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
-            "HOME": str(workdir),
-            "TMPDIR": str(workdir),
-            "LANG": "en_US.UTF-8",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONUNBUFFERED": "1",
-            **(env or {}),
-        }
-
-        started = time.perf_counter()
+        ephemeral = not session_id
+        workdir = self._session_dir(session_id or f"tmp-{int(time.time() * 1000)}-{os.urandom(4).hex()}")
+        work_root = workdir.resolve()
+        policy_file: Path | None = None
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=str(workdir),
-                env=child_env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                preexec_fn=self._preexec(limits),
-            )
-        except Exception as e:  # noqa: BLE001
-            # 首行只说原因，类名和 errno 这些留给日志
-            logger.warning("%s 沙箱起进程失败：%s", self.name, raw(e))
-            return ExecResult(ok=False, backend=self.name, error=f"没能启动进程：{describe_exception(e)}")
+            atomic.write_text(workdir / entry, code)
 
-        try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=limits.timeout)
-        except asyncio.TimeoutError:
-            self._kill(proc)
-            await proc.wait()
+            for rel, content in (files or {}).items():
+                target = (workdir / rel).resolve()
+                if not target.is_relative_to(work_root):
+                    return ExecResult(ok=False, backend=self.name, error=f"非法文件路径：{rel}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                atomic.write_text(target, content)
+
+            self._policies.mkdir(parents=True, exist_ok=True)
+            policy_file = self._policies / f"{workdir.name}-{language}.sb"
+            atomic.write_text(policy_file, build_policy(workdir, language=language, network=limits.network))
+
+            argv = [SANDBOX_EXEC, "-f", str(policy_file), *cmd_of(), entry]
+
+            # HOME 指向工作区：既挡住家目录，又让解释器的缓存有地方落
+            child_env = {
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
+                "HOME": str(workdir),
+                "TMPDIR": str(workdir),
+                "LANG": "en_US.UTF-8",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONUNBUFFERED": "1",
+                **(env or {}),
+            }
+
+            started = time.perf_counter()
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=str(workdir),
+                    env=child_env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    preexec_fn=self._preexec(limits),
+                )
+            except Exception as e:  # noqa: BLE001
+                # 首行只说原因，类名和 errno 这些留给日志
+                logger.warning("%s 沙箱起进程失败：%s", self.name, raw(e))
+                return ExecResult(ok=False, backend=self.name, error=f"没能启动进程：{describe_exception(e)}")
+
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=limits.timeout)
+            except asyncio.TimeoutError:
+                self._kill(proc)
+                await proc.wait()
+                return ExecResult(
+                    ok=False,
+                    backend=self.name,
+                    timed_out=True,
+                    exit_code=124,
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    error=f"执行超过 {limits.timeout} 秒，已终止",
+                )
+            except BaseException:
+                if proc.returncode is None:
+                    self._kill(proc)
+                    await proc.wait()
+                raise
+
+            stdout, t1 = truncate(out.decode(errors="replace"), limits.max_output)
+            stderr, t2 = truncate(err.decode(errors="replace"), limits.max_output)
+            code_ = proc.returncode or 0
+            # CPU 时间用尽是 SIGXCPU(24)，归到超时里更好理解
+            timed_out = code_ in (-24, 152)
+            written = [
+                p.name for p in workdir.iterdir()
+                if p.is_file() and not p.name.startswith(ENTRY_PREFIX)
+            ][:50]
+
             return ExecResult(
-                ok=False,
+                ok=code_ == 0,
+                exit_code=code_,
+                stdout=stdout,
+                stderr=stderr if not timed_out else (stderr or "CPU 时间超限，已终止"),
+                truncated=t1 or t2,
+                timed_out=timed_out,
                 backend=self.name,
-                timed_out=True,
-                exit_code=124,
                 duration_ms=int((time.perf_counter() - started) * 1000),
-                error=f"执行超过 {limits.timeout} 秒，已终止",
+                files_written=written,
             )
-
-        stdout, t1 = truncate(out.decode(errors="replace"), limits.max_output)
-        stderr, t2 = truncate(err.decode(errors="replace"), limits.max_output)
-        code_ = proc.returncode or 0
-        # CPU 时间用尽是 SIGXCPU(24)，归到超时里更好理解
-        timed_out = code_ in (-24, 152)
-        written = [
-            p.name for p in workdir.iterdir()
-            if p.is_file() and not p.name.startswith(ENTRY_PREFIX)
-        ][:50]
-
-        return ExecResult(
-            ok=code_ == 0,
-            exit_code=code_,
-            stdout=stdout,
-            stderr=stderr if not timed_out else (stderr or "CPU 时间超限，已终止"),
-            truncated=t1 or t2,
-            timed_out=timed_out,
-            backend=self.name,
-            duration_ms=int((time.perf_counter() - started) * 1000),
-            files_written=written,
-        )
+        finally:
+            if ephemeral:
+                if policy_file is not None:
+                    policy_file.unlink(missing_ok=True)
+                root_resolved = self._root.resolve()
+                if work_root != root_resolved and work_root.is_relative_to(root_resolved):
+                    shutil.rmtree(workdir, ignore_errors=True)
 
     @staticmethod
     def _kill(proc: asyncio.subprocess.Process) -> None:

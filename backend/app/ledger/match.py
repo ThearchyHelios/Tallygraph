@@ -579,9 +579,15 @@ def compare_queries(queries: list[Query], calibers: list[Caliber], *, deadline: 
         chosen = (composed or {}).get(str(query.node_id or ""))
         wanted = _wanted(query, referenced)
         pool = [(c, f) for c in calibers for f in c.fetches if f.source == query.source and f.tables & query.tables]
-        if chosen is not None:
-            # 助手选用的那一份排最前面：候选多的时候也一定比到它
-            pool.sort(key=lambda cf: (cf[0].key, cf[1].node_id) != chosen)
+        if pool:
+            # 助手选用的排第一；其余按「共享表数越多越靠前、表集合规模越接近越靠前」排，同分保持工作流/版本/节点原序
+            pool.sort(
+                key=lambda cf: (
+                    (cf[0].key, cf[1].node_id) != chosen if chosen is not None else False,
+                    -len(cf[1].tables & query.tables),
+                    abs(len(cf[1].tables) - len(query.tables)),
+                )
+            )
         if not pool:
             out.append({**row, "status": "none", "candidates": []})
             continue
@@ -649,7 +655,7 @@ def _card_loader(sealed: Any) -> Any:
 def referenced_of(sealed: Any) -> dict[str, set[str]]:
     """这次运行封存的报告引用了哪条查询的哪几列（labels.referenced_columns，只读哈希核对一致的报告）：compare_queries 的
     referenced。评测逐题比 SQL 时传它，就和账本一样按引用的列投影。在线程里调（读盘）。"""
-    from app.api.evidence import _reports
+    from app.engine.evidence_reader import reports_of as _reports
 
     docs = [r.doc for r in _reports(sealed) if r.doc is not None and r.hash_ok is True]
     return ledger_labels.referenced_columns(docs, _card_loader(sealed))
@@ -657,7 +663,7 @@ def referenced_of(sealed: Any) -> dict[str, set[str]]:
 
 def compute(sealed: Any, calibers: list[Caliber], kinds: dict[str, str | None], *, timeout: float) -> dict[str, Any]:
     """一次运行的比对工件内容（见 ledger/store 的模块说明）。在线程里调：读快照、比 SQL、标数都是同步的活。"""
-    from app.api.evidence import _choose, _reports
+    from app.engine.evidence_reader import choose_report as _choose, reports_of as _reports
 
     deadline = time.monotonic() + timeout
     queries = read_queries(sealed, kinds)
@@ -753,8 +759,8 @@ async def match_run(run_id: str, *, trigger: str = "sealed", timeout: float | No
 
 
 async def _match_run(run_id: str, *, trigger: str, timeout: float | None) -> str | None:
-    from app.api.evidence import _sealed
-    from app.api.settings import ledger_settings
+    from app.engine.evidence_reader import load_sealed as _sealed
+    from app.ledger.settings import ledger_settings
 
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)

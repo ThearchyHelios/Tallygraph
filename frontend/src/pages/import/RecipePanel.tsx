@@ -1143,6 +1143,13 @@ export function RecipePanel({ recipe, problems, units, candidates, labelOptions,
   const [assigned, setAssigned] = useState<{ map: Map<string, RecipeProblem[]>; top: RecipeProblem[] }>({ map: new Map(), top: [] })
   const sig = useRef('')
   useLayoutEffect(() => {
+    if (!problems.length) {
+      if (sig.current) {
+        sig.current = ''
+        setAssigned({ map: new Map(), top: [] })
+      }
+      return
+    }
     const paths = [...registry.current]
     const map = new Map<string, RecipeProblem[]>()
     const top: RecipeProblem[] = []

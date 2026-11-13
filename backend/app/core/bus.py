@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Callable
 from typing import AsyncIterator
 
@@ -11,6 +11,7 @@ from app.core.events import RunEventModel
 # 单个订阅者的积压上限。慢消费者（比如卡住的浏览器标签）不应该拖垮整个 run，
 # 所以队列满了就丢最旧的事件并打标记，而不是阻塞发布方。
 _QUEUE_MAXSIZE = 2048
+_MAX_SEQ_ENTRIES = 4096
 
 
 class _Subscriber:
@@ -31,17 +32,30 @@ class EventBus:
 
     def __init__(self) -> None:
         self._subs: dict[str, set[_Subscriber]] = defaultdict(set)
-        self._seq: dict[str, int] = defaultdict(int)
+        self._seq: OrderedDict[str, int] = OrderedDict()
         self._lock = asyncio.Lock()
         self.tap: Callable[[RunEventModel], None] | None = None
 
+    def _trim_seq(self) -> None:
+        while len(self._seq) > _MAX_SEQ_ENTRIES:
+            oldest, _ = next(iter(self._seq.items()))
+            if self._subs.get(oldest):
+                self._seq.move_to_end(oldest)
+                break
+            self._seq.popitem(last=False)
+
     def next_seq(self, run_id: str) -> int:
-        self._seq[run_id] += 1
-        return self._seq[run_id]
+        nxt = self._seq.get(run_id, 0) + 1
+        self._seq[run_id] = nxt
+        self._seq.move_to_end(run_id)
+        self._trim_seq()
+        return nxt
 
     def set_seq(self, run_id: str, value: int) -> None:
         """恢复一个已存在的 run 时，把序号接上，保证前端排序不乱。"""
-        self._seq[run_id] = max(self._seq[run_id], value)
+        self._seq[run_id] = max(self._seq.get(run_id, 0), value)
+        self._seq.move_to_end(run_id)
+        self._trim_seq()
 
     async def publish(self, event: RunEventModel, *, relayed: bool = False) -> None:
         if not relayed and self.tap is not None:
@@ -61,6 +75,7 @@ class EventBus:
 
     async def close(self, run_id: str) -> None:
         """给所有订阅者发结束哨兵，让 WebSocket 干净地收尾。"""
+        self._seq.pop(run_id, None)
         for sub in list(self._subs.get(run_id, ())):
             with contextlib.suppress(asyncio.QueueFull):
                 sub.queue.put_nowait(None)

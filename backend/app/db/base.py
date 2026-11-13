@@ -145,6 +145,8 @@ def _set_sqlite_pragma(dbapi_conn, _record):  # pragma: no cover - 驱动回调
     """WAL + 外键约束。WAL 让读写不互相阻塞，事件写入和前端轮询能并行。"""
     cur = dbapi_conn.cursor()
     cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA synchronous=NORMAL")
+    cur.execute("PRAGMA journal_size_limit=67108864")
     cur.execute("PRAGMA foreign_keys=ON")
     cur.execute("PRAGMA busy_timeout=5000")
     cur.close()
@@ -514,6 +516,17 @@ _INDEX_MIGRATIONS: list[tuple[str, str, str | tuple[str, ...]]] = [
     ("ix_artifacts_kind", "artifacts", "kind"),
     # 增量重导入的工作项按持久对齐键认（K11）：候选顺序、条数变了也要认得出同一个工作项
     ("ix_caliber_import_items_align_key", "caliber_import_items", "align_key"),
+    # 热点翻页、跨库检索与级联外键索引：避免列表全表排序和删除父表时全表扫子表
+    ("ix_runs_created_id", "runs", ("created_at", "id")),
+    ("ix_documents_col_created", "documents", ("collection", "created_at", "id")),
+    ("ix_documents_created_id", "documents", ("created_at", "id")),
+    ("ix_chunks_document_id", "chunks", "document_id"),
+    ("ix_chunk_terms_term", "chunk_terms", "term"),
+    ("ix_conversation_turns_run_id", "conversation_turns", "run_id"),
+    ("ix_caliber_drafts_datasource_id", "caliber_drafts", "datasource_id"),
+    ("ix_caliber_drafts_workflow_id", "caliber_drafts", "workflow_id"),
+    ("ix_caliber_write_requests_workflow_id", "caliber_write_requests", "workflow_id"),
+    ("ix_trigger_deliveries_event_id", "trigger_deliveries", "event_id"),
 ]
 
 

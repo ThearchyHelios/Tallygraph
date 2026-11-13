@@ -38,6 +38,7 @@ from app.analysis.inputs import Snap, as_list, hashable, same_value
 from app.analysis.numbers import canon, to_fraction
 
 TESTS = {"z": "z 检验", "fisher": "Fisher 精确检验", "welch": "Welch t 检验"}
+MAX_ROWS_MODE = 1000
 
 
 def used_settings(mode: str | None) -> list[str]:
@@ -214,6 +215,13 @@ def differ(raw: Mapping[str, Any], env: Env) -> Any:
         env.inputs.use(snap, "data", [group_col, *cols.values()])
         return refuse(env, params, used, "truncated", f"{snap.ref} 只取回了前 {len(snap.rows)} 行，各组不完整",
                       criterion=criterion)
+    if mode == "rows" and len(snap.rows) > MAX_ROWS_MODE:
+        raise CallError(
+            "too_many_rows",
+            f"{snap.ref} 有 {len(snap.rows)} 行，超过逐行明细模式 {MAX_ROWS_MODE} 行的上限："
+            f"请在 SQL 里按 {group_col} 汇总出 SUM、SUM(x*x)、COUNT(*)，改用 mean 模式",
+            reason=f"{snap.ref} 有 {len(snap.rows)} 行，超过逐行明细 {MAX_ROWS_MODE} 行的上限",
+        )
     groups = _groups(snap, group_col, cols, mode, by_period, params)  # type: ignore[arg-type]
     pairs = _pairs(raw, params, groups, mode, dim_label, by_period, group_col)  # type: ignore[arg-type]
     env.inputs.use(snap, "data", [group_col, *cols.values()],

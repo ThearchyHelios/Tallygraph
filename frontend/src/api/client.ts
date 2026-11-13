@@ -1205,6 +1205,7 @@ export function streamRun(
   /** 握手连续失败（一次都没打开过就断了）几次 */
   let refused = 0
   let pollTimer: ReturnType<typeof setTimeout> | undefined
+  let wsRetryTimer: ReturnType<typeof setTimeout> | undefined
 
   const finish = (status?: string) => {
     if (closed) return
@@ -1253,7 +1254,8 @@ export function streamRun(
     socket = new WebSocket(`${proto}://${location.host}/api/runs/${runId}/stream?after=${lastSeq}`)
 
     socket.onmessage = (ev) => {
-      const event = parseBody(ev.data) as RunEvent & { type: string; status?: string }
+      const event = parseBody(ev.data) as (RunEvent & { type?: string; status?: string }) | null
+      if (!event || typeof event !== 'object' || typeof event.type !== 'string') return
       if (event.type === 'stream.end') {
         socket?.close()
         // 新后端放在 data.status，老后端放在顶层 status
@@ -1261,7 +1263,7 @@ export function streamRun(
         return
       }
       if (event.seq) lastSeq = Math.max(lastSeq, event.seq)
-      onEvent(event)
+      onEvent(event as RunEvent)
     }
     socket.onclose = () => {
       if (closed) return
@@ -1273,12 +1275,14 @@ export function streamRun(
       }
       // 指数退避重连，最多等 5 秒
       retry += 1
-      setTimeout(connect, Math.min(300 * 2 ** retry, 5000))
+      clearTimeout(wsRetryTimer)
+      wsRetryTimer = setTimeout(connect, Math.min(300 * 2 ** retry, 5000))
     }
     socket.onopen = () => {
       opened = true
       refused = 0
       retry = 0
+      clearTimeout(wsRetryTimer)
       report(true)
     }
   }
@@ -1287,6 +1291,7 @@ export function streamRun(
   return () => {
     closed = true
     clearTimeout(pollTimer)
+    clearTimeout(wsRetryTimer)
     socket?.close()
   }
 }

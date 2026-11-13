@@ -12,7 +12,7 @@ import {
   confirmDialog, DeleteButton, EmptyState, ErrorState, Field, HealthPill, isComposing, Modal, PageHeader,
   promptDialog, SectionBar, Skeleton, Spinner, TabPanel, Tabs, toast, useRadioGroup, useTabRoute,
 } from '../components/ui'
-import { setThemePref, useTheme } from '../components/CommandPalette'
+import { setThemePref, useTheme } from '../components/shellCommands'
 import { errorMessage } from '../lib/errors'
 import { formatNumber, shortLabel } from '../lib/format'
 import { checkHealth, forgetHealth, healthFromServer, setHealth, useHealth } from '../lib/health'

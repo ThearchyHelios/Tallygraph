@@ -519,8 +519,8 @@ def _plan_rows(ours_columns: list[str], rows: list[Any], hidden: set[str], calib
 
 def _referenced(sealed: Any, artifact: str) -> list[tuple[int, str]]:
     """报告里引用了这条查询的哪几格：[(行, 列)]，按正文的先后（单元格、表格里的格）。"""
-    from app.api.evidence import _reports
     from app.engine.evidence import iter_units
+    from app.engine.evidence_reader import reports_of as _reports
 
     out: list[tuple[int, str]] = []
     for report in _reports(sealed):
@@ -580,8 +580,8 @@ def pinned_effective(pinned: Any) -> list[dict[str, Any]]:
 async def reconcile(run_id: str, req: Request, *, principal: Any) -> Run:
     """对这次运行的一条查询和一份相关口径对一次账：派生只读图、发起探索运行（来源 reconcile）。不能对的抛 ReconcileRefused。"""
     from app.api.deps import can_read_run
-    from app.api.evidence import _Masks, _sealed
     from app.core.artifact_store import load
+    from app.engine.evidence_reader import load_sealed as _sealed, open_masks as _Masks
     from app.engine.launch import LaunchRefused, launch_run
     from app.ledger import compose, derive, store
     from app.ledger.issue import _conversation_of

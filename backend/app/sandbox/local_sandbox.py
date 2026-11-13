@@ -107,73 +107,90 @@ class LocalSandbox(Sandbox):
                 ok=False, backend=self.name, error=f"本机找不到 {argv[0]}"
             )
 
-        workdir = self._session_dir(session_id or f"tmp-{int(time.time()*1000)}")
-        atomic.write_text(workdir / entry, code)
-        for rel, content in (files or {}).items():
-            target = (workdir / rel).resolve()
-            if not str(target).startswith(str(workdir.resolve())):
-                return ExecResult(ok=False, backend=self.name, error=f"非法文件路径：{rel}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            atomic.write_text(target, content)
-
-        # 只透传最小环境变量，避免把宿主机的 API key 泄漏给被执行的代码
-        child_env = {
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "HOME": str(workdir),
-            "LANG": "en_US.UTF-8",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            **(env or {}),
-        }
-
-        started = time.perf_counter()
+        ephemeral = not session_id
+        workdir = self._session_dir(session_id or f"tmp-{int(time.time() * 1000)}-{os.urandom(4).hex()}")
+        work_root = workdir.resolve()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=str(workdir),
-                env=child_env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                preexec_fn=self._preexec(limits),
-            )
-        except Exception as e:  # noqa: BLE001
-            # 首行只说原因，类名和 errno 这些留给日志
-            logger.warning("%s 沙箱起进程失败：%s", self.name, raw(e))
-            return ExecResult(ok=False, backend=self.name, error=f"无法启动进程：{describe_exception(e)}")
+            atomic.write_text(workdir / entry, code)
+            for rel, content in (files or {}).items():
+                target = (workdir / rel).resolve()
+                if not target.is_relative_to(work_root):
+                    return ExecResult(ok=False, backend=self.name, error=f"非法文件路径：{rel}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                atomic.write_text(target, content)
 
-        try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=limits.timeout)
-        except asyncio.TimeoutError:
+            # 只透传最小环境变量，避免把宿主机的 API key 泄漏给被执行的代码
+            child_env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": str(workdir),
+                "LANG": "en_US.UTF-8",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                **(env or {}),
+            }
+
+            started = time.perf_counter()
             try:
-                os.killpg(os.getpgid(proc.pid), 9)
-            except (ProcessLookupError, PermissionError):
-                proc.kill()
-            await proc.wait()
-            return ExecResult(
-                ok=False,
-                backend=self.name,
-                timed_out=True,
-                exit_code=124,
-                duration_ms=int((time.perf_counter() - started) * 1000),
-                error=f"执行超过 {limits.timeout} 秒，已终止",
-            )
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=str(workdir),
+                    env=child_env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    preexec_fn=self._preexec(limits),
+                )
+            except Exception as e:  # noqa: BLE001
+                # 首行只说原因，类名和 errno 这些留给日志
+                logger.warning("%s 沙箱起进程失败：%s", self.name, raw(e))
+                return ExecResult(ok=False, backend=self.name, error=f"无法启动进程：{describe_exception(e)}")
 
-        stdout, t1 = truncate(out.decode(errors="replace"), limits.max_output)
-        stderr, t2 = truncate(err.decode(errors="replace"), limits.max_output)
-        written = [
-            p.name
-            for p in workdir.iterdir()
-            if p.is_file() and not p.name.startswith(ENTRY_PREFIX)
-        ][:50]
-        return ExecResult(
-            ok=proc.returncode == 0,
-            exit_code=proc.returncode or 0,
-            stdout=stdout,
-            stderr=stderr,
-            truncated=t1 or t2,
-            backend=self.name,
-            duration_ms=int((time.perf_counter() - started) * 1000),
-            files_written=written,
-        )
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=limits.timeout)
+            except asyncio.TimeoutError:
+                self._kill(proc)
+                await proc.wait()
+                return ExecResult(
+                    ok=False,
+                    backend=self.name,
+                    timed_out=True,
+                    exit_code=124,
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    error=f"执行超过 {limits.timeout} 秒，已终止",
+                )
+            except BaseException:
+                if proc.returncode is None:
+                    self._kill(proc)
+                    await proc.wait()
+                raise
+
+            stdout, t1 = truncate(out.decode(errors="replace"), limits.max_output)
+            stderr, t2 = truncate(err.decode(errors="replace"), limits.max_output)
+            written = [
+                p.name
+                for p in workdir.iterdir()
+                if p.is_file() and not p.name.startswith(ENTRY_PREFIX)
+            ][:50]
+            return ExecResult(
+                ok=proc.returncode == 0,
+                exit_code=proc.returncode or 0,
+                stdout=stdout,
+                stderr=stderr,
+                truncated=t1 or t2,
+                backend=self.name,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                files_written=written,
+            )
+        finally:
+            if ephemeral:
+                root_resolved = self._root.resolve()
+                if work_root != root_resolved and work_root.is_relative_to(root_resolved):
+                    shutil.rmtree(workdir, ignore_errors=True)
+
+    @staticmethod
+    def _kill(proc: asyncio.subprocess.Process) -> None:
+        try:
+            os.killpg(os.getpgid(proc.pid), 9)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
 
     async def cleanup(self, session_id: str) -> None:
         path = self._session_dir(session_id)

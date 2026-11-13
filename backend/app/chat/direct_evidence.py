@@ -473,6 +473,38 @@ def _auto_bind_bare_numbers(
     if not cells:
         return text
 
+    cell_order = {id(c): idx for idx, c in enumerate(cells)}
+    text_code_by_raw: dict[str, list[_CellCandidate]] = {}
+    numeric_cells: list[_CellCandidate] = []
+    numeric_by_exact: dict[Decimal, list[_CellCandidate]] = {}
+    for c in cells:
+        if c.is_text_code:
+            text_code_by_raw.setdefault(c.raw_text, []).append(c)
+        else:
+            numeric_cells.append(c)
+            numeric_by_exact.setdefault(c.dec_value, []).append(c)
+
+    quant_cache: dict[tuple[str, int], dict[Decimal, list[_CellCandidate]]] = {}
+
+    def _quant_buckets(scale_kind: str, places: int) -> dict[Decimal, list[_CellCandidate]]:
+        key = (scale_kind, places)
+        cached = quant_cache.get(key)
+        if cached is not None:
+            return cached
+        buckets: dict[Decimal, list[_CellCandidate]] = {}
+        quant = Decimal(1).scaleb(-places)
+        if scale_kind == "pct":
+            for c in numeric_cells:
+                q_val = (c.dec_value * Decimal(100)).quantize(quant, rounding=ROUND_HALF_UP)
+                buckets.setdefault(q_val, []).append(c)
+        else:
+            divisor = Decimal(10000) if scale_kind == "万" else Decimal(100_000_000)
+            for c in numeric_cells:
+                q_val = (c.dec_value / divisor).quantize(quant, rounding=ROUND_HALF_UP)
+                buckets.setdefault(q_val, []).append(c)
+        quant_cache[key] = buckets
+        return buckets
+
     fences = _fenced_line_ranges(text)
     lines = text.splitlines(keepends=True)
     table_headers = _table_headers_by_line(lines)
@@ -546,31 +578,31 @@ def _auto_bind_bare_numbers(
                 continue
 
             has_leading_zero = bool(_LEADING_ZERO_INT_RE.match(raw_clean))
+            places = max(int(tok.decimals or 0), 0)
             matched: list[tuple[_CellCandidate, str | None]] = []
-            for cand in cells:
-                if has_leading_zero:
-                    if cand.is_text_code and cand.raw_text == raw_clean:
-                        matched.append((cand, None))
-                    continue
-                if cand.is_text_code:
-                    if not tok.is_percent and not unit_conv and cand.raw_text == raw_clean:
-                        matched.append((cand, None))
-                    continue
-                if unit_conv and unit_scale is not None:
-                    scaled_u = cand.dec_value / unit_scale
-                    places = max(int(tok.decimals or 0), 0)
-                    quant = Decimal(1).scaleb(-places)
-                    if scaled_u.quantize(quant, rounding=ROUND_HALF_UP) == target_dec:
-                        matched.append((cand, unit_conv))
-                elif cand.dec_value == target_dec:
-                    matched.append((cand, None))
-                elif tok.is_percent:
-                    # 单元格存 0.1258，正文写 12.6% 或 12.58%
-                    scaled = cand.dec_value * Decimal(100)
-                    places = max(int(tok.decimals or 0), 0)
-                    quant = Decimal(1).scaleb(-places)
-                    if scaled.quantize(quant, rounding=ROUND_HALF_UP) == target_dec:
-                        matched.append((cand, "pct"))
+            if has_leading_zero:
+                matched = [(c, None) for c in text_code_by_raw.get(raw_clean, ())]
+            elif unit_conv and unit_scale is not None:
+                matched = [(c, unit_conv) for c in _quant_buckets(unit_conv, places).get(target_dec, ())]
+            elif not tok.is_percent:
+                tc_hits = [(c, None) for c in text_code_by_raw.get(raw_clean, ())]
+                num_hits = [(c, None) for c in numeric_by_exact.get(target_dec, ())]
+                if tc_hits and num_hits:
+                    matched = sorted(tc_hits + num_hits, key=lambda pair: cell_order[id(pair[0])])
+                else:
+                    matched = tc_hits or num_hits
+            else:
+                # 单元格存 12.6（直接相等）或存 0.1258（正文写 12.6% 或 12.58%）
+                exact_hits = [(c, None) for c in numeric_by_exact.get(target_dec, ())]
+                pct_hits = [
+                    (c, "pct")
+                    for c in _quant_buckets("pct", places).get(target_dec, ())
+                    if c.dec_value != target_dec
+                ]
+                if exact_hits and pct_hits:
+                    matched = sorted(exact_hits + pct_hits, key=lambda pair: cell_order[id(pair[0])])
+                else:
+                    matched = exact_hits or pct_hits
 
             if not matched:
                 continue

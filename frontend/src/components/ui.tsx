@@ -1,4 +1,7 @@
-import { Component, useCallback, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
+import {
+  cloneElement, Component, isValidElement, useCallback, useEffect, useId, useLayoutEffect, useRef, useState,
+  useSyncExternalStore,
+} from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import type {
   ButtonHTMLAttributes, CSSProperties, ErrorInfo, KeyboardEvent as ReactKeyboardEvent, ReactNode, RefObject,
@@ -1514,15 +1517,43 @@ export function Field({ label, htmlFor, hint, error, required, children, classNa
   const hintId = `${id}-hint`
   const errorId = `${id}-error`
   const describedBy = error ? errorId : hint ? hintId : undefined
+  const invalid = error ? true : undefined
+  const bindControl = (node: ReactNode): { node: ReactNode; bound: boolean } => {
+    if (isValidElement<Record<string, any>>(node)
+        && (node.type === 'input' || node.type === 'select' || node.type === 'textarea')
+        && node.props.id == null) {
+      return {
+        bound: true,
+        node: cloneElement(node, {
+          id,
+          'aria-describedby': node.props['aria-describedby'] ?? describedBy,
+          'aria-invalid': node.props['aria-invalid'] ?? invalid,
+        }),
+      }
+    }
+    return { node, bound: false }
+  }
+  let content: ReactNode
+  if (typeof children === 'function') {
+    content = children({ id, 'aria-describedby': describedBy, 'aria-invalid': invalid })
+  } else if (Array.isArray(children)) {
+    let bound = false
+    content = children.map((child) => {
+      if (bound) return child
+      const res = bindControl(child)
+      bound = res.bound
+      return res.node
+    })
+  } else {
+    content = bindControl(children).node
+  }
   return (
     <div className={clsx('min-w-0', className)}>
       <label className="label" htmlFor={id}>
         {label}
         {required && <span className="ml-0.5 text-[var(--err)]" aria-hidden>*</span>}
       </label>
-      {typeof children === 'function'
-        ? children({ id, 'aria-describedby': describedBy, 'aria-invalid': error ? true : undefined })
-        : children}
+      {content}
       {error
         ? <div id={errorId} className="mt-1 text-2xs leading-relaxed text-[var(--err)]">{error}</div>
         : hint

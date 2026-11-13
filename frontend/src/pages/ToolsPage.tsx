@@ -631,7 +631,7 @@ function CustomTools() {
   const [rows, setRows] = useState<any[] | null>(null)
   const [error, setError] = useState<unknown>(null)
   const [editing, setEditing] = useState<any | null>(null)
-  const endpoints = useEndpoints()
+  const { items: endpoints } = useEndpoints()
 
   // ?edit=<工具名>：运行失败说「参数定义写坏了」时直接打开那一个的编辑框，不用再翻列表。
   // 读完就从地址里摘掉，免得关了弹窗、刷新一下又弹出来
@@ -774,7 +774,7 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
   const nameError = form.name && !TOOL_NAME_RE.test(form.name) ? '只能包含英文字母、数字和下划线，且不能以数字开头' : null
   const dirty = JSON.stringify(form) !== JSON.stringify(initial)
   // 绑定登记的端点（§3.9）：config 是 {endpoint, method, path, query, body}，只填路径，地址和认证头由端点按环境提供
-  const endpoints = useEndpoints()
+  const { items: endpoints, failed: endpointsFailed } = useEndpoints()
   const bound = form.kind === 'http' && !!form.config.endpoint
   const missingConfig = [
     form.kind === 'http' && !bound && !form.config.url && 'URL',
@@ -892,13 +892,15 @@ function CustomToolEditor({ row, onClose, onSaved }: { row: any; onClose: () => 
         </div>
 
         {form.kind === 'http' && (
-          <Field label={TOOL_ENDPOINT_TEXT.bind} hint={endpoints && !endpoints.length ? TOOL_ENDPOINT_TEXT.noEndpoints : TOOL_ENDPOINT_TEXT.hint}
+          <Field label={TOOL_ENDPOINT_TEXT.bind}
+                 hint={endpointsFailed ? TOOL_ENDPOINT_TEXT.loadFailed : endpoints && !endpoints.length ? TOOL_ENDPOINT_TEXT.noEndpoints : TOOL_ENDPOINT_TEXT.hint}
                  error={endpointMissing ? TOOL_ENDPOINT_TEXT.missing(String(form.config.endpoint)) : undefined}>
             {(p) => (
               <select {...p} className="field" value={endpointValue} onChange={(e) => bindEndpoint(e.target.value)}
                       data-custom-tool-endpoint="">
                 <option value="">{TOOL_ENDPOINT_TEXT.none}</option>
                 {(endpoints ?? []).map((ep) => <option key={ep.id} value={ep.id}>{ep.name}</option>)}
+                {bound && !endpoints && <option value={endpointValue}>{String(form.config.endpoint)}</option>}
                 {endpointMissing && <option value={endpointValue} disabled>{String(form.config.endpoint)}</option>}
               </select>
             )}
@@ -1019,11 +1021,16 @@ function mcpServerRecord(row: any): HealthRecord | undefined {
 const mcpConnection = (f: any) => JSON.stringify([f.transport, f.command.trim(), f.args.trim(), f.env ?? {}, f.url.trim(),
   f.headers ?? {}, f.endpoint_id ?? null])
 
-/** 登记的端点（绑定用）。取不到时为空列表，照样能不绑定 */
-function useEndpoints(): EndpointRow[] | null {
-  const [rows, setRows] = useState<EndpointRow[] | null>(null)
-  useEffect(() => { api.endpoints.list().then(({ items }) => setRows(items), () => setRows([])) }, [])
-  return rows
+/** 登记的端点（绑定用）。加载失败时保留 null，避免把已绑定的端点误报为已删除 */
+function useEndpoints(): { items: EndpointRow[] | null; failed: boolean } {
+  const [state, setState] = useState<{ items: EndpointRow[] | null; failed: boolean }>({ items: null, failed: false })
+  useEffect(() => {
+    api.endpoints.list().then(
+      ({ items }) => setState({ items, failed: false }),
+      () => setState({ items: null, failed: true }),
+    )
+  }, [])
+  return state
 }
 
 /**
@@ -1242,7 +1249,7 @@ function McpEditor({ row, onClose, onSaved }: {
   onSaved: (name: string, reconnected: boolean) => void
 }) {
   const admin = useAtLeast('admin')
-  const endpoints = useEndpoints()
+  const { items: endpoints, failed: endpointsFailed } = useEndpoints()
   const [initial] = useState(() => ({
     name: row.name ?? '', transport: row.transport ?? 'stdio', command: row.command ?? '',
     args: (row.args ?? []).join(' '), env: row.env ?? {}, url: row.url ?? '', enabled: row.enabled ?? true,
@@ -1326,12 +1333,15 @@ function McpEditor({ row, onClose, onSaved }: {
           </>
         ) : (
           <>
-            <Field label={MCP_AUTH_TEXT.endpoint} hint={MCP_AUTH_TEXT.endpointHint}>
+            <Field label={MCP_AUTH_TEXT.endpoint} hint={endpointsFailed ? TOOL_ENDPOINT_TEXT.loadFailed : MCP_AUTH_TEXT.endpointHint}>
               {(p) => (
                 <select {...p} className="field" value={form.endpoint_id ?? ''} data-mcp-endpoint=""
                         onChange={(e) => setForm({ ...form, endpoint_id: e.target.value || null })}>
                   <option value="">{MCP_AUTH_TEXT.endpointNone}</option>
                   {(endpoints ?? []).map((ep) => <option key={ep.id} value={ep.id}>{ep.name}</option>)}
+                  {form.endpoint_id && !endpoints && (
+                    <option value={form.endpoint_id}>{form.endpoint_id}</option>
+                  )}
                   {form.endpoint_id && endpoints && !endpoints.some((ep) => ep.id === form.endpoint_id) && (
                     <option value={form.endpoint_id} disabled>{TOOL_ENDPOINT_TEXT.missing(form.endpoint_id)}</option>
                   )}

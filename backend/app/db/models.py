@@ -602,7 +602,7 @@ class Workflow(Base, TimestampMixin):
     origin: Mapped[dict[str, Any] | None] = mapped_column(default=None)
 
     versions: Mapped[list["WorkflowVersion"]] = relationship(
-        back_populates="workflow", cascade="all, delete-orphan", lazy="selectin"
+        back_populates="workflow", cascade="all, delete-orphan", lazy="select", passive_deletes=True
     )
 
 
@@ -649,8 +649,11 @@ class WorkflowVersion(Base, TimestampMixin):
 
 class Run(Base, TimestampMixin):
     __tablename__ = "runs"
-    # 找钉住版本最近一次封存的运行（应用的视图、口径对比）。存量库由 db/base.py 的 _INDEX_MIGRATIONS 补建
-    __table_args__ = (Index("ix_runs_wf_ver_status", "workflow_id", "version", "status"),)
+    # 找钉住版本最近一次封存的运行（应用的视图、口径对比）与列表游标翻页。存量库由 db/base.py 的 _INDEX_MIGRATIONS 补建
+    __table_args__ = (
+        Index("ix_runs_wf_ver_status", "workflow_id", "version", "status"),
+        Index("ix_runs_created_id", "created_at", "id"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     workflow_id: Mapped[str | None] = mapped_column(
@@ -765,7 +768,10 @@ class Artifact(Base, TimestampMixin):
     """
 
     __tablename__ = "artifacts"
-    __table_args__ = (Index("ix_artifacts_run", "run_id"),)
+    __table_args__ = (
+        Index("ix_artifacts_run", "run_id"),
+        Index("ix_artifacts_kind", "kind"),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     run_id: Mapped[str] = mapped_column(String(32), primary_key=True, default="")
@@ -806,6 +812,10 @@ class Document(Base, TimestampMixin):
     """知识库里的一份原始文档。"""
 
     __tablename__ = "documents"
+    __table_args__ = (
+        Index("ix_documents_col_created", "collection", "created_at", "id"),
+        Index("ix_documents_created_id", "created_at", "id"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     collection: Mapped[str] = mapped_column(String(100), default="default", index=True)
@@ -833,7 +843,7 @@ class Chunk(Base):
     __table_args__ = (Index("ix_chunks_collection", "collection"),)
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
-    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
     collection: Mapped[str] = mapped_column(String(100), default="default")
     ordinal: Mapped[int] = mapped_column(Integer, default=0)
     content: Mapped[str] = mapped_column(Text)
@@ -863,7 +873,10 @@ class ChunkTerm(Base):
     """
 
     __tablename__ = "chunk_terms"
-    __table_args__ = (Index("ix_chunk_terms_lookup", "collection", "term"),)
+    __table_args__ = (
+        Index("ix_chunk_terms_lookup", "collection", "term"),
+        Index("ix_chunk_terms_term", "term"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     chunk_id: Mapped[str] = mapped_column(
@@ -964,7 +977,7 @@ class ConversationTurn(Base, TimestampMixin):
     explanation: Mapped[str] = mapped_column(Text, default="")
     graph: Mapped[dict[str, Any] | None] = mapped_column(default=None)
     run_id: Mapped[str | None] = mapped_column(
-        ForeignKey("runs.id", ondelete="SET NULL"), default=None
+        ForeignKey("runs.id", ondelete="SET NULL"), default=None, index=True
     )
     # running | done | error
     status: Mapped[str] = mapped_column(String(20), default="running")
@@ -1123,7 +1136,7 @@ class CaliberDraft(Base, TimestampMixin):
     collection: Mapped[str] = mapped_column(String(100), default="default")
     # 起草时给模型看的数据源：表结构和数据目录是取数 SQL 的唯一依据；源删了草稿照旧在，只丢这一条线索
     datasource_id: Mapped[str | None] = mapped_column(
-        ForeignKey("data_sources.id", ondelete="SET NULL"), default=None
+        ForeignKey("data_sources.id", ondelete="SET NULL"), default=None, index=True
     )
     # 同 docdraft.STATUSES：drafting | ready | questions_open | path_pending | attached | rejected | failed
     status: Mapped[str] = mapped_column(String(20), default="drafting", index=True)
@@ -1131,7 +1144,7 @@ class CaliberDraft(Base, TimestampMixin):
     # 这份草稿从哪来：{"documents": [文档 id], "guidance": 用户补充要求}
     origin: Mapped[dict[str, Any]] = mapped_column(default=dict)
     workflow_id: Mapped[str | None] = mapped_column(
-        ForeignKey("workflows.id", ondelete="SET NULL"), default=None
+        ForeignKey("workflows.id", ondelete="SET NULL"), default=None, index=True
     )
     # 起草失败的说法（没有可用模型、模型回的东西取不出 JSON……）。草稿不置成 rejected：人改完还能再试
     error: Mapped[str | None] = mapped_column(Text, default=None)
@@ -1153,7 +1166,7 @@ class CaliberWriteRequest(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     #: 发起这次写入的主体（开登录时是认证过的用户名，关登录时是自报署名，照实记）
     actor: Mapped[str] = mapped_column(String(120), default="")
-    workflow_id: Mapped[str] = mapped_column(ForeignKey("workflows.id", ondelete="CASCADE"))
+    workflow_id: Mapped[str] = mapped_column(ForeignKey("workflows.id", ondelete="CASCADE"), index=True)
     #: 这次请求针对的那张口径卡；只改标题这类不碰图的请求记空串（列非空，唯一键才认得住）
     card_id: Mapped[str] = mapped_column(String(64), default="")
     request_id: Mapped[str] = mapped_column(String(64))

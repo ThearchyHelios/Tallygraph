@@ -6335,6 +6335,7 @@ export const TOOL_ENDPOINT_TEXT = {
   query: '查询参数（JSON，可插值）',
   body: '请求体（JSON，可插值）',
   noEndpoints: '还没有登记的端点，在「工具 → 端点」中登记',
+  loadFailed: '端点列表加载失败，已保留当前绑定的端点',
 }
 
 /**

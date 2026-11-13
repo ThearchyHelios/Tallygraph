@@ -175,11 +175,23 @@ def _usage_of(message: BaseMessage, model_id: str) -> dict[str, Any]:
     meta = getattr(message, "usage_metadata", None) or {}
     inp = int(meta.get("input_tokens") or 0)
     out = int(meta.get("output_tokens") or 0)
+    details = meta.get("input_token_details") or {}
+    cache_read = int(details.get("cache_read") or 0) if isinstance(details, dict) else 0
+    cache_create = int(details.get("cache_creation") or 0) if isinstance(details, dict) else 0
+    if cache_read > 0 or cache_create > 0:
+        try:
+            cost = catalog.estimate_cost(
+                model_id, inp, out, cache_read_tokens=cache_read, cache_creation_tokens=cache_create
+            )
+        except TypeError:
+            cost = catalog.estimate_cost(model_id, inp, out)
+    else:
+        cost = catalog.estimate_cost(model_id, inp, out)
     return {
         "input_tokens": inp,
         "output_tokens": out,
         "total_tokens": inp + out,
-        "cost_usd": round(catalog.estimate_cost(model_id, inp, out), 6),
+        "cost_usd": round(cost, 6),
         "calls": 1,
     }
 
@@ -213,14 +225,31 @@ def explain_model_error(exc: Exception, model_id: str) -> str:
             "请稍后重试；如持续失败，请到「设置 → 模型接入」测试该模型")
 
 
+def _non_retriable_stream_error(exc: Exception) -> bool:
+    """鉴权失败、模型不存在、额度用尽、频率限制、上下文超长、输出额度被拒：非流式重发也必然因为同一原因失败，直接上报。"""
+    from langchain_core.exceptions import ContextOverflowError
+
+    from app.providers.budget import budget_refused
+
+    if isinstance(exc, ContextOverflowError) or budget_refused(exc):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status in (401, 403, 413, 429):
+        return True
+    low = str(exc).lower()
+    return any(k in low for k in (
+        "invalid_model", "model does not exist", "insufficient", "quota",
+        "rate limit", "unauthorized", "invalid api key",
+    ))
+
+
 async def _invoke_streaming(
     model: Any, messages: list[BaseMessage], ctx: NodeContext, model_id: str = ""
 ) -> AIMessage:
     """流式调用并把 token 实时推给前端。
 
     失败时回退到非流式 —— 有些兼容网关不支持 SSE，不该因此让整个节点挂掉。
-    但回退也失败的话，两次都是同一个原因，不能只把原始异常往上抛：用户看到的
-    会是两段一模一样的供应商报错，而里面既没有模型名也没有下一步该干什么。
+    但鉴权、模型不存在、限流、上下文超长这类请求本身就不成立的报错直接抛出，不再白发第二次请求。
     """
     # 模型 id 要跟着 llm.start 走。以前这条事件只有 message_count，于是调用失败时
     # 整条轨迹里**没有任何地方**记着试的是哪个模型——排查只能靠翻配置猜。
@@ -240,6 +269,8 @@ async def _invoke_streaming(
     except NotImplementedError:
         response = await model.ainvoke(messages)
     except Exception as e:  # noqa: BLE001
+        if _non_retriable_stream_error(e):
+            raise NodeError(ctx.node.id, explain_model_error(e, model_id)) from e
         ctx.emit(EventType.LOG, level="warn",
                  message=f"流式输出失败，已改用非流式调用：{explain_model_error(e, model_id)}",
                  code="stream_fallback")
@@ -290,15 +321,24 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     spent: list[dict[str, Any]] = []
 
     if schema:
-        # 要结构化结果就走原生 structured output，这条路径拿不到 token 流
+        # 要结构化结果就走原生 structured output，带上 include_raw=True 把真实 token 用量一起拿回来
         ctx.emit(EventType.LLM_START, model=model_id, structured=True,
                  message_count=len(messages))
         try:
             # langchain 靠 "title" 识别裸 JSON Schema dict，缺了会抛 Unsupported function
             if isinstance(schema, dict) and "title" not in schema:
                 schema = {"title": "output", **schema}
-            structured = model.with_structured_output(schema)
-            value = await structured.ainvoke(messages)
+            try:
+                structured = model.with_structured_output(schema, include_raw=True)
+            except TypeError:
+                structured = model.with_structured_output(schema)
+            got = await structured.ainvoke(messages)
+            if isinstance(got, dict) and got.get("parsing_error"):
+                err = got["parsing_error"]
+                raise err if isinstance(err, BaseException) else ValueError(str(err))
+            raw_msg, value = _split_structured(got)
+            if value is None:
+                raise ValueError("模型返回的结构化结果为空")
         except Exception as e:  # noqa: BLE001
             # 模型压根不存在也会走到这里，那不是"结构化输出失败"
             if "invalid_model" in str(e) or "model does not exist" in str(e).lower():
@@ -310,8 +350,12 @@ async def run_llm(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             ) from e
         payload = value if isinstance(value, (dict, list)) else getattr(value, "model_dump", lambda: value)()
         output = {"data": payload, "text": json.dumps(payload, ensure_ascii=False, indent=2)}
-        response: BaseMessage = AIMessage(content=output["text"])
-        spent.append(_report_call(ctx, response, model_id, started))
+        response = AIMessage(
+            content=output["text"],
+            usage_metadata=getattr(raw_msg, "usage_metadata", None),
+            response_metadata=dict(getattr(raw_msg, "response_metadata", None) or {}),
+        )
+        spent.append(_report_call(ctx, raw_msg if raw_msg is not None else response, model_id, started))
     else:
         response = await _invoke_streaming(model, messages, ctx, model_id)
         spent.append(_report_call(ctx, response, model_id, started))

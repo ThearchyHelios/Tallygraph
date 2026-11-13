@@ -11,6 +11,10 @@ from app.engine.evidence import ledger_enabled
 from app.engine.lineage import scoped_id as _scoped
 from app.analysis.contract import LEDGER_KIND
 
+MASKED = "已遮罩"
+RUN_NOT_FOUND = "run_not_found"
+REPORT_NOT_FOUND = "evidence_report_not_found"
+
 
 def _fetch(artifact: str) -> tuple[Any, bool]:
     try:
@@ -236,3 +240,157 @@ def metric_cards(sealed: Sealed) -> list[tuple[str, str, dict[str, Any]]]:
             if ok is True and isinstance(content, dict) and isinstance(content.get("metrics"), list):
                 out.append((node_id, art, content))
     return out
+
+
+async def load_sealed(run_id: str) -> Sealed:
+    """读取封存范围；运行记录不存在时抛 404 CodedHTTPException（供引擎与领域层共用，无需引入 api/evidence）。"""
+    from app.api.coded import CodedHTTPException
+
+    try:
+        return await read_sealed(run_id)
+    except LookupError:
+        raise CodedHTTPException(404, "运行记录不存在", RUN_NOT_FOUND) from None
+
+
+@dataclass
+class Report:
+    node_id: str
+    doc_artifact: str
+    ok: bool | None
+    repairs: int | None
+    stats: dict[str, Any] | None
+    doc: dict[str, Any] | None
+    hash_ok: bool | None
+    fields: list[str]
+    claims: str | None = None
+
+
+def output_evidence(sealed: Sealed) -> list[dict[str, Any]]:
+    output = sealed.payload_of(sealed.nodes_of("output")) or {}
+    primary = output.get("_evidence")
+    if not isinstance(primary, dict):
+        return []
+    return [primary, *[r for r in primary.get("others") or [] if isinstance(r, dict)]]
+
+
+def reports_of(sealed: Sealed, *, nested: bool = False) -> list[Report]:
+    """封存范围内每个报告节点最后一次的自查结果，按第一次出现的顺序。"""
+    latest: dict[str, dict[str, Any]] = {}
+    for _, etype, node_id, data in sealed.events:
+        if (
+            etype == "report.checked"
+            and node_id
+            and isinstance(data, dict)
+            and data.get("doc_artifact")
+            and (nested or "/" not in node_id)
+        ):
+            latest[node_id] = data
+    evidence = output_evidence(sealed)
+    out: list[Report] = []
+    for node_id, data in latest.items():
+        artifact = str(data["doc_artifact"])
+        try:
+            doc = load(artifact)
+            hash_ok: bool | None = True if doc is not None else None
+        except ValueError:
+            doc, hash_ok = None, False
+        if isinstance(doc, dict) and (doc.get("node_id") != node_id or doc.get("run_id") != sealed.run_id):
+            doc, hash_ok = None, False
+        fields = [
+            f
+            for r in evidence
+            if r.get("report_node") == node_id and r.get("doc_artifact") == artifact
+            for f in r.get("fields") or []
+        ]
+        out.append(
+            Report(
+                node_id=node_id,
+                doc_artifact=artifact,
+                ok=data.get("ok"),
+                repairs=data.get("repairs"),
+                stats=(doc or {}).get("stats") or data.get("stats"),
+                doc=doc if isinstance(doc, dict) else None,
+                hash_ok=hash_ok,
+                fields=fields,
+                claims=data.get("claims") if isinstance(data.get("claims"), str) else None,
+            )
+        )
+    return out
+
+
+def choose_report(reports: list[Report], wanted: str | None, sealed: Sealed) -> Report:
+    """从封存报告列表里选出目标报告（指定 wanted 优先，否则取出口 _evidence 主报告，再退回第一份）。"""
+    from app.api.coded import CodedHTTPException
+
+    if wanted:
+        chosen = next((r for r in reports if r.node_id == wanted), None)
+        if chosen is None:
+            raise CodedHTTPException(404, "本次运行中没有所选报告撰写节点的文档", REPORT_NOT_FOUND)
+        return chosen
+    primary = next(iter(output_evidence(sealed)), {})
+    return next((r for r in reports if r.node_id == primary.get("report_node")), reports[0])
+
+
+class ShownText:
+    """把展示用 SQL、检查片段、合并警告里命中的运行遮罩值替换为「已遮罩」。"""
+
+    def __init__(self, secrets: Any) -> None:
+        self._secrets = secrets
+        self.changed = False
+
+    def text(self, value: Any) -> Any:
+        if self._secrets is None or not isinstance(value, str) or not value:
+            return value
+        out = self._secrets.scrub(value, loose=True)
+        self.changed = self.changed or out != value
+        return out
+
+    def checks(self, checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {**c, **{k: self.text(c[k]) for k in ("message", "sql_excerpt") if isinstance(c.get(k), str)}}
+            for c in checks
+        ]
+
+    def merge(self, view: dict[str, Any]) -> dict[str, Any]:
+        view["sql"] = self.text(view.get("sql"))
+        view["warnings"] = [{**w, "message": self.text(w.get("message"))} for w in view.get("warnings") or []]
+        view["inputs"] = [
+            {**i, **({"checks": self.checks(i["checks"])} if i.get("checks") else {})}
+            for i in view.get("inputs") or []
+        ]
+        return view
+
+
+def open_masks(sealed: Sealed | None = None) -> Any:
+    """获取请求级数据源遮罩上下文（通过统一边界暴露给领域层，兼容测试对证据遮罩构造器的桩替换）。"""
+    from app.api import evidence as _evidence_mod
+
+    return _evidence_mod._Masks(sealed)
+
+
+async def resolve_metric_masks(
+    metric: dict[str, Any],
+    card_node: str,
+    artifact: str,
+    sealed: Sealed,
+    masks: Any,
+    *,
+    card: dict[str, Any] | None = None,
+    output: Any = None,
+    by_value: bool = True,
+    sure: bool = False,
+) -> tuple[dict[str, Any], str | None]:
+    """判断单个指标及其输入是否命中的数据源遮罩。"""
+    from app.api import evidence as _evidence_mod
+
+    return await _evidence_mod._metric_masks(
+        metric,
+        card_node,
+        artifact,
+        sealed,
+        masks,
+        card=card,
+        output=output,
+        by_value=by_value,
+        sure=sure,
+    )

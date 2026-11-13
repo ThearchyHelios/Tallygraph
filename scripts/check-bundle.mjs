@@ -54,13 +54,13 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
+import { resolveChrome, resolvePython } from './lib/env.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
 const API = process.env.AGENTLAB_API ?? 'http://localhost:8000/api'
-const CHROME = process.env.CHROME_PATH ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+const CHROME = resolveChrome()
 const BACKEND = join(dirname(dirname(fileURLToPath(import.meta.url))), 'backend')
-const PYTHON = [process.env.CHECK_PYTHON, join(homedir(), 'miniforge3/envs/agentlab/bin/python')]
-  .find((p) => p && existsSync(p))
+const PYTHON = resolvePython({ requireBackend: true })
 
 let failed = 0
 const check = (name, cond, detail = '') => {

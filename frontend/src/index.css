@@ -1,5 +1,5 @@
+@layer theme, base, xyflow, components, utilities;
 @import 'tailwindcss';
-@import '@xyflow/react/dist/style.css';
 
 /* ==========================================================================
    主题 token。深色是默认（长时间盯画布，深色更省眼），浅色由 data-theme 切换；

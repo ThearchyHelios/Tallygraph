@@ -1208,8 +1208,6 @@ async def _refresh_run_items(session: Any, *, run: CaliberImportRun, draft: Cali
     没对齐上的工作项（mode 是 new / manual、metric_id 为空）没有可比的 L 一格，保持抽出来时的样子：
     要对齐得先走人工对齐（reimport.align 的入口在接口层）。
     """
-    from app.api.ledger import _draft_graph_payload
-
     live_metrics = list(fieldbaseline.accepted_card(workflow.graph if workflow is not None else {})[1])
     live_by_id = {str(m.get("id")): m for m in live_metrics if isinstance(m, Mapping)}
     ref = fieldbaseline.ref_of(draft.payload)
@@ -1228,7 +1226,7 @@ async def _refresh_run_items(session: Any, *, run: CaliberImportRun, draft: Cali
         item.fields, item.status, item.align = merged["fields"], merged["status"], merged["align"]
     await _refresh_counts(session, run)
     if workflow is not None:
-        live = await _draft_graph_payload(session, workflow, workflow.version)
+        live = await fieldbaseline.draft_graph_projection(session, workflow, workflow.version)
         if live is not None:
             draft.payload = {**(draft.payload or {}), **live}
 

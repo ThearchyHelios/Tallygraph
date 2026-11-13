@@ -12,9 +12,9 @@ import { useConversations } from './store/conversations'
 import { personalAppsOn } from './pages/blueprints/shared'
 import { Logo } from './components/Logo'
 import {
-  CommandPalette, PAGES, ShortcutHelp, flushThemePref, openShortcutHelp, toggleCommandPalette, toggleNotify,
-  toggleTheme, usePages, useTheme, visiblePages, waitedFor,
-} from './components/CommandPalette'
+  PAGES, flushThemePref, openShortcutHelp, toggleCommandPalette, toggleNotify,
+  toggleTheme, usePages, useShellOverlay, useTheme, visiblePages, waitedFor,
+} from './components/shellCommands'
 import { atLeast, authSettled, loginOn, loginUrl, needsLogin, prefsLocalOnly, principalName, useAuth } from './store/auth'
 import { ErrorBoundary, Kbd, OfflineBanner, Spinner, StatusBadge, isComposing, toast, useTicker } from './components/ui'
 import { applyTheme, normalizeTheme } from './lib/theme'
@@ -57,6 +57,16 @@ const NewAppStart = lazy(() => import('./pages/blueprints/NewAppStart').then((mo
 const BlueprintPage = lazy(() => import('./pages/blueprints/BlueprintPage').then((module) => ({ default: module.BlueprintPage })))
 const LoginPage = lazy(() => import('./pages/LoginPage').then((module) => ({ default: module.LoginPage })))
 const SharePage = lazy(() => import('./pages/apps/SharePage').then((module) => ({ default: module.SharePage })))
+const LazyShellOverlays = lazy(() => import('./components/CommandPalette').then((m) => ({
+  default: function Overlays() {
+    return (
+      <>
+        <m.CommandPalette />
+        <m.ShortcutHelp />
+      </>
+    )
+  },
+})))
 
 /** 启动时认人（/auth/me）最多等多久再取目录 */
 const AUTH_WAIT_MS = 2500
@@ -230,12 +240,25 @@ function Shell() {
         </div>
       </main>
 
-      <CommandPalette />
-      <ShortcutHelp />
+      <ShellOverlays />
       <ShellKeys />
       <ShellSignals />
       <LeaveBlocker />
     </div>
+  )
+}
+
+function ShellOverlays() {
+  const open = useShellOverlay()
+  const [everOpened, setEverOpened] = useState(false)
+  useEffect(() => {
+    if (open) setEverOpened(true)
+  }, [open])
+  if (!open && !everOpened) return null
+  return (
+    <Suspense fallback={null}>
+      <LazyShellOverlays />
+    </Suspense>
   )
 }
 

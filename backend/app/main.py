@@ -171,9 +171,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await relay.stop()
         await cluster.stop()
         # 应用库的连接全关掉：SQLite 最后一个连接关掉时才把 -wal 并回、删掉（copy-to-postgres 按它认服务停没停），
-        # PostgreSQL 的连接池也正常关
+        # PostgreSQL 的连接池也正常关；外部数据源缓存的连接池一并释放
+        from app.data.engine import engines
         from app.db.base import dispose_session_engine, engine as db_engine
 
+        await engines.close()
         await db_engine.dispose()
         await dispose_session_engine()
         logger.info("已停止")

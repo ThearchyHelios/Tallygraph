@@ -21,10 +21,19 @@ _BLOCKED_PORTS = {22, 23, 25, 135, 139, 445, 3389}
 _METADATA_HOSTS = frozenset({"100.100.100.200", "fd00:ec2::254", "metadata.google.internal"})
 
 
-def _is_private(ip: str) -> bool:
+def _unwrap_ip(ip: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
+        return None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
+def _is_private(ip: str) -> bool:
+    addr = _unwrap_ip(ip)
+    if addr is None:
         return True
     return (
         addr.is_private
@@ -48,9 +57,8 @@ def _fake_networks() -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
 
 
 def _in(ip: str, networks) -> bool:
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
+    addr = _unwrap_ip(ip)
+    if addr is None:
         return False
     return any(addr.version == n.version and addr in n for n in networks)
 
@@ -101,10 +109,11 @@ async def _real_ips(host: str) -> tuple[str, ...]:
 
 def _is_metadata(ip: str) -> bool:
     try:
-        addr = ipaddress.ip_address(ip)
+        raw_addr = ipaddress.ip_address(ip)
     except ValueError:
         return True
-    return addr.is_link_local or str(addr) in _METADATA_HOSTS
+    addr = raw_addr.ipv4_mapped if isinstance(raw_addr, ipaddress.IPv6Address) and raw_addr.ipv4_mapped is not None else raw_addr
+    return raw_addr.is_link_local or addr.is_link_local or str(raw_addr) in _METADATA_HOSTS or str(addr) in _METADATA_HOSTS
 
 
 async def assert_safe_url(url: str, *, allow_intranet: bool = False) -> str:
@@ -199,35 +208,63 @@ async def safe_request(
     max_bytes = max_bytes or settings.http_tool_max_bytes
     current = await assert_safe_url(url)
 
+    _SENSITIVE_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization", "x-api-key"})
+    cur_method = method.upper()
+    cur_headers = dict(headers or {})
+    cur_params: dict[str, str] | None = params
+    cur_json: object | None = json_body
+    cur_data: str | None = data
+
     async with httpx.AsyncClient(
         timeout=timeout, follow_redirects=False, trust_env=False
     ) as client:
-        for _ in range(5):
-            resp = await client.request(
-                method.upper(),
+        for hop in range(6):
+            async with client.stream(
+                cur_method,
                 current,
-                headers=headers or {},
-                params=params,
-                json=json_body,
-                content=data,
-            )
-            if resp.status_code in (301, 302, 303, 307, 308) and "location" in resp.headers:
-                current = await assert_safe_url(
-                    str(httpx.URL(current).join(resp.headers["location"]))
-                )
-                continue
-            break
+                headers=cur_headers,
+                params=cur_params,
+                json=cur_json,
+                content=cur_data,
+            ) as resp:
+                if hop < 5 and resp.status_code in (301, 302, 303, 307, 308) and "location" in resp.headers:
+                    prev_url = httpx.URL(current)
+                    next_url = prev_url.join(resp.headers["location"])
+                    current = await assert_safe_url(str(next_url))
+                    cur_params = None
+                    if (next_url.scheme, next_url.host, next_url.port) != (prev_url.scheme, prev_url.host, prev_url.port):
+                        cur_headers = {k: v for k, v in cur_headers.items() if k.lower() not in _SENSITIVE_HEADERS}
+                    if resp.status_code == 303 or (resp.status_code in (301, 302) and cur_method == "POST"):
+                        cur_method = "GET"
+                        cur_json = None
+                        cur_data = None
+                    continue
 
-        body = resp.content[:max_bytes]
-        truncated = len(resp.content) > max_bytes
-        try:
-            text = body.decode(resp.encoding or "utf-8", errors="replace")
-        except (LookupError, UnicodeDecodeError):
-            text = body.decode("utf-8", errors="replace")
-        return {
-            "status": resp.status_code,
-            "url": str(resp.url),
-            "headers": dict(resp.headers),
-            "body": text,
-            "truncated": truncated,
-        }
+                chunks: list[bytes] = []
+                total = 0
+                truncated = False
+                async for chunk in resp.aiter_bytes():
+                    if not chunk:
+                        continue
+                    remaining = max_bytes - total
+                    if len(chunk) > remaining:
+                        if remaining > 0:
+                            chunks.append(chunk[:remaining])
+                        truncated = True
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+
+                body = b"".join(chunks)
+                try:
+                    text = body.decode(resp.encoding or "utf-8", errors="replace")
+                except (LookupError, UnicodeDecodeError):
+                    text = body.decode("utf-8", errors="replace")
+                return {
+                    "status": resp.status_code,
+                    "url": str(resp.url),
+                    "headers": dict(resp.headers),
+                    "body": text,
+                    "truncated": truncated,
+                }
+        raise UnsafeUrlError("重定向次数超过上限")

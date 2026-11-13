@@ -54,7 +54,9 @@ class ProviderNotConfigured(RuntimeError):
 
 async def list_providers(session: AsyncSession) -> list[Provider]:
     rows = await session.execute(select(Provider).order_by(Provider.created_at, Provider.id))
-    return list(rows.scalars())
+    items = list(rows.scalars())
+    catalog.sync_provider_models(items)
+    return items
 
 
 #: 点名的接入不存在、已停用时，在「设置 → 模型接入」里能做什么。NAMED_FIX 是整句的前半句；后半句（去哪里换一个
@@ -326,8 +328,16 @@ def build_chat_model(provider: Provider, spec: ModelSpec) -> BaseChatModel:
             # 且 api_key=None 时不会发出 x-api-key。
             import anthropic
 
-            client_args = {"base_url": base_url, "api_key": None, "auth_token": api_key,
-                           "max_retries": chat.max_retries}
+            client_args: dict[str, Any] = {
+                "base_url": base_url,
+                "api_key": None,
+                "auth_token": api_key,
+                "max_retries": chat.max_retries,
+            }
+            if kwargs.get("timeout") is not None:
+                client_args["timeout"] = kwargs["timeout"]
+            if kwargs.get("default_headers"):
+                client_args["default_headers"] = dict(kwargs["default_headers"])
             chat._client = anthropic.Anthropic(**client_args)
             chat._async_client = anthropic.AsyncAnthropic(**client_args)
         return chat
@@ -414,11 +424,51 @@ def _reasoning_aware_openai() -> type:
     所以在这里把它捞回 additional_kwargs，thinking_text 再统一读出来。
     只加字段，不改 langchain 对正文的任何处理。
     """
+    from langchain_core.messages import AIMessage
     from langchain_openai import ChatOpenAI
     from pydantic import PrivateAttr
 
     class ReasoningAwareChatOpenAI(ChatOpenAI):  # type: ignore[misc]
         _reasoning_hint: dict[str, Any] = PrivateAttr(default_factory=dict)
+
+        def _get_request_payload(
+            self, input_: Any, *, stop: list[str] | None = None, **kwargs: Any
+        ) -> dict:
+            payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+            lc_msgs = self._convert_input(input_).to_messages()
+            ai_reasonings = [
+                (m.additional_kwargs or {}).get("reasoning_content")
+                for m in lc_msgs
+                if isinstance(m, AIMessage)
+            ]
+            raw_msgs = payload.get("messages")
+            if isinstance(raw_msgs, list) and ai_reasonings:
+                ai_idx = 0
+                for msg_dict in raw_msgs:
+                    if not isinstance(msg_dict, dict) or msg_dict.get("role") != "assistant":
+                        continue
+                    reasoning = ai_reasonings[ai_idx] if ai_idx < len(ai_reasonings) else None
+                    ai_idx += 1
+                    # DeepSeek Reasoner / Kimi K2 Thinking 等在工具调用多轮往返时要求携带了 tool_calls 的
+                    # assistant 消息必须原样回传 reasoning_content，否则直接报 400 Missing reasoning_content field
+                    if isinstance(reasoning, str) and reasoning and msg_dict.get("tool_calls"):
+                        msg_dict.setdefault("reasoning_content", reasoning)
+            return payload
+
+        def _create_chat_result(self, response: Any, generation_info: dict | None = None):
+            res = super()._create_chat_result(response, generation_info)
+            raw_dict = response if isinstance(response, dict) else (
+                response.model_dump() if hasattr(response, "model_dump") else {}
+            )
+            choices = raw_dict.get("choices") or []
+            for idx, gen in enumerate(res.generations):
+                if idx >= len(choices):
+                    break
+                msg = (choices[idx] or {}).get("message") or {}
+                text = msg.get("reasoning_content") or msg.get("reasoning")
+                if isinstance(text, str) and text:
+                    gen.message.additional_kwargs["reasoning_content"] = text
+            return res
 
         def _convert_chunk_to_generation_chunk(
             self, chunk: dict, default_chunk_class: type, base_generation_info: dict | None
@@ -458,19 +508,19 @@ def _reasoning_aware_openai() -> type:
                 raise e from first
 
         async def _astream(self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any):
-            """流式调用；服务方不认思考控制参数或 stream_options 时去掉它重发一次，之后这个接口不再带它。
+            """流式调用；服务方不认思考控制参数或 stream_options 时去掉它重发一次，之后这个接口+模型不再带它。
 
             只在还没收到任何一块时重发：拒绝都发生在请求刚发出去的时候，重发不会重复输出。"""
             usage = not self._use_responses_api({**kwargs, **self.model_kwargs}) \
                 and self._should_stream_usage(kwargs.get("stream_usage"), **kwargs)
-            key = _endpoint_key(self)
-            hint_key = (key, str(getattr(self, "model_name", "") or ""))
-            use_hint = bool(self._reasoning_hint) and hint_key not in _NO_REASONING_HINT
+            endpoint = _endpoint_key(self)
+            model_key = (endpoint, str(getattr(self, "model_name", "") or ""))
+            use_hint = bool(self._reasoning_hint) and model_key not in _NO_REASONING_HINT
 
             if use_hint:
                 started = False
                 hint_kwargs = _merge_reasoning_hint(kwargs, self._reasoning_hint)
-                if not usage or key in _NO_STREAM_USAGE:
+                if not usage or model_key in _NO_STREAM_USAGE:
                     hint_kwargs = {k: v for k, v in hint_kwargs.items() if k != "stream_options"} | {"stream_usage": False}
                 try:
                     async for chunk in super()._astream(messages, stop, run_manager, **hint_kwargs):
@@ -480,17 +530,18 @@ def _reasoning_aware_openai() -> type:
                 except Exception as e:  # noqa: BLE001
                     if started:
                         raise
-                    if _rejects_stream_options_specifically(e) and usage and key not in _NO_STREAM_USAGE:
+                    if _rejects_stream_options_specifically(e) and usage and model_key not in _NO_STREAM_USAGE:
                         # 明确点名拒绝 stream_options：剥离 stream_options 但保留思考控制参数再试
                         no_usage_hint_kwargs = {
                             k: v for k, v in hint_kwargs.items() if k != "stream_options"
                         } | {"stream_usage": False}
                         try:
                             async for chunk in super()._astream(messages, stop, run_manager, **no_usage_hint_kwargs):
-                                if key not in _NO_STREAM_USAGE:
-                                    _NO_STREAM_USAGE.add(key)
+                                if model_key not in _NO_STREAM_USAGE:
+                                    _NO_STREAM_USAGE.add(model_key)
                                     logger.warning(
-                                        "模型接入 %s 不支持流式用量回传（%s），已改为不请求用量", key, str(e)[:200]
+                                        "模型接入 %s/%s 不支持流式用量回传（%s），已改为不请求用量",
+                                        model_key[0], model_key[1], str(e)[:200],
                                     )
                                 yield chunk
                             return
@@ -500,24 +551,24 @@ def _reasoning_aware_openai() -> type:
                         raise
                     # 剥离思考控制参数后走下方常规流式逻辑；若成则记入 _NO_REASONING_HINT
                     yielded_after_strip = False
-                    async for chunk in self._astream_without_hint(messages, stop, run_manager, usage=usage, key=key, **kwargs):
-                        if not yielded_after_strip and hint_key not in _NO_REASONING_HINT:
-                            _NO_REASONING_HINT.add(hint_key)
+                    async for chunk in self._astream_without_hint(messages, stop, run_manager, usage=usage, key=model_key, **kwargs):
+                        if not yielded_after_strip and model_key not in _NO_REASONING_HINT:
+                            _NO_REASONING_HINT.add(model_key)
                             logger.warning(
                                 "模型接入 %s/%s 不支持思考控制参数（%s），已自动剥离",
-                                hint_key[0],
-                                hint_key[1],
+                                model_key[0],
+                                model_key[1],
                                 str(e)[:200],
                             )
                         yielded_after_strip = True
                         yield chunk
                     return
 
-            async for chunk in self._astream_without_hint(messages, stop, run_manager, usage=usage, key=key, **kwargs):
+            async for chunk in self._astream_without_hint(messages, stop, run_manager, usage=usage, key=model_key, **kwargs):
                 yield chunk
 
         async def _astream_without_hint(
-            self, messages: Any, stop: Any = None, run_manager: Any = None, *, usage: bool, key: str, **kwargs: Any
+            self, messages: Any, stop: Any = None, run_manager: Any = None, *, usage: bool, key: tuple[str, str], **kwargs: Any
         ):
             first: Exception | None = None
             if usage and key not in _NO_STREAM_USAGE:
@@ -536,9 +587,12 @@ def _reasoning_aware_openai() -> type:
             try:
                 async for chunk in super()._astream(messages, stop, run_manager, **kwargs):
                     if first is not None and key not in _NO_STREAM_USAGE:
-                        # 去掉它就成了：记下这个接口不认，之后不再每次先失败一次
+                        # 去掉它就成了：记下这个接口+模型不认，之后不再每次先失败一次
                         _NO_STREAM_USAGE.add(key)
-                        logger.warning("模型接入 %s 不支持流式用量回传（%s），已改为不请求用量", key, str(first)[:200])
+                        logger.warning(
+                            "模型接入 %s/%s 不支持流式用量回传（%s），已改为不请求用量",
+                            key[0], key[1], str(first)[:200],
+                        )
                     yield chunk
             except Exception as e:
                 if first is None:
@@ -548,8 +602,8 @@ def _reasoning_aware_openai() -> type:
     return ReasoningAwareChatOpenAI
 
 
-#: 认定不支持 stream_options 的接口（base_url）。进程内有效：重启后再试一次，服务方可能已经升级
-_NO_STREAM_USAGE: set[str] = set()
+#: 认定不支持 stream_options 的 (base_url, model)。按接口+模型记忆，避免统一网关下单个旧模型连坐其它模型
+_NO_STREAM_USAGE: set[tuple[str, str]] = set()
 #: 认定不支持思考控制参数（reasoning_effort / enable_thinking / thinking）的 (base_url, model)
 _NO_REASONING_HINT: set[tuple[str, str]] = set()
 

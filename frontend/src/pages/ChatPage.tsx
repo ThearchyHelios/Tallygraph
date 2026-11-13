@@ -48,7 +48,13 @@ import {
  * dense 一个开关。两边各写一套的话，同一次运行在两个页面会讲出不同的故事。
  */
 export function ChatPage() {
-  const { ask, stop, load, hydrate, recheck, setScope, setDepth } = useChat()
+  const ask = useChat((s) => s.ask)
+  const stop = useChat((s) => s.stop)
+  const load = useChat((s) => s.load)
+  const hydrate = useChat((s) => s.hydrate)
+  const recheck = useChat((s) => s.recheck)
+  const setScope = useChat((s) => s.setScope)
+  const setDepth = useChat((s) => s.setDepth)
   const depth = useChat((s) => s.depth)
   const { conversationId } = useParams()
   const navigate = useNavigate()
@@ -60,7 +66,12 @@ export function ChatPage() {
   const turns = useChat((s) => (currentId ? s.byConversation[currentId] : undefined))
   const loadState = useChat((s) => (currentId ? s.loadState[currentId] : undefined))
   const loadError = useChat((s) => (currentId ? s.loadError[currentId] : undefined))
-  const byConversation = useChat((s) => s.byConversation)
+  const elsewhereId = useChat((s) => {
+    for (const [id, ts] of Object.entries(s.byConversation)) {
+      if (id !== currentId && isBusy(ts)) return id
+    }
+    return null
+  })
   const backend = useCatalog((s) => s.backend)
   // 在回收站里的对话可以点开看，但不能接着问：问了它也还在回收站里，左栏找不到
   const trashed = useConversations((s) => (currentId ? s.trash.find((c) => c.id === currentId) : undefined))
@@ -147,13 +158,10 @@ export function ChatPage() {
   const trashBusy = !!trashed && stillRunning(trashed, turns)
   // 另一个会话在跑：这里照样能问（各跑各的），但得让人知道那边没停
   const elsewhere = useMemo(() => {
-    for (const [id, ts] of Object.entries(byConversation)) {
-      if (id !== currentId && isBusy(ts)) {
-        return { id, title: list.find((c) => c.id === id)?.title || ts[ts.length - 1].question }
-      }
-    }
-    return null
-  }, [byConversation, currentId, list])
+    if (!elsewhereId) return null
+    const ts = useChat.getState().byConversation[elsewhereId]
+    return { id: elsewhereId, title: list.find((c) => c.id === elsewhereId)?.title || ts?.[ts.length - 1]?.question || '' }
+  }, [elsewhereId, list])
 
   const blocked = loadState === 'loading' ? '正在加载对话历史…'
     : loadState === 'error' ? '对话历史加载失败，请点击上方的「重试」'

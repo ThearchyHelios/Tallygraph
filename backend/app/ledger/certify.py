@@ -570,9 +570,9 @@ async def freeze(session: Any, run_id: str, *, peers: Sequence[str] = (), name: 
     """把一次问数据运行固化成口径草稿（见模块说明），落库成新的草稿工作流，返回 {workflow_id, name, nodes, edges, params,
     sources, ...}。peers 是同一组（同一个 SQL 形状）的别的运行：认哪些字面量位置跨轮变了。不能固化抛 CertifyRefused。"""
     from app.api.deps import can_read_run, current_principal
-    from app.api.evidence import _reports, _sealed
     from app.core.artifact_store import graph_hash, load
     from app.db.models import DataSource, Workflow, WorkflowVersion
+    from app.engine.evidence_reader import load_sealed as _sealed, reports_of as _reports
     from app.ledger import store
 
     run = await session.get(Run, run_id)

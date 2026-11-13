@@ -149,8 +149,6 @@ logger = logging.getLogger(__name__)
 
 SCHEMA = "agentlab.evidence/1"
 
-RUN_NOT_FOUND = "run_not_found"
-REPORT_NOT_FOUND = "evidence_report_not_found"
 SEGMENT_NOT_FOUND = "evidence_segment_not_found"
 DOC_MISSING = "evidence_doc_missing"
 DOC_TAMPERED = "evidence_doc_tampered"
@@ -159,17 +157,26 @@ LEGACY_NOTE = "旧版出具：按数值匹配，不是显式引用。同一个�
 NONE_NOTE = "本次运行没有报告文档，也没有出具契约，没有可展示的证据"
 NO_DOC_NOTE = "本次运行的出具契约采用引用模式核对，但报告没有产出可核对的文档"
 
-from app.engine.evidence_reader import Sealed as _Sealed, metric_cards as _sealed_cards, read_sealed
+from app.engine.evidence_reader import (
+    MASKED,
+    REPORT_NOT_FOUND,
+    RUN_NOT_FOUND,
+    Report as _Report,
+    Sealed as _Sealed,
+    ShownText as _Shown,
+    choose_report as _choose,
+    load_sealed,
+    metric_cards as _sealed_cards,
+    output_evidence as _output_evidence,
+    read_sealed,
+    reports_of as _reports,
+)
 
 
 async def _sealed(run_id: str) -> _Sealed:
-    try:
-        return await read_sealed(run_id)
-    except LookupError:
-        raise CodedHTTPException(404, "运行记录不存在", RUN_NOT_FOUND) from None
+    return await load_sealed(run_id)
 
 
-MASKED = "已遮罩"
 #: 面板底下的遮罩说明。遮的列可能是遮罩列本身，也可能是 SQL 里给它起了别名、套了函数得来的结果列（c.phone AS tel）
 MASK_NOTE = "这些列取自数据源中设置了遮罩的列，面板上不显示原值。遮罩只减少暴露，不是安全边界"
 #: 遮没遮核对不了、不显示的值（指标步骤的值、推演的原值）：和「已遮罩」分开，读的人不该以为这里设了遮罩
@@ -198,64 +205,8 @@ MISSING_RETRIEVAL = "无法读取检索快照，或其中没有这条命中"
 
 
 # --------------------------------------------------------------------------
-# 报告文档
+# 报告文档（Report / reports_of / output_evidence 定义在 app/engine/evidence_reader.py）
 # --------------------------------------------------------------------------
-
-
-@dataclass
-class _Report:
-    node_id: str
-    doc_artifact: str
-    ok: bool | None
-    repairs: int | None
-    stats: dict[str, Any] | None
-    doc: dict[str, Any] | None
-    #: True 取回并复验通过；False 内容和哈希对不上（或者不是这次运行这个节点写的）；None 文件不在了
-    hash_ok: bool | None
-    fields: list[str]
-    #: 写这份报告时的结论句策略（report.checked 里记的，升级前的运行没有）
-    claims: str | None = None
-
-
-def _reports(sealed: _Sealed, *, nested: bool = False) -> list[_Report]:
-    """封存范围内每个报告节点最后一次的自查结果，按第一次出现的顺序。
-
-    默认只认这次运行的图上的报告节点：子工作流里的报告（节点 id「子工作流节点 id/…」，子图的事件和父运行在同一个流里）
-    是子工作流那一步内部的东西，父图的答案是子工作流出口的值，不是那份报告本身——证据图、取答案的评测、按成果挑报告
-    （_choose）都按父图自己的认。nested 为真时连子工作流里的一起给（按 ?report=sub/write 点开它们）。可验证报告另按全部
-    report.checked 核对（bundle/build._report_events：自查过的文档一份都不能少）。"""
-    latest: dict[str, dict[str, Any]] = {}
-    for _, etype, node_id, data in sealed.events:
-        if etype == "report.checked" and node_id and isinstance(data, dict) and data.get("doc_artifact") \
-                and (nested or "/" not in node_id):
-            latest[node_id] = data
-    evidence = _output_evidence(sealed)
-    out = []
-    for node_id, data in latest.items():
-        artifact = str(data["doc_artifact"])
-        try:
-            doc = load(artifact)
-            hash_ok: bool | None = True if doc is not None else None
-        except ValueError:
-            doc, hash_ok = None, False
-        # 文档要真是这次运行里这个节点写的：内容寻址只保证没被改，不保证没被张冠李戴
-        if isinstance(doc, dict) and (doc.get("node_id") != node_id or doc.get("run_id") != sealed.run_id):
-            doc, hash_ok = None, False
-        fields = [f for r in evidence if r.get("report_node") == node_id and r.get("doc_artifact") == artifact
-                  for f in r.get("fields") or []]
-        out.append(_Report(node_id=node_id, doc_artifact=artifact, ok=data.get("ok"), repairs=data.get("repairs"),
-                           stats=(doc or {}).get("stats") or data.get("stats"),
-                           doc=doc if isinstance(doc, dict) else None, hash_ok=hash_ok, fields=fields,
-                           claims=data.get("claims") if isinstance(data.get("claims"), str) else None))
-    return out
-
-
-def _output_evidence(sealed: _Sealed) -> list[dict[str, Any]]:
-    output = sealed.payload_of(sealed.nodes_of("output")) or {}
-    primary = output.get("_evidence")
-    if not isinstance(primary, dict):
-        return []
-    return [primary, *[r for r in primary.get("others") or [] if isinstance(r, dict)]]
 
 
 def _input_payloads(sealed: _Sealed) -> dict[str, Any]:
@@ -828,16 +779,6 @@ def _named_reports(sealed: _Sealed, wanted: str | None) -> list[_Report]:
     """点名要某一份报告时从哪些里挑：点的是子工作流里的那份（「sub/write」）连子工作流里的一起给，否则只给父图上的
     （_reports）。"""
     return _reports(sealed, nested=bool(wanted) and "/" in str(wanted))
-
-
-def _choose(reports: list[_Report], wanted: str | None, sealed: _Sealed) -> _Report:
-    if wanted:
-        chosen = next((r for r in reports if r.node_id == wanted), None)
-        if chosen is None:
-            raise CodedHTTPException(404, "本次运行中没有所选报告撰写节点的文档", REPORT_NOT_FOUND)
-        return chosen
-    primary = next(iter(_output_evidence(sealed)), {})
-    return next((r for r in reports if r.node_id == primary.get("report_node")), reports[0])
 
 
 async def _chain(seg: dict[str, Any], doc: dict[str, Any], sealed: _Sealed,
@@ -2977,32 +2918,7 @@ def _no_data_view(snap: dict[str, Any]) -> list[dict[str, Any]]:
             if isinstance(item, dict) and isinstance(item.get("message"), str)]
 
 
-class _Shown:
-    """查询步骤上要展示的 SQL、合并 SQL、SQL 检查的片段、合并警告：里面写着的遮罩值（secrets，这次运行查到过的，
-    masking._Secrets）换成「已遮罩」，换了写法的长号码也认。secrets 为 None 时原样交回。changed：换过东西，查询步骤
-    底下要说清这只是展示时遮的。"""
-
-    def __init__(self, secrets: Any) -> None:
-        self._secrets = secrets
-        self.changed = False
-
-    def text(self, value: Any) -> Any:
-        if self._secrets is None or not isinstance(value, str) or not value:
-            return value
-        out = self._secrets.scrub(value, loose=True)
-        self.changed = self.changed or out != value
-        return out
-
-    def checks(self, checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [{**c, **{k: self.text(c[k]) for k in ("message", "sql_excerpt") if isinstance(c.get(k), str)}}
-                for c in checks]
-
-    def merge(self, view: dict[str, Any]) -> dict[str, Any]:
-        view["sql"] = self.text(view.get("sql"))
-        view["warnings"] = [{**w, "message": self.text(w.get("message"))} for w in view.get("warnings") or []]
-        view["inputs"] = [{**i, **({"checks": self.checks(i["checks"])} if i.get("checks") else {})}
-                          for i in view.get("inputs") or []]
-        return view
+# _Shown 定义在 app.engine.evidence_reader.ShownText 并在上方导入为 _Shown
 
 
 def _has_values(snap: dict[str, Any]) -> bool:
