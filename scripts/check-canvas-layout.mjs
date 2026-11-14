@@ -11,11 +11,11 @@
 // 沙箱拷贝）跑时带上地址：
 //   AGENTLAB_WEB=http://localhost:<前端端口> AGENTLAB_API=http://localhost:<后端端口>/api node scripts/check-canvas-layout.mjs
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
+import { resolveChrome } from './lib/env.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
 const API = process.env.AGENTLAB_API ?? 'http://localhost:8000/api'
-const CHROME = process.env.CHROME_PATH
-  ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+const CHROME = resolveChrome()
 
 let failed = 0
 const check = (name, cond, detail = '') => {

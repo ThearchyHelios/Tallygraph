@@ -654,10 +654,12 @@ async def review(
             raise TypeError("结构化输出没有返回对象")
     except Exception:  # noqa: BLE001 - 不支持结构化输出的模型退回文本解析
         try:
-            from app.api.copilot import _extract_json
+            from app.core.json_extract import _extract_json
             from app.engine.state import message_text
 
             raw = _extract_json(message_text(await model.ainvoke(messages)))
+            if not isinstance(raw, dict):
+                raise TypeError("复核输出没有返回对象")
         except Exception:  # noqa: BLE001
             # 模型这条路彻底不通。规则层已经知道出了什么事，照样说得出话
             return ReviewResult(

@@ -995,10 +995,12 @@ async def original_values(use: Mapping[str, Any], meta: Sequence[Mapping[str, An
         ours = next((m.get("ours") for c in proven for m in c.get("columns") or [] if m.get("caliber") == column),
                     None) if isinstance(column, str) else None
         if ours in columns and isinstance(rows, list) and rows and isinstance(rows[0], (list, tuple)):
+            from app.engine.nodes.metrics import render_metric_value
+
             value = rows[0][columns.index(ours)]
             try:
-                text = render_number(value, unit=str(item.get("unit") or ""), decimals=item.get("decimals"),
-                                     fmt=item.get("format"))
+                text = render_metric_value(value, unit=str(item.get("unit") or ""), decimals=item.get("decimals"),
+                                           fmt=item.get("format"), parse_numeric_str=True)
             except Exception:  # noqa: BLE001 - 渲染不出就写原值
                 text = str(value)
         else:

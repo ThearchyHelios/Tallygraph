@@ -96,14 +96,20 @@ class UserPatch(BaseModel):
     password: str | None = Field(default=None, max_length=200)
 
 
-async def _other_admins(session: AsyncSession, user_id: str) -> int:
-    return int((await session.execute(select(func.count()).select_from(User).where(
-        User.role == "admin", User.disabled.is_(False), User.id != user_id))).scalar_one())
+async def _other_admins(session: AsyncSession, user_id: str, *, require_password: bool = False) -> int:
+    stmt = select(func.count()).select_from(User).where(
+        User.role == "admin", User.disabled.is_(False), User.id != user_id
+    )
+    if require_password:
+        stmt = stmt.where(User.password_hash.is_not(None))
+    return int((await session.execute(stmt)).scalar_one())
 
 
 @router.patch("/users/{user_id}")
 async def update_user(user_id: str, payload: UserPatch, session: AsyncSession = Depends(get_session)
                       ) -> dict[str, Any]:
+    from app.auth import current_mode
+
     row = await session.get(User, user_id)
     if row is None:
         raise HTTPException(404, "用户不存在")
@@ -118,7 +124,8 @@ async def update_user(user_id: str, payload: UserPatch, session: AsyncSession = 
         changes["disabled"] = [row.disabled, payload.disabled]
     losing_admin = row.role == "admin" and not row.disabled and (
         ("role" in changes and payload.role != "admin") or payload.disabled is True)
-    if losing_admin and not await _other_admins(session, row.id):
+    need_password = current_mode() == "local" and row.password_hash is not None
+    if losing_admin and not await _other_admins(session, row.id, require_password=need_password):
         raise HTTPException(409, "至少需要保留一个可用的管理员")
     if payload.password:
         if problem := password_problem(payload.password):

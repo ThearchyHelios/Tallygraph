@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import json
+import os
 from http.cookies import SimpleCookie
 from typing import Any
 
@@ -68,17 +69,31 @@ def _is_docs(path: str) -> bool:
     return any(path == p or path.startswith(p + "/") for p in _DOCS)
 
 
+def _trust_proxy_headers() -> bool:
+    return os.environ.get("AGENTLAB_TRUST_PROXY_HEADERS", "").strip().lower() in ("1", "true", "yes")
+
+
+def _http_scheme(raw_scheme: str | None) -> str:
+    scheme = (raw_scheme or "http").strip().lower()
+    return {"ws": "http", "wss": "https"}.get(scheme, scheme or "http")
+
+
 def _origin_ok(origin: str, headers: dict[str, str], scope: dict[str, Any]) -> bool:
     from app.core.public_url import origin_of, public_base_url
 
     allowed = {o.rstrip("/") for o in settings.cors_origins}
     # 对外访问地址（环境变量或设置里的那一项，core/public_url.py）：反向代理后面请求的 Host 不一定是它
-    if address := public_base_url():
+    address = public_base_url()
+    if address:
         allowed.add(origin_of(address))
-    host = headers.get("x-forwarded-host") or headers.get("host")
-    if host:
-        scheme = headers.get("x-forwarded-proto") or scope.get("scheme") or "http"
-        allowed.add(f"{scheme}://{host}")
+    direct_host = headers.get("host")
+    if direct_host:
+        allowed.add(f"{_http_scheme(scope.get('scheme'))}://{direct_host}")
+    if not address and _trust_proxy_headers():
+        fwd_host = (headers.get("x-forwarded-host") or "").split(",", 1)[0].strip()
+        if fwd_host:
+            fwd_proto = (headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip()
+            allowed.add(f"{_http_scheme(fwd_proto or scope.get('scheme'))}://{fwd_host}")
     return origin.rstrip("/") in allowed
 
 
@@ -147,6 +162,13 @@ class AuthMiddleware:
             origin = headers.get("origin")
             if origin and not _origin_ok(origin, headers, scope):
                 await _reply(send, 403, "请求来自其他站点，已拒绝", "csrf_origin")
+                return
+
+        if scope["type"] == "websocket":
+            ws_origin = headers.get("origin")
+            if ws_origin and not _origin_ok(ws_origin, headers, scope):
+                await receive()
+                await send({"type": "websocket.close", "code": 1008})
                 return
 
         principal = await resolve(headers, mode)

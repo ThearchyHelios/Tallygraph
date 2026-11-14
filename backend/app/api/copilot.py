@@ -18,7 +18,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import copilot_context
-from app.api.coded import DATASOURCE_SCOPE_EMPTY, CodedHTTPException
+from app.core.coded import DATASOURCE_SCOPE_EMPTY, CodedHTTPException
+from app.core.json_extract import COPILOT_SETTING_KEY, _extract_json
 # 读流、解析、落地搬到了生成过程（copilot_gen），这里留着老名字：测试和别处照旧从这里取
 from app.api.copilot_gen import (  # noqa: F401
     AppApplier, AppChecker, CopilotIncomplete, Generation, GraphApplier, GraphChecker, _apply_op, _iter_ops,
@@ -742,9 +743,6 @@ def _with_history(user: str, history: str) -> str:
     return f"{history}\n\n---\n\n{user}" if history else user
 
 
-COPILOT_SETTING_KEY = "copilot"
-
-
 async def copilot_model_spec(
     session: AsyncSession, payload: GenerateIn, *, max_tokens: int = 8192
 ) -> ModelSpec:
@@ -1384,35 +1382,52 @@ async def _with_heartbeat(source: Any, phase: str = "planning", *, started: floa
     """
     started = time.monotonic() if started is None else started
     iterator = source.__aiter__()
-    while True:
-        pending = asyncio.ensure_future(iterator.__anext__())
+    pending: asyncio.Future[dict[str, Any]] | None = None
+    try:
         while True:
-            done, _ = await asyncio.wait({pending}, timeout=_HEARTBEAT_SECONDS)
-            if pending in done:
-                try:
-                    op = pending.result()
-                except StopAsyncIteration:
-                    return
-                kind = op.get("op")
-                # 阶段跟着实际操作走，前端据此换文案。查看时生成过程自己发一拍 looking，查看完回到 planning
-                # 蓝图助手的 bp_* 操作、填关节的 fill_joint 也是在动手（api/copilot_blueprint.py）
-                if kind == "add_node" or kind in APP_OPS or kind in _BLUEPRINT_BUILD_OPS:
-                    phase = "building"
-                elif kind in ("add_edge", "connect"):
-                    phase = "wiring"
-                elif kind == "done":
-                    phase = "finalizing"
-                elif kind == "heartbeat":
-                    phase = op.get("phase") or phase
-                elif kind == "look":
-                    phase = "planning"
-                yield op
-                break
-            yield {
-                "op": "heartbeat",
-                "phase": phase,
-                "elapsed_ms": int((time.monotonic() - started) * 1000),
-            }
+            pending = asyncio.ensure_future(iterator.__anext__())
+            while True:
+                done, _ = await asyncio.wait({pending}, timeout=_HEARTBEAT_SECONDS)
+                if pending in done:
+                    try:
+                        op = pending.result()
+                    except StopAsyncIteration:
+                        return
+                    finally:
+                        pending = None
+                    kind = op.get("op")
+                    # 阶段跟着实际操作走，前端据此换文案。查看时生成过程自己发一拍 looking，查看完回到 planning
+                    # 蓝图助手的 bp_* 操作、填关节的 fill_joint 也是在动手（api/copilot_blueprint.py）
+                    if kind == "add_node" or kind in APP_OPS or kind in _BLUEPRINT_BUILD_OPS:
+                        phase = "building"
+                    elif kind in ("add_edge", "connect"):
+                        phase = "wiring"
+                    elif kind == "done":
+                        phase = "finalizing"
+                    elif kind == "heartbeat":
+                        phase = op.get("phase") or phase
+                    elif kind == "look":
+                        phase = "planning"
+                    yield op
+                    break
+                yield {
+                    "op": "heartbeat",
+                    "phase": phase,
+                    "elapsed_ms": int((time.monotonic() - started) * 1000),
+                }
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            try:
+                await pending
+            except (asyncio.CancelledError, StopAsyncIteration, Exception):  # noqa: BLE001
+                pass
+        aclose = getattr(iterator, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
 
 def _sse(obj: dict[str, Any]) -> str:
@@ -3377,18 +3392,7 @@ def _slim(graph: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _extract_json(text: str) -> dict[str, Any]:
-    text = text.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        text = "\n".join(lines[1 : -1 if lines[-1].strip().startswith("```") else None])
-    start = text.find("{")
-    for end in range(len(text), start, -1):
-        try:
-            return json.loads(text[start:end])
-        except json.JSONDecodeError:
-            continue
-    raise ValueError("模型输出里找不到 JSON")
+# `_extract_json` 已下沉至 `app.core.json_extract` 并在模块顶层导出，保留原签名兼容调用方。
 
 
 # --------------------------------------------------------------------------

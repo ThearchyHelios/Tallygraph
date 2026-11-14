@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -12,10 +14,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.analysis import contract as analysis_contract
 from app.api import health
 from app.api.coded import PUBLIC_URL_ENV_LOCKED, CodedHTTPException
+from app.api.deps import current_principal
 from app.core import public_url
 from app.core.errors import explain, not_configured, raw
 from app.core.config import settings as app_settings
-from app.core.crypto import encrypt, mask
+from app.core.crypto import decrypt, encrypt, is_ciphertext, mask
 from app.data.draft_model import CATALOG_DRAFT_SETTING_KEY, setting_pair
 from app.db.base import get_session
 from app.db.models import Provider, Setting
@@ -97,7 +100,27 @@ def _user_extra(extra: dict[str, Any] | None) -> dict[str, Any]:
     return {k: v for k, v in (extra or {}).items() if k != LAST_CHECK}
 
 
-def _with_saved_headers(extra: dict[str, Any], saved: dict[str, Any] | None) -> dict[str, Any]:
+def _url_origin(url: str | None) -> tuple[str, str, int | None] | None:
+    text = (url or "").strip()
+    if not text:
+        return None
+    try:
+        parts = urlsplit(text)
+        port = parts.port
+    except ValueError:
+        return (text, "", None)
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    default_port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    return (scheme, host, port or default_port)
+
+
+def _with_saved_headers(
+    extra: dict[str, Any],
+    saved: dict[str, Any] | None,
+    *,
+    host_changed: bool = False,
+) -> dict[str, Any]:
     """请求头的值回显的是 ***：原样带回来的，换回存着的真值。
 
     设置页保存时会把读到的 extra 整块带回来。以前照单全收，于是改个名字、
@@ -107,7 +130,17 @@ def _with_saved_headers(extra: dict[str, Any], saved: dict[str, Any] | None) -> 
     if not isinstance(headers, dict):
         return extra
     old = (saved or {}).get("headers") or {}
-    return {**extra, "headers": {k: (old.get(k, v) if v == "***" else v) for k, v in headers.items()}}
+    merged: dict[str, Any] = {}
+    for k, v in headers.items():
+        if isinstance(v, str) and is_ciphertext(v) and v != old.get(k):
+            raise HTTPException(400, "不允许直接提交密文前缀")
+        if v == "***" and k in old:
+            if host_changed:
+                raise HTTPException(400, "修改接入地址后请重新填写自定义请求头")
+            merged[k] = old[k]
+        else:
+            merged[k] = v
+    return {**extra, "headers": merged}
 
 
 def _connection(provider: Provider, model: str | None = None) -> str:
@@ -171,6 +204,9 @@ async def create_provider(
     problem = _config_problem(payload.kind, payload.base_url)
     if problem:
         raise HTTPException(400, problem)
+    if is_ciphertext(payload.api_key):
+        raise HTTPException(400, "不允许直接提交密文前缀")
+    clean_extra = _with_saved_headers(_user_extra(payload.extra), None)
     exists = (
         await session.execute(select(Provider).where(Provider.name == payload.name))
     ).scalar_one_or_none()
@@ -185,7 +221,7 @@ async def create_provider(
         models=payload.models,
         default_model=payload.default_model,
         enabled=payload.enabled,
-        extra=_user_extra(payload.extra),
+        extra=clean_extra,
     )
     # 表单里刚测过这份配置：保存下来就带着那次结果
     _set_last_check(row, health.draft_result(_connection(row)))
@@ -205,11 +241,21 @@ async def update_provider(
 
     data = payload.model_dump(exclude_unset=True)
     before, last = _connection(row), (row.extra or {}).get(LAST_CHECK)
+    host_changed = "base_url" in data and _url_origin(data.get("base_url")) != _url_origin(row.base_url)
     if "api_key" in data:
-        row.api_key = encrypt(data.pop("api_key")) if data["api_key"] else None
-        data.pop("api_key", None)
+        incoming_key = data.pop("api_key")
+        if incoming_key:
+            if is_ciphertext(incoming_key) and incoming_key != row.api_key:
+                raise HTTPException(400, "不允许直接提交密文前缀")
+            if row.api_key and incoming_key == mask(row.api_key):
+                if host_changed:
+                    raise HTTPException(400, "修改接入地址后请重新填写 API Key")
+            else:
+                row.api_key = encrypt(incoming_key)
+        else:
+            row.api_key = None
     if data.get("extra") is not None:
-        data["extra"] = _with_saved_headers(_user_extra(data["extra"]), row.extra)
+        data["extra"] = _with_saved_headers(_user_extra(data["extra"]), row.extra, host_changed=host_changed)
     else:
         data.pop("extra", None)
     for key, value in data.items():
@@ -334,15 +380,26 @@ def _draft_provider(payload: ProviderDraftIn, saved: Provider | None) -> Provide
 
     编辑时 Key 框留空表示不改、请求头回显的是 ***——测试都得换回存着的真值，
     否则改个 Base URL 想测一下，只会得到一句"密钥不对"。
+    但目标主机变了时不能把已存的密钥或掩码头直接转发到新主机，也不允许直接提交 enc:: 密文。
     """
-    extra = _user_extra(payload.extra)
-    if saved:
-        extra = _with_saved_headers(extra, saved.extra)
+    host_changed = bool(saved) and _url_origin(payload.base_url) != _url_origin(saved.base_url if saved else None)
+    extra = _with_saved_headers(_user_extra(payload.extra), saved.extra if saved else None, host_changed=host_changed)
+    if payload.api_key:
+        if is_ciphertext(payload.api_key) and payload.api_key != (saved.api_key if saved else None):
+            raise HTTPException(400, "不允许直接提交密文前缀")
+        if saved and saved.api_key and payload.api_key == mask(saved.api_key):
+            if host_changed:
+                raise HTTPException(400, "修改接入地址后请重新填写 API Key")
+            resolved_key = saved.api_key
+        else:
+            resolved_key = encrypt(payload.api_key)
+    else:
+        resolved_key = saved.api_key if (saved and not host_changed) else None
     return Provider(
         name=payload.name or (saved.name if saved else "草稿"),
         kind=payload.kind,
         base_url=(payload.base_url or "").strip() or None,
-        api_key=encrypt(payload.api_key) if payload.api_key else (saved.api_key if saved else None),
+        api_key=resolved_key,
         models=payload.models,
         default_model=payload.default_model,
         enabled=True,
@@ -390,6 +447,7 @@ async def probe_provider_models(
     Key、自定义请求头都按真正调用时的方式带上。
     """
     import httpx
+    from app.tools.net import UnsafeUrlError, assert_safe_url
 
     problem = _config_problem(payload.kind, payload.base_url)
     if problem:
@@ -399,10 +457,15 @@ async def probe_provider_models(
         return {"ok": True, "models": [m["id"] for m in catalog.MOCK_MODELS], "url": ""}
 
     extra = dict(provider.extra or {})
-    # 和真正调用时取同一把钥匙：只有官方 OpenAI / Anthropic 才退回环境变量。
-    # 兼容网关是别人家的服务，Key 框空着就不带——否则点一下「拉取模型」，
-    # 环境里那把 OpenAI 的钥匙就发给了表单上随便填的一个地址
-    key = _resolve_key(provider) or ""
+    # 非管理员自定义 base_url 时禁止回退到服务端环境变量密钥；管理员与真实调用（factory）一致，
+    # 仅在 kind=openai / anthropic 时按 _resolve_key 回退（openai_compatible 本身不读环境变量）
+    has_custom_base = bool((payload.base_url or "").strip()) or bool((provider.base_url or "").strip())
+    if provider.api_key:
+        key = decrypt(provider.api_key) or ""
+    elif not has_custom_base or current_principal().at_least("admin"):
+        key = _resolve_key(provider) or ""
+    else:
+        key = ""
     headers: dict[str, str] = {}
     if provider.kind == "anthropic":
         base = provider.base_url or os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
@@ -419,11 +482,31 @@ async def probe_provider_models(
             headers["Authorization"] = f"Bearer {key}"
     headers.update({k: str(v) for k, v in (extra.get("headers") or {}).items()})
 
+    max_model_resp_bytes = 2 * 1024 * 1024
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
+        await assert_safe_url(url, allow_intranet=current_principal().at_least("admin"))
+        async with httpx.AsyncClient(timeout=10, trust_env=False, follow_redirects=False) as client:
+            req_obj = client.build_request("GET", url, headers=headers)
+            resp = await client.send(req_obj, stream=True)
+            try:
+                resp.raise_for_status()
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_model_resp_bytes:
+                        raise ValueError("模型列表响应过大")
+                    chunks.append(chunk)
+                raw_bytes = b"".join(chunks)
+                encoding = resp.encoding
+            finally:
+                await resp.aclose()
+            data = json.loads(raw_bytes.decode(encoding or "utf-8", errors="replace"))
+    except UnsafeUrlError as e:
+        return {"ok": False, "error": f"未能获取模型列表：{e}", "hint": "",
+                "detail": "", "models": [], "url": url}
     except Exception as e:  # noqa: BLE001
         reason, hint = explain(e)
         return {"ok": False, "error": f"未能获取模型列表：{reason}", "hint": hint,

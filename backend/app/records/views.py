@@ -112,13 +112,16 @@ def _infer_table_key(older: tuple[Older, ...] | list[Older]) -> str | None:
 
 def _materialize_older(older: tuple[Older, ...] | list[Older], *, table_key: str | None = None) -> tuple[Older, ...]:
     items = tuple(older)
-    if len(items) <= MAX_DIRECT_ATTACH or any(o.schema_name is not None for o in items):
+    already_archived = [o for o in items if o.schema_name == ARCHIVE_SCHEMA]
+    unarchived = [o for o in items if o.schema_name != ARCHIVE_SCHEMA]
+    max_direct = MAX_DIRECT_ATTACH - 1 if already_archived else MAX_DIRECT_ATTACH
+    if len(unarchived) <= max_direct:
         return items
     key = table_key or _infer_table_key(items)
     if not key:
         return items
-    direct = items[:MAX_DIRECT_ATTACH - 1]
-    overflow = items[MAX_DIRECT_ATTACH - 1:]
+    direct = tuple(unarchived[:MAX_DIRECT_ATTACH - 1])
+    overflow = unarchived[MAX_DIRECT_ATTACH - 1:]
     present = [o for o in overflow if Path(o.path).is_file()]
     if not present:
         return items
@@ -128,13 +131,22 @@ def _materialize_older(older: tuple[Older, ...] | list[Older], *, table_key: str
     )
     arch_str = str(arch)
     present_versions = {o.version for o in present}
-    mapped = tuple(
-        Older(o.version, arch_str, o.columns, o.high_water, schema_name=ARCHIVE_SCHEMA,
-              table_name=store.archive_table_name(o.version))
-        if o.version in present_versions else o
+    mapped_by_ver = {
+        o.version: (
+            Older(o.version, arch_str, o.columns, o.high_water, schema_name=ARCHIVE_SCHEMA,
+                  table_name=store.archive_table_name(o.version))
+            if o.version in present_versions else o
+        )
         for o in overflow
-    )
-    return (*direct, *mapped)
+    }
+    direct_vers = {o.version for o in direct}
+    out: list[Older] = []
+    for o in items:
+        if o.schema_name == ARCHIVE_SCHEMA or o.version in direct_vers:
+            out.append(o)
+        else:
+            out.append(mapped_by_ver.get(o.version, o))
+    return tuple(out)
 
 
 def bind_view(source: Any, columns: list[store.Column], *, high_water: int | None, rows: str = "all",
@@ -194,25 +206,49 @@ async def resolve(session: AsyncSession, source: Any, entry: Any = None) -> Reco
     table_key = table.table_key if table is not None else None
     columns = columns_of(table) if table is not None else columns_of_source(source)
     older_rows = await _older_versions(session, table)
+    if table is None and entry is None:
+        inferred_key, discovered = await asyncio.to_thread(_discover_default_older, source)
+        return bind_view(source, columns, high_water=None, rows="all", older=discovered,
+                         table_key=inferred_key)
+    arch_file = store.archive_path(table_key) if table_key else None
+    archived_map = (
+        await asyncio.to_thread(_archived_versions_in_db, arch_file, below_version=table.version)
+        if arch_file is not None and arch_file.is_file() and table is not None
+        else {}
+    )
     if isinstance(entry, dict):
         seq = entry.get("seq")
         marked = [o for o in entry.get("older") or [] if isinstance(o, dict) and isinstance(o.get("version"), int)]
         # 发起时文件就不在的那几版：没有高水位，不挂；照原样带着，快照里照实说汇总缺了它们
         missing = [int(o["version"]) for o in marked if o.get(MISSING)]
         pinned = {int(o["version"]): o.get("seq") for o in marked if not o.get(MISSING)}
-        older = [Older(row.version, str(path_of(row)), columns_of(row),
-                       int(pinned[row.version]) if isinstance(pinned[row.version], int) else 0)
-                 for row in older_rows if row.version in pinned]
+        older = [
+            Older(row.version, str(path_of(row)), columns_of(row),
+                  int(pinned[row.version]) if isinstance(pinned[row.version], int) else 0)
+            if path_of(row).is_file() or row.version not in archived_map
+            else Older(row.version, str(arch_file), columns_of(row),
+                       int(pinned[row.version]) if isinstance(pinned[row.version], int) else 0,
+                       schema_name=ARCHIVE_SCHEMA, table_name=store.archive_table_name(row.version))
+            for row in older_rows if row.version in pinned
+        ]
         if len(older) > MAX_DIRECT_ATTACH:
             older = list(await asyncio.to_thread(_materialize_older, older, table_key=table_key))
         return bind_view(source, columns, high_water=int(seq) if isinstance(seq, int) else 0,
                          rows=str(entry.get("rows") or "none"), viewer=entry.get("viewer"), older=older,
                          missing=missing, table_key=table_key)
-    older = [Older(row.version, str(path_of(row)), columns_of(row), None) for row in older_rows
-             if path_of(row).is_file()]
+    older = []
+    missing = []
+    for row in older_rows:
+        p = path_of(row)
+        if p.is_file():
+            older.append(Older(row.version, str(p), columns_of(row), None))
+        elif row.version in archived_map and arch_file is not None:
+            older.append(Older(row.version, str(arch_file), columns_of(row), None,
+                               schema_name=ARCHIVE_SCHEMA, table_name=store.archive_table_name(row.version)))
+        else:
+            missing.append(row.version)
     if len(older) > MAX_DIRECT_ATTACH:
         older = list(await asyncio.to_thread(_materialize_older, older, table_key=table_key))
-    missing = [row.version for row in older_rows if not path_of(row).is_file()]
     if missing:
         logger.warning("记录表 %s 第 %s 版的数据文件不在了，跨版本汇总里不含这几版", table.table_key,
                        "、".join(str(v) for v in missing))
@@ -220,10 +256,130 @@ async def resolve(session: AsyncSession, source: Any, entry: Any = None) -> Reco
                      table_key=table_key)
 
 
-def default_view(source: Any) -> RecordsView:
+def _source_table_coords(source: Any) -> tuple[Path, str, int] | None:
+    raw_db = getattr(source, "database", None)
+    if not raw_db or raw_db == ":memory:":
+        return None
+    db_path = Path(str(raw_db))
+    name = db_path.name
+    if not (name.endswith(".db") and ".v" in name[:-3]):
+        return None
+    key, _, ver = name[:-3].rpartition(".v")
+    if not key or not ver.isdigit() or not store._KEY.match(key):
+        return None
+    version = int(ver)
+    return (db_path.parent, key, version) if version >= 1 else None
+
+
+def _columns_from_sqlite_table(db_path: Path, table_name: str = store.TABLE) -> list[store.Column]:
+    from app.records import SYSTEM_COLUMNS
+
+    conn = store._ro(db_path)
+    try:
+        info = conn.execute(f"PRAGMA table_info({store._q(table_name)})").fetchall()
+    finally:
+        conn.close()
+    return [
+        store.Column(name=str(r[1]), label=str(r[1]), type=_type_of(str(r[2] or "")))
+        for r in info
+        if str(r[1]) not in SYSTEM_COLUMNS and str(r[1]) != store.ACTION_KEY_COLUMN
+    ]
+
+
+def _archived_versions_in_db(arch_path: Path, *, below_version: int) -> dict[int, list[store.Column]]:
+    if not arch_path.is_file():
+        return {}
+    from app.records import SYSTEM_COLUMNS
+
+    out: dict[int, list[store.Column]] = {}
+    conn = store._ro(arch_path)
+    try:
+        tables = [
+            str(r[0])
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'rows_v%'").fetchall()
+        ]
+        for tbl in tables:
+            suffix = tbl[len("rows_v"):]
+            if not suffix.isdigit():
+                continue
+            ver = int(suffix)
+            if 1 <= ver < below_version:
+                info = conn.execute(f"PRAGMA table_info({store._q(tbl)})").fetchall()
+                out[ver] = [
+                    store.Column(name=str(r[1]), label=str(r[1]), type=_type_of(str(r[2] or "")))
+                    for r in info
+                    if str(r[1]) not in SYSTEM_COLUMNS and str(r[1]) != store.ACTION_KEY_COLUMN
+                ]
+    except Exception:  # noqa: BLE001
+        return {}
+    finally:
+        conn.close()
+    return out
+
+
+def _discover_default_older(source: Any) -> tuple[str | None, list[Older]]:
+    coords = _source_table_coords(source)
+    if coords is None:
+        return None, []
+    parent, table_key, current_version = coords
+    if current_version <= 1:
+        return table_key, []
+    disk_files: dict[int, Path] = {}
+    for ver in range(current_version - 1, 0, -1):
+        candidate = parent / f"{table_key}.v{ver}.db"
+        if candidate.is_file():
+            disk_files[ver] = candidate
+    arch_path = parent / f"{table_key}.archive.db"
+    archived_map = _archived_versions_in_db(arch_path, below_version=current_version)
+    # 超过直挂上限（或已生成 archive.db 归档库）时，把近期直挂库与归档库一并并入 default_view，
+    # 防止目录行数统计与数据剖析在版本超限后丢掉归档历史行；未超限且无归档时保持轻量直读当前库。
+    all_versions = sorted(set(disk_files) | set(archived_map), reverse=True)
+    if len(all_versions) <= MAX_DIRECT_ATTACH and not archived_map:
+        return table_key, []
+    older: list[Older] = []
+    for ver in all_versions:
+        if ver in disk_files:
+            try:
+                cols = _columns_from_sqlite_table(disk_files[ver])
+            except Exception:  # noqa: BLE001
+                continue
+            older.append(Older(ver, str(disk_files[ver]), cols, None))
+        elif ver in archived_map:
+            older.append(
+                Older(
+                    ver,
+                    str(arch_path),
+                    archived_map[ver],
+                    None,
+                    schema_name=ARCHIVE_SCHEMA,
+                    table_name=store.archive_table_name(ver),
+                )
+            )
+    return table_key, older
+
+
+def default_view(source: Any, *, older: list[Older] | tuple[Older, ...] | None = None) -> RecordsView:
     """没经解析就拿来查的记录表数据源（数据剖析这类只有搭建者进得来的入口）：现在的数据、看全部，照样走临时视图——
-    底表里的幂等键、被更正的行不露出来。列取登记在数据源上的表结构。"""
-    return bind_view(source, columns_of_source(source), high_water=None, rows="all")
+    底表里的幂等键、被更正的行不露出来。列取登记在数据源上的表结构；超过直挂上限或已有归档库时一并并入近期与归档旧版本。"""
+    if older is None:
+        table_key, discovered = _discover_default_older(source)
+        return bind_view(
+            source,
+            columns_of_source(source),
+            high_water=None,
+            rows="all",
+            older=discovered,
+            table_key=table_key,
+        )
+    coords = _source_table_coords(source)
+    return bind_view(
+        source,
+        columns_of_source(source),
+        high_water=None,
+        rows="all",
+        older=older,
+        table_key=coords[1] if coords else None,
+    )
 
 
 async def pin_entry(session: AsyncSession, source: Any, *, run_class: str | None = None,

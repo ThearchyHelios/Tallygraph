@@ -140,12 +140,13 @@ class ParameterRefused(Exception):
 
 @dataclass(frozen=True)
 class Slot:
-    """模板里的一处 `{{ input.字段 }}`：第几处、字段、过滤器、写在哪儿。"""
+    """模板里的一处 `{{ input.字段 }}`：第几处、字段、过滤器、写在哪儿、引号定界符。"""
 
     index: int
     field: str
     filters: tuple[str, ...] = ()
     context: str = "bare"
+    quote: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {"name": self.field, "filters": list(self.filters), "slot": self.context}
@@ -186,8 +187,54 @@ def describe(problems: Iterable[Problem]) -> str:
 # ==========================================================================
 
 
+def _token_quote(token: Any) -> str:
+    """从词法 token 提取引号定界符类型：' / \" / $$（或 $tag$）/ Oracle q-quote 闭定界符。"""
+    opener = token.text[: token.open] if token.open else ""
+    if opener.startswith("$"):
+        return opener
+    if opener == '"':
+        return '"'
+    if token.open == 2:
+        return token.text[len(token.text) - token.close :] if token.close else opener
+    return "'"
+
+
+def _mask_templates(template: str) -> str:
+    """扫描 SQL 词法前，将 `{{ ... }}` 等长替换为下划线，避免 `{{ input['x'] }}` 内部的引号打断外部 SQL 字符串。"""
+    return _TEMPLATE_EXPR.sub(lambda m: "_" * len(m.group(0)), template)
+
+
+def _quote_spans(template: str, dialect: str | None) -> list[tuple[int, int, str, str]]:
+    """返回模板中每段词法 token 的 (内起点, 内终点, context, quote)。"""
+    from app.data.guard import _reading, _tokens
+
+    masked = _mask_templates(template)
+    tokens = _tokens(masked, _reading(dialect))
+    spans: list[tuple[int, int, str, str]] = []
+    pos = 0
+    for tok in tokens:
+        start, end = pos, pos + len(tok.text)
+        pos = end
+        if tok.kind == "string":
+            spans.append((start + tok.open, end - tok.close, "quoted", _token_quote(tok)))
+        elif tok.kind == "comment":
+            spans.append((start, end, "comment", ""))
+        elif tok.kind == "ident":
+            spans.append((start + tok.open, end - tok.close, "name", ""))
+        elif tok.kind == "code":
+            spans.append((start, end, "bare", ""))
+    return spans
+
+
+def _quote_at(q_spans: Sequence[tuple[int, int, str, str]], start: int, end: int) -> str:
+    for qs, qe, ctx, quote in q_spans:
+        if ctx == "quoted" and qs <= start and end <= qe:
+            return quote
+    return "'"
+
+
 def slots_of(template: str, *, dialect: str | None = None) -> tuple[Slot, ...]:
-    """模板里每一处 `{{ input.字段 }}`（含写在哪儿、带了什么过滤器）。认不出写法、写在表名列名里的抛
+    """模板里每一处 `{{ input.字段 }}`（含写在哪儿、带了什么过滤器、引号定界符）。认不出写法、写在表名列名里的抛
     ParameterRefused(unsupported_parameter)——判断和带值比对那一套（data/sql_semantics._template_slots）是同一份。"""
     from app.data.sql_semantics import _NotComparable, _template_slots
 
@@ -195,7 +242,17 @@ def slots_of(template: str, *, dialect: str | None = None) -> tuple[Slot, ...]:
         spans, _ = _template_slots(template, dialect=dialect)
     except _NotComparable as e:
         raise ParameterRefused([Problem(UNSUPPORTED, str(e))]) from None
-    return tuple(Slot(index=s.index, field=s.field, filters=tuple(s.filters), context=s.context) for _, _, s in spans)
+    q_spans = _quote_spans(template, dialect)
+    return tuple(
+        Slot(
+            index=s.index,
+            field=s.field,
+            filters=tuple(s.filters),
+            context=s.context,
+            quote=_quote_at(q_spans, start, end) if s.context == "quoted" else "",
+        )
+        for start, end, s in spans
+    )
 
 
 def input_refs(template: str) -> tuple[str, ...]:
@@ -407,18 +464,41 @@ def _unresolved(name: str, field: Mapping[str, Any] | None, values: Mapping[str,
 # ==========================================================================
 
 
-def literal_problem(name: str, value: Any, contexts: Iterable[str]) -> str | None:
+def literal_problem(
+    name: str,
+    value: Any,
+    contexts: Iterable[str],
+    *,
+    quotes: Iterable[str] = (),
+) -> str | None:
     """值写在 SQL 的哪个位置、旧适配器（内联文本替换）承载得了吗：承载不了给一句原因，承载得了为 None。
 
-    引号里的字里再出现引号 / 反斜杠 / 换行、裸写的位置上不是有限数值或布尔值、注释里带换行或注释结束符——这些都会让渲染出来的语句
-    不再等于「那一版口径的 SQL」。真支持特殊字符要等驱动级参数绑定（见模块说明），那之前明确拒绝，不硬塞。"""
+    引号里的字里再出现引号 / 反斜杠 / 换行（含双引号与美元引号定界符）、裸写的位置上不是有限数值或布尔值、
+    注释里带换行或注释结束符——这些都会让渲染出来的语句不再等于「那一版口径的 SQL」。真支持特殊字符要等驱动级参数绑定
+    （见模块说明），那之前明确拒绝，不硬塞。"""
     text = _written(value)
     where = set(contexts)
-    if "quoted" in where and any(ch in text for ch in ("'", "\\", "\n", "\r")):
-        return QUOTED_TEXT.format(name=name)
+    quote_set = {str(q) for q in quotes if q}
+    if "double_quoted" in where:
+        where.add("quoted")
+        quote_set.add('"')
+    if "dollar_quoted" in where:
+        where.add("quoted")
+        quote_set.add("$$")
+    if "quoted" in where:
+        forbidden: set[str] = {"\x00", "'", "\\", "\n", "\r"}
+        if '"' in quote_set:
+            forbidden.add('"')
+        if any(q.startswith("$") for q in quote_set):
+            forbidden.add("$")
+        for q in quote_set:
+            if len(q) == 2 and q.endswith("'"):
+                forbidden.add(q[0])
+        if any(ch in text for ch in forbidden):
+            return QUOTED_TEXT.format(name=name)
     if "bare" in where and not _bare_scalar_ok(value):
         return BARE_TEXT.format(name=name, value=text[:40])
-    if "comment" in where and ("\n" in text or "\r" in text or "*/" in text):
+    if "comment" in where and ("\x00" in text or "\n" in text or "\r" in text or "*/" in text):
         return COMMENT_TEXT.format(name=name)
     return None
 
@@ -458,7 +538,13 @@ def check_template(template: str, *, fields: Mapping[str, Mapping[str, Any]], va
             continue
         seen_literal.add(name)
         # 同一个字段的每一处槽位一起判（写在引号里 / 裸写 / 注释里各算一处），一个字段只报一条
-        if problem := literal_problem(name, values[name], (s.context for s in slots if s.field == name)):
+        field_slots = [s for s in slots if s.field == name]
+        if problem := literal_problem(
+            name,
+            values[name],
+            (s.context for s in field_slots),
+            quotes=(s.quote for s in field_slots if s.quote),
+        ):
             problems.append(Problem(LITERAL, problem, name=name, node_id=node_id, where=where))
     return problems
 
@@ -471,7 +557,8 @@ def _sql_of(node: Mapping[str, Any]) -> str | None:
 
 def check_nodes(nodes: Iterable[Mapping[str, Any]], *, fields: Iterable[Mapping[str, Any]],
                 values: Mapping[str, Any] | None = None, where: str = "入口字段",
-                dialect: str | None = None) -> list[Problem]:
+                dialect: str | None = None,
+                dialects: Mapping[str, str] | None = None) -> list[Problem]:
     """几个调用工具节点（原始 JSON）的 args.sql 各过一遍，问题按节点先后合起来。values 不给就只判模板与声明。"""
     declared_fields = declared(fields)
     out: list[Problem] = []
@@ -481,30 +568,48 @@ def check_nodes(nodes: Iterable[Mapping[str, Any]], *, fields: Iterable[Mapping[
         sql = _sql_of(node)
         if sql is None:
             continue
-        out += check_template(sql, fields=declared_fields, values=values, node_id=str(node.get("id") or "") or None,
-                              where=where, dialect=dialect)
+        nid = str(node.get("id") or "") or None
+        node_dialect = (dialects or {}).get(nid or "", dialect)
+        out += check_template(sql, fields=declared_fields, values=values, node_id=nid,
+                              where=where, dialect=node_dialect)
     return out
 
 
+def _runtime_input_slots(template: str, dialect: str | None) -> dict[str, tuple[set[str], set[str]]]:
+    """扫描运行时模板中每个可识别 input 字段所在的 SQL 上下文与引号定界符。"""
+    q_spans = _quote_spans(template, dialect)
+    by_name: dict[str, tuple[set[str], set[str]]] = {}
+    for m in _TEMPLATE_EXPR.finditer(template or ""):
+        expr = m.group(1).strip()
+        path = _template_path(expr)
+        if not path or not _INPUT_HEAD.match(path):
+            continue
+        lookups = _lookups(path)
+        if lookups is None or lookups[0] != "input" or len(lookups) < 2:
+            continue
+        name = lookups[1]
+        start, end = m.start(), m.end()
+        ctx = "bare"
+        quote = ""
+        for qs, qe, span_ctx, span_quote in q_spans:
+            if qs <= start and end <= qe:
+                ctx = span_ctx
+                quote = span_quote
+                break
+        contexts, quotes = by_name.setdefault(name, (set(), set()))
+        contexts.add(ctx)
+        if quote:
+            quotes.add(quote)
+    return by_name
+
+
 def runtime_problems(template: str, *, values: Mapping[str, Any],
-                     declared: Mapping[str, Mapping[str, Any]]) -> list[Problem]:
-    """运行时的同一条判断（宽松认法）：模板里按 input 取值的地方这次取不到值就拒。
-
-    认法和 engine/expressions.resolve_path 一致（`input.字段`、`input['字段']`、`input[0]`、`input.a.b[0].c` 都算，
-    取的是第一层的字段）；认不出取哪个字段的写法（`{{ input }}`、`input['a.b']`、`input[a[b]]`）同样拒——它们渲染成
-    空串，不能当「没引用参数」放过去。
-
-    「有值」和入口收值（params.provided）同一套：**None 和空串都算没给**（空串不是值，是省略），取到别的值才放行。
-    开放入口（入口节点没声明字段、键由发起时传）也一样——否则 `{{ input['store'] }}` 传了个空串就会渲染成 `''`，
-    发出一条 `AND region = ''`。
-
-    - 没给值、入口也没声明过它 → undeclared_parameter；
-    - 没给值、声明过、声明的缺省值也是 None（含只声明成可选的）→ missing_parameter；声明了缺省值（含 `""`：作者写的
-      就是「空值不过滤」）的按声明保留，照缺省值渲染。
-    只看会不会渲染成空串：普通画布上的取数 SQL 引用 vars./nodes. 的不归它管。
-    """
+                     declared: Mapping[str, Mapping[str, Any]],
+                     dialect: str | None = None) -> list[Problem]:
+    """运行时的同一条判断（宽松认法）：模板里按 input 取值的地方这次取不到值或引号内字面量不安全就拒。"""
     problems: list[Problem] = [
         Problem(UNSUPPORTED, DYNAMIC_TEXT.format(expr=writing)) for writing in dynamic_input_writings(template)]
+    invalid_names: set[str] = set()
     for name in input_refs(template):
         if _given(values.get(name)):
             continue
@@ -513,8 +618,24 @@ def runtime_problems(template: str, *, values: Mapping[str, Any],
         if field is None and name not in values:
             problems.append(Problem(UNDECLARED, UNDECLARED_TEXT.format(
                 name=name, where="这次运行的入口", fields=_names(sorted(declared))), name=name))
+            invalid_names.add(name)
         elif _unresolved(name, field, values):
             problems.append(Problem(MISSING, MISSING_TEXT.format(name=name, where="这次运行的入口"), name=name))
+            invalid_names.add(name)
+
+    resolved = resolve(declared.values(), values)
+    slot_map = _runtime_input_slots(template, dialect)
+    for name in input_refs(template):
+        if name in invalid_names or name not in resolved:
+            continue
+        contexts, quotes = slot_map.get(name, (set(), set()))
+        field = declared.get(name)
+        checked_contexts = {c for c in contexts if c in ("quoted", "comment")}
+        if "bare" in contexts and field is not None and field_type(field) in ("integer", "number", "boolean"):
+            checked_contexts.add("bare")
+        if checked_contexts:
+            if problem := literal_problem(name, resolved[name], checked_contexts, quotes=quotes):
+                problems.append(Problem(LITERAL, problem, name=name, where="这次运行的入口"))
     return problems
 
 
@@ -604,7 +725,8 @@ def plan(template: str, *, fields: Iterable[Mapping[str, Any]], values: Mapping[
 
 
 def marker(*, rendered: Any, template: str | None = None, values: Mapping[str, Any] | None = None,
-           declared_fields: Iterable[Mapping[str, Any]] = (), source: Mapping[str, Any] | None = None) -> dict[str, Any]:
+           declared_fields: Iterable[Mapping[str, Any]] = (), source: Mapping[str, Any] | None = None,
+           dialect: str | None = None) -> dict[str, Any]:
     """写进节点 data.config[KEY] 的参数契约：**rendered 那一项（tool 的 args / merge 的 sql）已经是渲染好的字面语句**，
     运行时的模板渲染一概不碰它——不然值里的 `{{ }}` 会被再解释一遍（K01 的二次渲染反例）。
 
@@ -617,7 +739,7 @@ def marker(*, rendered: Any, template: str | None = None, values: Mapping[str, A
     out: dict[str, Any] = {"mode": LITERAL_ARGS, "adapter": ADAPTER, HASH_KEY: rendered_hash(rendered)}
     if template is not None:
         out.update(material(template, values=values or {}, declared_fields=declared(declared_fields),
-                            source=source, with_template=False))
+                            source=source, with_template=False, dialect=dialect))
     elif source:
         out["source"] = dict(source)
     return out
@@ -685,9 +807,12 @@ def contract_of(config: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     return [dict(d) for d in items or [] if isinstance(d, Mapping) and d.get("name")]
 
 
+check_sql = check_template
+bind_sql = plan
+
 __all__ = ["ADAPTER", "CODES", "CONTEXTS", "FILTERS", "HASH_KEY", "KEY", "LITERAL", "LITERAL_ARGS", "LITERAL_KEY",
            "MISSING", "ParameterRefused", "Problem", "SNAPSHOT_KEY", "Slot", "Statement", "UNDECLARED", "UNSUPPORTED",
-           "check_nodes", "check_template", "contract", "contract_of", "declared", "describe", "dynamic_input_writings",
-           "field_type", "input_refs", "is_literal", "literal_keys", "literal_problem", "marker", "marker_material",
-           "material", "mentions_input", "mode_of", "plan", "provided", "render", "rendered_hash", "resolve",
-           "runtime_problems", "slots_of", "value_kind"]
+           "bind_sql", "check_nodes", "check_sql", "check_template", "contract", "contract_of", "declared", "describe",
+           "dynamic_input_writings", "field_type", "input_refs", "is_literal", "literal_keys", "literal_problem",
+           "marker", "marker_material", "material", "mentions_input", "mode_of", "plan", "provided", "render",
+           "rendered_hash", "resolve", "runtime_problems", "slots_of", "value_kind"]

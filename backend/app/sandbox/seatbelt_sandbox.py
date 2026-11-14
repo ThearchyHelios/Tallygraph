@@ -111,6 +111,7 @@ def build_policy(workdir: Path, *, language: str, network: bool) -> str:
         "",
         ";; ---- 其他 ----",
         "(allow process-exec process-fork)",  # 子进程同样受这份策略约束
+        "(deny signal (target others))",
         "(allow sysctl-read)",
         "(allow mach-lookup)",
         "(deny file-read* (subpath \"/Users/Shared\"))",
@@ -133,8 +134,24 @@ class SeatbeltSandbox(Sandbox):
     name = "seatbelt"
 
     def __init__(self) -> None:
-        self._root = settings.workspace_dir / "seatbelt"
-        self._policies = settings.data_dir / "sandbox-policies"
+        self._custom_root: Path | None = None
+        self._custom_policies: Path | None = None
+
+    @property
+    def _root(self) -> Path:
+        return self._custom_root if self._custom_root is not None else settings.workspace_dir
+
+    @_root.setter
+    def _root(self, value: Path) -> None:
+        self._custom_root = value
+
+    @property
+    def _policies(self) -> Path:
+        return self._custom_policies if self._custom_policies is not None else settings.data_dir / "sandbox-policies"
+
+    @_policies.setter
+    def _policies(self, value: Path) -> None:
+        self._custom_policies = value
 
     @staticmethod
     def available() -> bool:
@@ -161,6 +178,9 @@ class SeatbeltSandbox(Sandbox):
         path = self._root / sanitize_session(session_id)
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def _workspace(self, session_id: str) -> Path:
+        return self._session_dir(session_id)
 
     @staticmethod
     def _preexec(limits: SandboxLimits):  # pragma: no cover - 只在子进程里执行
@@ -211,7 +231,8 @@ class SeatbeltSandbox(Sandbox):
                 atomic.write_text(target, content)
 
             self._policies.mkdir(parents=True, exist_ok=True)
-            policy_file = self._policies / f"{workdir.name}-{language}.sb"
+            safe_id = workdir.name
+            policy_file = self._policies / f".agentlab_{safe_id}_{language}_{os.urandom(6).hex()}.sb"
             atomic.write_text(policy_file, build_policy(workdir, language=language, network=limits.network))
 
             argv = [SANDBOX_EXEC, "-f", str(policy_file), *cmd_of(), entry]
@@ -283,12 +304,12 @@ class SeatbeltSandbox(Sandbox):
                 files_written=written,
             )
         finally:
+            if policy_file is not None:
+                policy_file.unlink(missing_ok=True)
             if ephemeral:
-                if policy_file is not None:
-                    policy_file.unlink(missing_ok=True)
                 root_resolved = self._root.resolve()
                 if work_root != root_resolved and work_root.is_relative_to(root_resolved):
-                    shutil.rmtree(workdir, ignore_errors=True)
+                    await asyncio.to_thread(shutil.rmtree, workdir, True)
 
     @staticmethod
     def _kill(proc: asyncio.subprocess.Process) -> None:
@@ -298,7 +319,10 @@ class SeatbeltSandbox(Sandbox):
             proc.kill()
 
     async def cleanup(self, session_id: str) -> None:
-        path = self._session_dir(session_id)
+        safe_id = sanitize_session(session_id)
+        path = self._root / safe_id
         await asyncio.to_thread(shutil.rmtree, path, True)
-        for stale in self._policies.glob(f"{path.name}-*.sb"):
-            stale.unlink(missing_ok=True)
+        if self._policies.exists():
+            for pattern in (f"{safe_id}-*.sb", f".agentlab_{safe_id}_*.sb"):
+                for stale in self._policies.glob(pattern):
+                    stale.unlink(missing_ok=True)

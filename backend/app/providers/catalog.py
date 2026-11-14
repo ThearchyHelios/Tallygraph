@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from typing import Any
 
 # --------------------------------------------------------------------------
@@ -189,20 +190,34 @@ def needs_interleaved_beta(model: str) -> bool:
 
 
 _OPENAI_REASONING_RE = re.compile(r"^o[134](?:$|[-_])")
-#: 用户在「设置 → 模型接入」里填了自定义价格或上下文窗口的模型（由 list_providers 同步）
-_CUSTOM_MODELS: dict[str, dict[str, Any]] = {}
+_MAX_CUSTOM_MODELS = 512
+#: 用户在「设置 → 模型接入」里填了自定义价格或上下文窗口的模型（由 list_providers 同步，带容量上限与跨 worker 缓存同步）
+_CUSTOM_MODELS: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
 
-def sync_provider_models(providers: list[Any]) -> None:
-    """把当前启用的模型接入里带了自定义 pricing / context 的模型同步进内存表。"""
-    custom: dict[str, dict[str, Any]] = {}
+def _put_custom_model(target: OrderedDict[str, dict[str, Any]], key: str, info: dict[str, Any]) -> None:
+    if not key:
+        return
+    target[key] = info
+    target.move_to_end(key)
+    while len(target) > _MAX_CUSTOM_MODELS:
+        target.popitem(last=False)
+
+
+def sync_provider_models(providers: list[Any], *, broadcast: bool = True) -> None:
+    """把当前启用的模型接入里带了自定义 pricing / context 的模型同步进有界内存表，并通知集群其他 worker。"""
+    import asyncio
+
+    custom: OrderedDict[str, dict[str, Any]] = OrderedDict()
     for p in providers or ():
         if not getattr(p, "enabled", True):
             continue
+        prov_name = str(getattr(p, "name", "") or "").strip().lower()
         for entry in getattr(p, "models", None) or ():
             if not isinstance(entry, dict) or not entry.get("id"):
                 continue
-            key = _norm(str(entry["id"]))
+            raw_id = str(entry["id"]).strip().lower()
+            key = _norm(raw_id)
             if not key:
                 continue
             info: dict[str, Any] = {}
@@ -218,9 +233,55 @@ def sync_provider_models(providers: list[Any]) -> None:
             if isinstance(ctx_val, (int, float)) and not isinstance(ctx_val, bool) and ctx_val > 0:
                 info["context"] = int(ctx_val)
             if info:
-                custom[key] = info
+                if prov_name:
+                    _put_custom_model(custom, f"{prov_name}:{key}", info)
+                if "/" in raw_id and raw_id != key:
+                    _put_custom_model(custom, raw_id, info)
+                _put_custom_model(custom, key, info)
     _CUSTOM_MODELS.clear()
     _CUSTOM_MODELS.update(custom)
+    if broadcast:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None and loop.is_running():
+            from app.cluster import caches
+
+            task = loop.create_task(caches.broadcast("custom_models"))
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+
+
+async def _reload_custom_models_from_db() -> None:
+    try:
+        from sqlalchemy import select
+
+        from app.db.base import SessionLocal
+        from app.db.models import Provider
+
+        async with SessionLocal() as session:
+            rows = list((await session.execute(select(Provider).where(Provider.enabled.is_(True)))).scalars())
+        sync_provider_models(rows, broadcast=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _on_custom_models_cache_event(_key: str | None = None) -> None:
+    import asyncio
+
+    _CUSTOM_MODELS.clear()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None and loop.is_running():
+        task = loop.create_task(_reload_custom_models_from_db())
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+
+
+from app.cluster import caches as _cluster_caches  # noqa: E402
+
+_cluster_caches.on("custom_models", _on_custom_models_cache_event)
 
 
 def _norm(model: str) -> str:
@@ -250,10 +311,21 @@ def supports_effort(model: str) -> bool:
     return _norm(model).startswith(_EFFORT_PREFIXES)
 
 
-def find_pricing(model: str) -> dict[str, float] | None:
+def _lookup_custom(model: str, field: str) -> Any:
+    raw = (model or "").strip().lower()
+    if raw and raw in _CUSTOM_MODELS and field in _CUSTOM_MODELS[raw]:
+        return _CUSTOM_MODELS[raw][field]
     target = _norm(model)
-    if target in _CUSTOM_MODELS and "pricing" in _CUSTOM_MODELS[target]:
-        return _CUSTOM_MODELS[target]["pricing"]
+    if target in _CUSTOM_MODELS and field in _CUSTOM_MODELS[target]:
+        return _CUSTOM_MODELS[target][field]
+    return None
+
+
+def find_pricing(model: str) -> dict[str, float] | None:
+    custom = _lookup_custom(model, "pricing")
+    if custom is not None:
+        return custom
+    target = _norm(model)
     pools = [ANTHROPIC_MODELS, OPENAI_MODELS, MOCK_MODELS]
     pools += [p["models"] for p in COMPATIBLE_PRESETS]
     for pool in pools:
@@ -265,9 +337,10 @@ def find_pricing(model: str) -> dict[str, float] | None:
 
 def find_context(model: str) -> int | None:
     """目录里登记的上下文窗口（token）。没登记的返回 None，由调用方取保守值。"""
+    custom = _lookup_custom(model, "context")
+    if custom is not None:
+        return custom
     target = _norm(model)
-    if target in _CUSTOM_MODELS and "context" in _CUSTOM_MODELS[target]:
-        return _CUSTOM_MODELS[target]["context"]
     pools = [ANTHROPIC_MODELS, OPENAI_MODELS, MOCK_MODELS]
     pools += [p["models"] for p in COMPATIBLE_PRESETS]
     for pool in pools:
@@ -301,6 +374,8 @@ def estimate_cost(
     *,
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
+    cache_read: int = 0,
+    cache_write: int = 0,
 ) -> float:
     """按目录价估算一次调用的花费（美元）。带缓存读写明细时按缓存单价折算（默认命中 0.1x、建缓存 1.25x）。"""
     pricing = find_pricing(model)
@@ -308,16 +383,16 @@ def estimate_cost(
         return 0.0
     inp_rate = pricing.get("input", 0.0)
     out_rate = pricing.get("output", 0.0)
-    if cache_read_tokens <= 0 and cache_creation_tokens <= 0:
+    eff_read = max(0, int(cache_read_tokens or cache_read or 0))
+    eff_write = max(0, int(cache_creation_tokens or cache_write or 0))
+    if eff_read <= 0 and eff_write <= 0:
         return input_tokens / 1_000_000 * inp_rate + output_tokens / 1_000_000 * out_rate
-    read_tokens = max(0, int(cache_read_tokens))
-    write_tokens = max(0, int(cache_creation_tokens))
-    uncached = max(0, int(input_tokens) - read_tokens - write_tokens)
+    uncached = max(0, int(input_tokens) - eff_read - eff_write)
     read_rate = pricing.get("cache_read", inp_rate * 0.1)
     write_rate = pricing.get("cache_creation", inp_rate * 1.25)
     return (
         uncached * inp_rate
-        + read_tokens * read_rate
-        + write_tokens * write_rate
+        + eff_read * read_rate
+        + eff_write * write_rate
         + output_tokens * out_rate
     ) / 1_000_000

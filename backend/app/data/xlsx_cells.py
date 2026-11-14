@@ -73,10 +73,9 @@ class Workbooks:
         self._csv: Any = None
 
     def csv(self, delimiter: str | None = None) -> Any:
-        """CSV 原件解析好的记录（csv_grid.CsvTable），第一次要读时才解析，同一次执行里复用。delimiter 是扫描时定下的
-        分隔符（csv_grid.sheet_delimiter），不给时再嗅一次。"""
+        """CSV 原件的惰性流句柄（csv_grid.CsvStream），第一次要读时解析编码与分隔符，后续逐行流式读取而不全量物化。"""
         if self._csv is None:
-            self._csv = csv_grid.parse(self.raw, delimiter)
+            self._csv = csv_grid.open_stream(self.raw, delimiter)
         return self._csv
 
     def values(self) -> Any:
@@ -96,7 +95,7 @@ class Workbooks:
                     book.close()
                 except Exception:  # noqa: BLE001  关闭失败不影响已经读出来的结果
                     pass
-        self._values = self._formulas = None
+        self._values = self._formulas = self._csv = None
 
     def __enter__(self) -> Workbooks:
         return self

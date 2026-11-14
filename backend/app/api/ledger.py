@@ -482,8 +482,10 @@ async def trial_caliber(workflow_id: str, version: int, node_id: str, payload: T
         raise HTTPException(422, "；".join(str(e.get("message")) for e in errors[:5]))
     # 参数完整性：模板里的每个参数这次都要有值（可选、没有缺省值的也算缺），引用的字段入口都得声明过，
     # 承载不了的值明确拒——都在发起运行之前判，缺参/未声明不会走到「发出 SQL 才发现」
+    dialects = await _fetch_node_dialects(session, pinned.fetches)
     problems = params.check_nodes(pinned.fetches, fields=pinned.entry_fields, values=values,
-                                  where=f"口径「{pinned.workflow_name}」的入口")
+                                  where=f"口径「{pinned.workflow_name}」的入口",
+                                  dialects=dialects)
     if problems:
         raise CodedHTTPException(422, params.describe(problems), problems[0].code,
                                  extra={"problems": [p.as_dict() for p in problems]})
@@ -496,13 +498,7 @@ async def trial_caliber(workflow_id: str, version: int, node_id: str, payload: T
                 "node_id": node_id, "card": pinned.node_id},
         options={READ_ONLY_OPTION: True},
         started_by=principal.username)
-    row = None
-    for _ in range(300):
-        async with SessionLocal() as poll:
-            row = await poll.get(Run, run.id)
-        if row is None or row.status in TERMINAL_RUN_STATUSES:
-            break
-        await asyncio.sleep(0.1)
+    row = await _wait_trial_run(run.id, timeout=30.0)
 
     out: dict[str, Any] = {"run_id": run.id, "status": row.status if row is not None else "unknown",
                            "output": None,
@@ -518,6 +514,76 @@ async def trial_caliber(workflow_id: str, version: int, node_id: str, payload: T
 # --------------------------------------------------------------------------
 # 进程内 QueryCore 固定执行（app/ledger/querycore.py，K09）
 # --------------------------------------------------------------------------
+
+
+async def _wait_trial_run(run_id: str, *, timeout: float = 30.0) -> Run | None:
+    """通过 EventBus 订阅等待试运行到达终态，并在结束时只读一次数据库（消除 300 次轮询查询）。"""
+    from app.core.bus import bus
+    from app.core.events import EventType
+    from app.engine.runner import run_manager
+
+    terminal_events = {
+        str(EventType.RUN_FINISHED),
+        str(EventType.RUN_FAILED),
+        str(EventType.RUN_CANCELLED),
+        str(EventType.RUN_INTERRUPTED),
+    }
+
+    async def _watch_bus() -> None:
+        stream = bus.subscribe(run_id)
+        try:
+            async for event in stream:
+                if str(event.type) in terminal_events:
+                    return
+        finally:
+            await stream.aclose()
+
+    watcher = asyncio.create_task(_watch_bus())
+    await asyncio.sleep(0)
+    try:
+        if run_manager.is_active(run_id):
+            idle_task = asyncio.create_task(run_manager.wait_idle(run_id, timeout=timeout))
+            try:
+                await asyncio.wait_for(
+                    asyncio.wait({watcher, idle_task}, return_when=asyncio.FIRST_COMPLETED),
+                    timeout=timeout,
+                )
+            finally:
+                if not idle_task.done():
+                    idle_task.cancel()
+    except TimeoutError:
+        pass
+    finally:
+        if not watcher.done():
+            watcher.cancel()
+            try:
+                await watcher
+            except (asyncio.CancelledError, Exception):
+                pass
+    async with SessionLocal() as poll:
+        return await poll.get(Run, run_id)
+
+
+async def _fetch_node_dialects(session: AsyncSession, nodes: Iterable[Mapping[str, Any]]) -> dict[str, str]:
+    from app.tools.datasource import source_of_tool
+
+    source_by_node: dict[str, str] = {}
+    for node in nodes:
+        if not isinstance(node, Mapping):
+            continue
+        nid = str(node.get("id") or "")
+        tool_name = str(((node.get("data") or {}).get("config") or {}).get("tool") or "")
+        if nid and (src := source_of_tool(tool_name)):
+            source_by_node[nid] = src
+    if not source_by_node:
+        return {}
+    rows = (
+        await session.execute(
+            select(DataSource.name, DataSource.kind).where(DataSource.name.in_(set(source_by_node.values())))
+        )
+    ).all()
+    kind_by_name = {str(name): str(kind) for name, kind in rows if name and kind}
+    return {nid: kind_by_name[src] for nid, src in source_by_node.items() if src in kind_by_name}
 
 
 class QueryCoreIn(BaseModel):
@@ -1112,6 +1178,7 @@ async def _run_trial(*, draft_id: str, workflow_id: str, graph: dict[str, Any], 
     try:
         async with SessionLocal() as read:
             pinned = await load_pinned(read, workflow_id, version, str(card_id))
+            dialects = await _fetch_node_dialects(read, pinned.fetches)
         target = caliber_probe(pinned).graph
     except NotDerivable as e:
         return await failed("failed", f"口径卡不能派生探针：{e.message}")
@@ -1120,7 +1187,8 @@ async def _run_trial(*, draft_id: str, workflow_id: str, graph: dict[str, Any], 
     from app.ledger import params
 
     if problems := params.check_nodes(pinned.fetches, fields=pinned.entry_fields, values=values,
-                                     where=f"口径「{pinned.workflow_name}」的入口"):
+                                     where=f"口径「{pinned.workflow_name}」的入口",
+                                     dialects=dialects):
         return await failed("needs_input", params.describe(problems))
 
     try:
@@ -1134,13 +1202,7 @@ async def _run_trial(*, draft_id: str, workflow_id: str, graph: dict[str, Any], 
         logger.exception("草稿 %s 的试运行没有发起", draft_id)
         return await failed("failed", f"试运行没有发起：{e}")
     await _save_trial(draft_id, {**binding, "run_id": run.id, "status": "running", "error": ""})
-    row: Run | None = None
-    for _ in range(int(TRIAL_TIMEOUT_S / TRIAL_POLL_S)):
-        async with SessionLocal() as poll:
-            row = await poll.get(Run, run.id)
-        if row is None or row.status in TERMINAL_RUN_STATUSES:
-            break
-        await asyncio.sleep(TRIAL_POLL_S)
+    row = await _wait_trial_run(run.id, timeout=float(TRIAL_TIMEOUT_S))
     status = _run_status(row.status if row is not None else "running")
     error = str(row.error or "") if row is not None and status == "failed" else ""
     return {**binding, "run_id": run.id, "status": status, "error": error}

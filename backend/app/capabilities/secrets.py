@@ -14,16 +14,31 @@ from app.core import crypto
 _HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 
-def seal(values: dict[str, Any] | None, previous: dict[str, Any] | None = None) -> dict[str, str]:
-    """提交上来的字典 → 存库的样子：值加密；正好等于原值掩码的那一项保持原值（原值是升级前的明文也一样加密）。"""
+def seal(
+    values: dict[str, Any] | None,
+    previous: dict[str, Any] | None = None,
+    *,
+    target_changed: bool = False,
+) -> dict[str, str]:
+    """提交上来的字典 → 存库的样子：值加密；正好等于原值掩码的那一项保持原值（原值是升级前的明文也一样加密）。
+
+    安全边界：
+    1. 外部不允许直接提交 enc:: 密文前缀（除非与已存密文完全相同，供内部迁移或幂等回写使用），防止借试运行等出口充当解密预言机；
+    2. 目标地址变更时不允许继续提交掩码占位符沿用旧凭据，防止把已存密钥转发到攻击者新改的地址。
+    """
     before = previous or {}
     out: dict[str, str] = {}
     for key, value in (values or {}).items():
+        skey = str(key)
         text = "" if value is None else str(value)
-        old = before.get(key)
+        old = before.get(skey, before.get(key))
+        if crypto.is_ciphertext(text) and text != old:
+            raise ValueError("不允许直接提交密文前缀")
         if old and text and text == crypto.mask(old):
+            if target_changed:
+                raise ValueError("修改目标地址后必须重新输入敏感凭据，不能沿用掩码旧值")
             text = old
-        out[str(key)] = crypto.encrypt(text) or ""
+        out[skey] = crypto.encrypt(text) or ""
     return out
 
 
@@ -70,11 +85,11 @@ async def seal_existing() -> int:
         for tool in (await session.execute(select(CustomTool))).scalars():
             headers = (tool.config or {}).get("headers")
             if isinstance(headers, dict) and not is_sealed(headers):
-                tool.config = {**(tool.config or {}), "headers": seal(headers)}
+                tool.config = {**(tool.config or {}), "headers": seal(headers, headers)}
                 changed += 1
         for server in (await session.execute(select(McpServer))).scalars():
             if not is_sealed(server.env) or not is_sealed(server.headers):
-                server.env, server.headers = seal(server.env), seal(server.headers)
+                server.env, server.headers = seal(server.env, server.env), seal(server.headers, server.headers)
                 changed += 1
         if changed:
             await session.commit()

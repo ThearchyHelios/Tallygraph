@@ -25,10 +25,11 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api import deps
 from app.data import catalog, catalog_profile_jobs, schema_view
 from app.data.entities import confirmed_bindings, list_entities, translate_entity_value
 from app.data.names import name_key
-from app.data.semantic_metrics import find_companion_lookup_tables, list_metrics
+from app.data.semantic_metrics import authorized_metric_source_ids, find_companion_lookup_tables, list_metrics
 from app.db.models import DataSource
 from app.memory.embeddings import _tokens
 
@@ -376,8 +377,13 @@ async def ground_question(
         allowed_source_names=allowed_source_keys,
     )
 
-    # 3. 启用态独立语义指标匹配
+    # 3. 启用态独立语义指标匹配（受限普通用户仅可见已获 AppGrant 授权的数据源下的指标）
+    deps_restricted = deps.restricted()
+    is_restricted = bool(restricted or deps_restricted)
     enabled_metrics = await list_metrics(session, status="enabled")
+    if deps_restricted:
+        permitted_source_ids = await authorized_metric_source_ids(session, deps.current_principal())
+        enabled_metrics = [m for m in enabled_metrics if m.source_id in permitted_source_ids]
     if explicit_sources:
         exp_ids = {ds.id for ds in explicit_sources}
         scoped_metrics = [m for m in enabled_metrics if m.source_id in exp_ids] or enabled_metrics
@@ -449,14 +455,15 @@ async def ground_question(
         total_picked += 1
         return True
 
-    # (a) 命中指标的底表跨源最优先入选
-    for ctx in ds_ctx_list:
-        ds = ctx["ds"]
-        for mm in matched_metrics:
-            if mm["source_id"] == ds.id:
-                resolved = catalog.resolve_table_name(ctx["cache"], mm["table_name"])
-                if resolved:
-                    _pick_table(ctx, resolved, f"指标「{mm['name']}」底表", cap=MAX_GROUNDED_TABLES + 2)
+    # (a) 命中指标的底表跨源最优先入选（受限普通用户不把指标底表物理名暴露进预命中表块）
+    if not deps_restricted:
+        for ctx in ds_ctx_list:
+            ds = ctx["ds"]
+            for mm in matched_metrics:
+                if mm["source_id"] == ds.id:
+                    resolved = catalog.resolve_table_name(ctx["cache"], mm["table_name"])
+                    if resolved:
+                        _pick_table(ctx, resolved, f"指标「{mm['name']}」底表", cap=MAX_GROUNDED_TABLES + 2)
 
     # (b) 命中实体的绑定表跨源次优先入选
     for ctx in ds_ctx_list:
@@ -601,16 +608,23 @@ async def ground_question(
                 for d in (mm.get("dimensions") or [])
                 if isinstance(d, Mapping)
             ) or "无"
-            mode_tag = "｜模式：多表参数化 SQL 模板（必须调用 `metric_query` 执行，勿手写跨表拼凑）" if mm.get("calc_mode") == "sql_template" else ""
-            m_lines.append(
-                f"- 指标 `{mm['key']}`｜名称：{mm['name']}"
-                + (f"（单位：{mm['unit']}）" if mm["unit"] else "")
-                + f"｜数据源：`{mm['source_name']}`｜底表：`{mm['table_name']}`{mode_tag}"
-                + (f"｜时间列：`{mm['date_column']}`" if mm["date_column"] else "")
-                + f"\n  口径表达式：`{mm['sql_expression']}`"
-                + (f"｜有效过滤：`{mm['filter_sql']}`" if mm["filter_sql"] else "")
-                + f"｜可分组/过滤维度：{dims_desc}"
-            )
+            if is_restricted:
+                m_lines.append(
+                    f"- 指标 `{mm['key']}`｜显示名称：{mm['name']}"
+                    + (f"（单位：{mm['unit']}）" if mm["unit"] else "")
+                    + f"｜可分组/过滤维度：{dims_desc}"
+                )
+            else:
+                mode_tag = "｜模式：多表参数化 SQL 模板（必须调用 `metric_query` 执行，勿手写跨表拼凑）" if mm.get("calc_mode") == "sql_template" else ""
+                m_lines.append(
+                    f"- 指标 `{mm['key']}`｜名称：{mm['name']}"
+                    + (f"（单位：{mm['unit']}）" if mm["unit"] else "")
+                    + f"｜数据源：`{mm['source_name']}`｜底表：`{mm['table_name']}`{mode_tag}"
+                    + (f"｜时间列：`{mm['date_column']}`" if mm["date_column"] else "")
+                    + f"\n  口径表达式：`{mm['sql_expression']}`"
+                    + (f"｜有效过滤：`{mm['filter_sql']}`" if mm["filter_sql"] else "")
+                    + f"｜可分组/过滤维度：{dims_desc}"
+                )
             if mm["description"]:
                 m_lines.append(f"  口径说明：{mm['description']}")
         ctx_parts.append("\n".join(m_lines))
@@ -645,8 +659,8 @@ async def ground_question(
         ]
         ctx_parts.append("## 五、本轮可用数据源清单\n" + "\n".join(overview))
 
-    # 7. 组装前端可观测摘要（restricted=True 时隐去物理表名、列名与底层编码）
-    if restricted:
+    # 7. 组装前端可观测摘要（restricted 或 deps.restricted() 时隐去物理表名、列名与底层编码）
+    if is_restricted:
         ui_metrics = [
             {
                 "id": m["id"],

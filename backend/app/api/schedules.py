@@ -29,8 +29,9 @@ from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.coded import CodedHTTPException
+from app.api.deps import current_principal
 from app.api.runs import actor_of
-from app.core.crypto import decrypt, encrypt
+from app.core.crypto import decrypt, encrypt, is_ciphertext
 from app.db.base import get_session, utcnow
 from app.db.models import Run, Schedule, ScheduleFire, WebhookDelivery, Workflow, WorkflowVersion
 from app.scheduler import auto_compare, cron, outbox, service, triggers, webhook
@@ -254,7 +255,23 @@ def _secret(value: Any) -> str | None:
         return None
     if not isinstance(value, str):
         raise _invalid("Webhook 签名密钥需要是文本", "webhook")
-    return value.strip()
+    cleaned = value.strip()
+    if is_ciphertext(cleaned):
+        raise _invalid("不允许直接提交密文前缀", "webhook")
+    return cleaned
+
+
+async def _assert_webhook_safe(url: str | None) -> None:
+    if not url:
+        return
+    from app.tools.net import UnsafeUrlError, assert_safe_url
+
+    allow_intranet = current_principal().at_least("admin")
+    try:
+        await assert_safe_url(url, allow_intranet=allow_intranet)
+    except UnsafeUrlError as e:
+        msg = "Webhook 地址不能指向云元数据或受限地址" if allow_intranet else "非管理员配置的 Webhook 地址需要是公网地址"
+        raise _invalid(msg, "webhook") from e
 
 
 def _blank(value: Any) -> bool:
@@ -819,6 +836,8 @@ async def create_schedule_row(session: AsyncSession, body: dict[str, Any], *, ac
     """校验并建一个定时任务（提交）。建任务的接口和发布单（停用着建，应用发布后再启用）共用。"""
     values = schedule_values(body)
     hook = values.pop("webhook")
+    if hook is not None:
+        await _assert_webhook_safe(hook.get("url"))
     if values.get("target_kind", "workflow") != "workflow":
         kind, target_id = values.pop("target_kind"), values.pop("target_id")
         name = await _check_target(session, kind, target_id)
@@ -905,7 +924,10 @@ async def update_schedule(schedule_id: str, request: Request,
     if "misfire_grace_s" in body:
         values["misfire_grace_s"] = _grace(body["misfire_grace_s"])
     if "webhook" in body:
-        values |= _patched_webhook(row, body["webhook"])
+        patched_hook = _patched_webhook(row, body["webhook"])
+        if patched_hook.get("webhook_url"):
+            await _assert_webhook_safe(decrypt(patched_hook["webhook_url"]))
+        values |= patched_hook
 
     def merged(key: str) -> Any:
         return values.get(key, getattr(row, key))
@@ -956,7 +978,10 @@ async def _update_event_schedule(session: AsyncSession, row: Schedule, body: dic
     if "input_template" in body:
         values["input_template"] = _template(body["input_template"], trigger.get("event"))
     if "webhook" in body:
-        values |= _patched_webhook(row, body["webhook"])
+        patched_hook = _patched_webhook(row, body["webhook"])
+        if patched_hook.get("webhook_url"):
+            await _assert_webhook_safe(decrypt(patched_hook["webhook_url"]))
+        values |= patched_hook
 
     def merged(key: str) -> Any:
         return values.get(key, getattr(row, key))
@@ -1138,7 +1163,25 @@ async def list_fires(schedule_id: str, limit: str | None = None, before: str | N
 @router.post("/{schedule_id}/webhook/test")
 async def test_webhook(schedule_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     """按保存的 Webhook 发一条测试消息（不重试）：{ok, http_status, message}。失败的说明里只有主机名。"""
-    await _get(session, schedule_id)
+    row = await _get(session, schedule_id)
+    if row.webhook_url:
+        plain_url = decrypt(row.webhook_url) or ""
+        if plain_url:
+            try:
+                webhook.check_url(plain_url)
+            except ValueError:
+                pass
+            else:
+                from app.tools.net import UnsafeUrlError, assert_safe_url
+
+                allow_intranet = current_principal().at_least("admin")
+                try:
+                    await assert_safe_url(plain_url, allow_intranet=allow_intranet)
+                except UnsafeUrlError:
+                    host = webhook.host_of(plain_url)
+                    msg = (f"发往 {host} 的请求被安全策略拦截" if allow_intranet
+                           else f"非管理员不能向内网或受限地址 {host} 发送测试请求")
+                    return {"ok": False, "http_status": None, "message": msg}
     try:
         return await webhook.send_test(schedule_id)
     except KeyError as e:

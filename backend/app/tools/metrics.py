@@ -18,6 +18,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.api import deps
 from app.data import catalog
 from app.data.engine import masked_columns
 from app.data.entities import list_entities
@@ -25,6 +26,7 @@ from app.data.names import name_key
 from app.data.semantic_metrics import (
     MetricInvalid,
     MetricNotFound,
+    authorized_metric_source_ids,
     compile_metric_sql,
     find_companion_lookup_tables,
     get_metric,
@@ -104,10 +106,21 @@ async def run_metric_query(
     limit: int = 200,
 ) -> str:
     async with SessionLocal() as session:
+        from app.auth.chat_policy import restricted_actor
+
+        actor = deps.current_principal() if deps.restricted() else ctx.started_by
+        is_user_restricted = deps.restricted() or bool(await restricted_actor(session, actor))
+        if is_user_restricted:
+            permitted_source_ids = await authorized_metric_source_ids(session, actor)
+        else:
+            permitted_source_ids = None
+
         try:
             row = await get_metric(session, metric)
         except MetricNotFound as exc:
             return f"查询失败：{exc}"
+        if permitted_source_ids is not None and row.source_id not in permitted_source_ids:
+            return f"查询失败：没有权限访问语义指标「{metric}」（未获得对应应用或数据源授权）"
         if row.status != "enabled":
             return f"查询失败：指标「{row.name}（{row.key}）」当前状态为 {row.status}，未启用"
         ds = await session.get(DataSource, row.source_id)
@@ -159,8 +172,22 @@ async def run_metric_query(
             "name": row.name,
             "unit": row.unit or "",
         }
-        if alignments:
+        if is_user_restricted:
+            payload.pop("sql", None)
+        if alignments and not is_user_restricted:
             payload["entity_alignments"] = alignments
+        elif alignments:
+            payload["entity_alignments"] = [
+                {
+                    "dimension": a.get("dimension"),
+                    "entity_key": a.get("entity_key"),
+                    "entity_label": a.get("entity_label"),
+                    "input": a.get("input"),
+                    "canonical_label": a.get("canonical_label"),
+                }
+                for a in alignments
+                if isinstance(a, Mapping)
+            ]
 
         has_groups = bool(group_by_date or group_by)
         rows_data = payload.get("rows") if isinstance(payload.get("rows"), list) else []
@@ -178,7 +205,7 @@ async def run_metric_query(
         is_empty_or_null = is_empty_metric_result(rows_data, has_groups=has_groups) or all_metric_null
         cache = ds.schema_cache if isinstance(ds.schema_cache, Mapping) else {}
         tables_map = (cache.get("tables") or {}) if isinstance(cache, Mapping) else {}
-        if is_empty_or_null and isinstance(tables_map, Mapping) and row.table_name:
+        if not is_user_restricted and is_empty_or_null and isinstance(tables_map, Mapping) and row.table_name:
             resolved_tbl = catalog.resolve_table_name(cache, row.table_name) or row.table_name
             masked_set = {name_key(c) for c in masked_columns(ds.options)}
             entries = await catalog.read_catalog(session, ds.id)

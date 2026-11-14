@@ -26,13 +26,15 @@ import csv
 import io
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterator
 
 from app.data.recipe_types import GridCell
 from app.data.xlsx_scan import Bounds, SheetScan, UnsupportedTable, WorkbookScan
 
-__all__ = ["CSV_PATH", "CSV_SHEET", "CSV_SUFFIXES", "MAX_COLS", "MAX_ROWS", "CsvTable", "cell_value", "is_csv_sheet",
-           "looks_like_csv", "looks_like_markup", "parse", "rows", "scan", "scan_any", "sheet_delimiter"]
+__all__ = ["CSV_PATH", "CSV_SHEET", "CSV_SUFFIXES", "MAX_COLS", "MAX_ROWS", "CsvStream", "CsvTable", "cell_value",
+           "is_csv_sheet", "looks_like_csv", "looks_like_markup", "open_stream", "parse", "rows", "scan", "scan_any",
+           "sheet_delimiter"]
 
 #: CSV 的「工作表名」：配方按它认（SheetMatch.name），每月的文件名不同也认得出
 CSV_SHEET = "CSV"
@@ -110,12 +112,52 @@ class CsvTable:
     delimiter: str
 
 
-def _resolve_csv_meta(raw: bytes, delimiter: str | None) -> tuple[str, str, str]:
+@dataclass
+class CsvStream:
+    """惰性流式 CSV 句柄：只缓存编码与分隔符元信息，按行流式扫描而不一次性物化百万行。"""
+
+    raw: bytes | str | Path
+    enc: str
+    errors: str
+    delimiter: str
+    _records_cache: list[list[str]] | None = None
+
+    def iter_records(self) -> Iterator[list[str]]:
+        return _iter_csv_records(self.raw, enc=self.enc, errors=self.errors, delimiter=self.delimiter)
+
+    @property
+    def records(self) -> list[list[str]]:
+        if self._records_cache is None:
+            self._records_cache = list(self.iter_records())
+        return self._records_cache
+
+
+def open_stream(raw: bytes | str | Path, delimiter: str | None = None) -> CsvStream:
+    """打开一个惰性 CSV 流句柄：仅嗅探编码与分隔符，逐行读取留给 rows() / iter_records()。"""
+    enc, errors, resolved_delim = _resolve_csv_meta(raw, delimiter)
+    return CsvStream(raw=raw, enc=enc, errors=errors, delimiter=resolved_delim)
+
+
+def _open_csv_stream(raw: bytes | str | Path, *, encoding: str, errors: str) -> Any:
     from app.data import tabular
 
-    enc, errors = tabular._detect_csv_encoding(raw)
+    if isinstance(raw, (str, Path)):
+        return Path(raw).open("r", encoding=encoding, errors=errors, newline="")
+    data = raw if isinstance(raw, bytes) else bytes(raw)
+    return tabular._open_csv_text(data, encoding=encoding, errors=errors, newline="")
+
+
+def _resolve_csv_meta(raw: bytes | str | Path, delimiter: str | None) -> tuple[str, str, str]:
+    from app.data import tabular
+
+    if isinstance(raw, (str, Path)):
+        with Path(raw).open("rb") as fh:
+            sample = fh.read(65536)
+    else:
+        sample = raw if isinstance(raw, bytes) else bytes(raw)
+    enc, errors = tabular._detect_csv_encoding(sample)
     if delimiter is None:
-        with tabular._open_csv_text(raw, encoding=enc, errors=errors, newline="") as probe_stream:
+        with _open_csv_stream(raw, encoding=enc, errors=errors) as probe_stream:
             head = probe_stream.read(8192)
         try:
             delimiter = csv.Sniffer().sniff(head, delimiters=_DELIMITERS).delimiter
@@ -124,12 +166,10 @@ def _resolve_csv_meta(raw: bytes, delimiter: str | None) -> tuple[str, str, str]
     return enc, errors, delimiter
 
 
-def _iter_csv_records(raw: bytes, *, enc: str, errors: str, delimiter: str) -> Iterator[list[str]]:
-    from app.data import tabular
-
+def _iter_csv_records(raw: bytes | str | Path, *, enc: str, errors: str, delimiter: str) -> Iterator[list[str]]:
     row_count = 0
     try:
-        with tabular._open_csv_text(raw, encoding=enc, errors=errors, newline="") as stream:
+        with _open_csv_stream(raw, encoding=enc, errors=errors) as stream:
             for record in csv.reader(stream, delimiter=delimiter):
                 if row_count >= MAX_ROWS:
                     raise UnsupportedTable(f"CSV 文件超过 {MAX_ROWS:,} 行，超出可以导入的上限")
@@ -213,12 +253,32 @@ def scan_any(raw: bytes, filename: str | None) -> WorkbookScan:
     return xlsx_scan.scan(raw)
 
 
-def rows(table: CsvTable, *, min_row: int, max_row: int, min_col: int,
+def rows(table: CsvTable | CsvStream, *, min_row: int, max_row: int, min_col: int,
          max_col: int) -> Iterator[tuple[int, list[tuple[int, GridCell]]]]:
     """按行流式给一个矩形里的非空格：(行号, [(列号, 格)…])，口径同 xlsx_cells.sheet_rows（整行为空的不给）。"""
-    for r in range(max(min_row, 1), min(max_row, len(table.records)) + 1):
-        record = table.records[r - 1]
-        out = [(c, GridCell(v)) for c in range(max(min_col, 1), min(max_col, len(record)) + 1)
+    if min_row > max_row or min_col > max_col or max_row < 1 or max_col < 1:
+        return
+    lo_r = max(min_row, 1)
+    lo_c = max(min_col, 1)
+    if isinstance(table, CsvStream) and table._records_cache is None:
+        for r, record in enumerate(table.iter_records(), 1):
+            if r < lo_r:
+                continue
+            if r > max_row:
+                break
+            hi_c = min(max_col, len(record))
+            if lo_c <= hi_c:
+                out = [(c, GridCell(v)) for c in range(lo_c, hi_c + 1)
+                       if (v := cell_value(record[c - 1])) is not None]
+                if out:
+                    yield r, out
+            if r >= max_row:
+                break
+        return
+    records = table.records
+    for r in range(lo_r, min(max_row, len(records)) + 1):
+        record = records[r - 1]
+        out = [(c, GridCell(v)) for c in range(lo_c, min(max_col, len(record)) + 1)
                if (v := cell_value(record[c - 1])) is not None]
         if out:
             yield r, out

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -412,6 +413,20 @@ class _Due:
     pushed: bool = False
 
 
+#: 单轮 / 单事件循环同时并发推送与对比的上限，避免积压触发同时打爆外呼与数据库连接
+MAX_CONCURRENT_WEBHOOKS = 8
+_LOOP_SEMAPHORES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = weakref.WeakKeyDictionary()
+
+
+def _dispatch_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _LOOP_SEMAPHORES.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(MAX_CONCURRENT_WEBHOOKS)
+        _LOOP_SEMAPHORES[loop] = sem
+    return sem
+
+
 async def notify_due(now: datetime | None = None) -> int:
     """查已发起的触发，运行状态有变化的按订阅推送一次。返回这一拍推送了几条（含失败的）。
 
@@ -432,12 +447,11 @@ async def notify_due(now: datetime | None = None) -> int:
     # 扫描窗口按触发记录的创建时间算，两种例外：运行记录窗口内有过变化（运行状态一变 updated_at 就跟着变），以及
     # 停在审批上、有待审批的——以前只看触发记录，创建 30 天以后才停到审批上的运行收不到「等待审批」
     waiting = select(Approval.id).where(Approval.run_id == Run.id, Approval.status == "pending").exists()
-    # 和发起共用一把锁：发起时先记一条「未能发起」再发起运行、成功了才改成 started，扫描不能撞在这中间。锁里只挑出
-    # 状态有变化的、拼好要推的消息；认领在锁外按条件 UPDATE 做，挑出来的是锁里看到的状态，和别的扫描撞上也只有一个
-    # 认领得到
+    # 和发起共用一把锁：发起时先记一条「未能发起」再发起运行、成功了才改成 started，扫描不能撞在这中间。锁里只快照
+    # 触发记录与运行行，状态判定、消息拼装、对比和外呼推送都在锁外做，避免慢查询或下游拖住定时发起。
     async with service.launch_lock():
         async with SessionLocal() as session:
-            rows = (await session.execute(
+            rows = list((await session.execute(
                 select(ScheduleFire, Run)
                 .outerjoin(Run, Run.id == ScheduleFire.run_id)
                 .where(or_(ScheduleFire.created_at >= cutoff, Run.updated_at >= cutoff,
@@ -447,12 +461,13 @@ async def notify_due(now: datetime | None = None) -> int:
                          or_(ScheduleFire.notified_status.is_(None), ScheduleFire.notified_status != Run.status)),
                 ))
                 .order_by(ScheduleFire.created_at, ScheduleFire.id)
-            )).all()
-            if rows:
-                # 链接里的地址：全站同一个对外访问地址（环境变量优先，其次设置，core/public_url.py）
-                from app.core import public_url
+            )).all())
+    if rows:
+        async with SessionLocal() as session:
+            # 链接里的地址：全站同一个对外访问地址（环境变量优先，其次设置，core/public_url.py）
+            from app.core import public_url
 
-                base_url = await public_url.refresh(session)
+            base_url = await public_url.refresh(session)
             for fire, run in rows:
                 seen = await _state_of(session, fire, run, now)
                 if seen.state is None or seen.state == fire.notified_status:
@@ -468,22 +483,25 @@ async def notify_due(now: datetime | None = None) -> int:
                 compare_run = run.id if run is not None and run.status == "succeeded" and seen.sealed else None
                 dues.append(_Due(fire.id, fire.notified_status, seen.state, compare_run, job))
     if dues:
-        await asyncio.gather(*(_follow_up(due, base_url) for due in dues))
+        sem = _dispatch_semaphore()
+        await asyncio.gather(*(_follow_up(due, base_url, sem) for due in dues))
     return sum(1 for due in dues if due.pushed)
 
 
-async def _follow_up(due: _Due, base_url: str | None) -> None:
+async def _follow_up(due: _Due, base_url: str | None, sem: asyncio.Semaphore | None = None) -> None:
     """先比（需要的话），再认领，认领到了再推：对比摘要要写进这条通知；认领放在对比之后，比到一半被取消时这次触发
     还没认领。对比自己兜住了超时和异常，出什么事都不挡推送。"""
-    brief = await auto_compare.compare_fire(due.fire_id, due.compare_run) if due.compare_run else None
-    if not await _mark(due.fire_id, due.old, due.state) or due.job is None:
-        return
-    if brief is not None:
-        due.job.notice.compare = brief
-        if base_url:
-            due.job.notice.compare_url = auto_compare.page_url(base_url, due.compare_run, brief["base_run_id"])
-    due.pushed = True
-    await _deliver(due.job)
+    gate = sem or _dispatch_semaphore()
+    async with gate:
+        brief = await auto_compare.compare_fire(due.fire_id, due.compare_run) if due.compare_run else None
+        if not await _mark(due.fire_id, due.old, due.state) or due.job is None:
+            return
+        if brief is not None:
+            due.job.notice.compare = brief
+            if base_url:
+                due.job.notice.compare_url = auto_compare.page_url(base_url, due.compare_run, brief["base_run_id"])
+        due.pushed = True
+        await _deliver(due.job)
 
 
 @dataclass

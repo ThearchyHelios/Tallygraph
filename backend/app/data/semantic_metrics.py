@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from functools import lru_cache
 from typing import Any
 
@@ -913,13 +915,25 @@ def _format_col_ref(source: DataSource, table_name: str, col_expr: str) -> str:
     return f"{prefix}.{_quote_single_part(col_name, source.kind, force_quote=force_col)}"
 
 
-def _sql_literal(val: Any) -> str:
+def _sql_literal(val: Any, dialect: str | None = None) -> str:
     if isinstance(val, bool):
         return "1" if val else "0"
-    if isinstance(val, (int, float)):
+    if isinstance(val, (int, float, Decimal)):
+        if (isinstance(val, float) and (math.isnan(val) or math.isinf(val))) or (
+            isinstance(val, Decimal) and not val.is_finite()
+        ):
+            raise MetricInvalid("指标过滤值不能为 NaN 或 Infinity", field="filters")
+        if isinstance(val, Decimal):
+            return format(val, "f")
         return str(val)
     text = str(val if val is not None else "")
-    escaped = text.replace("'", "''")
+    if "\x00" in text:
+        raise MetricInvalid("指标过滤值不能包含空字节", field="filters")
+    k = (dialect or "").strip().lower()
+    if k in ("mysql", "mariadb"):
+        escaped = text.replace("\\", "\\\\").replace("'", "''")
+    else:
+        escaped = text.replace("'", "''")
     return f"'{escaped}'"
 
 
@@ -994,15 +1008,15 @@ def _date_expr_for_grain(quoted_col: str, grain: str, kind: str | None, *, tempo
 def _format_date_bound_sql(bound: str, *, kind: str | None, temporal_kind: str) -> str:
     k = (kind or "").strip().lower()
     if temporal_kind in ("text", "datetime_text") or k == "sqlite":
-        return _sql_literal(bound)
+        return _sql_literal(bound, dialect=kind)
     if k == "oracle":
         if _ISO_DATE_RE.match(bound):
             return f"DATE '{bound}'"
         norm_ts = bound.replace("T", " ")
         if len(norm_ts) == 16:
             norm_ts += ":00"
-        return f"TO_DATE({_sql_literal(norm_ts)}, 'YYYY-MM-DD HH24:MI:SS')"
-    return _sql_literal(bound)
+        return f"TO_DATE({_sql_literal(norm_ts, dialect=kind)}, 'YYYY-MM-DD HH24:MI:SS')"
+    return _sql_literal(bound, dialect=kind)
 
 
 def _validate_date_bound(raw: str, *, field: str) -> str:
@@ -1306,9 +1320,9 @@ def compile_metric_sql(
             resolved_vals.append(v)
         q_col = _format_col_ref(source, table_name, col_name)
         if len(resolved_vals) == 1:
-            where_parts.append(f"{q_col} = {_sql_literal(resolved_vals[0])}")
+            where_parts.append(f"{q_col} = {_sql_literal(resolved_vals[0], dialect=kind)}")
         else:
-            in_list = ", ".join(_sql_literal(x) for x in resolved_vals)
+            in_list = ", ".join(_sql_literal(x, dialect=kind) for x in resolved_vals)
             where_parts.append(f"{q_col} IN ({in_list})")
 
     safe_limit = max(1, min(int(limit or 200), 1000))
@@ -1353,30 +1367,24 @@ def compile_metric_sql(
             date_col=date_col,
             kind=kind,
         )
-        compiled = _SELECT_DIMS_SLOT_RE.sub(
-            (f"{', '.join(dim_selects)}, " if dim_selects else ""),
-            sql_template,
-        )
-        compiled = _WHERE_SLOT_RE.sub(
-            (f"WHERE {' AND '.join(where_parts)}" if where_parts else ""),
-            compiled,
-        )
-        compiled = _AND_WHERE_SLOT_RE.sub(
-            (f"AND ({' AND '.join(where_parts)})" if where_parts else ""),
-            compiled,
-        )
-        compiled = _GROUP_BY_SLOT_RE.sub(
-            (f"GROUP BY {', '.join(group_exprs)}" if group_exprs else ""),
-            compiled,
-        )
-        compiled = _ORDER_BY_SLOT_RE.sub(
-            (f"ORDER BY {', '.join(tpl_order_parts)}" if tpl_order_parts else ""),
-            compiled,
-        )
-        compiled = _DATE_FROM_SLOT_RE.sub(_sql_literal(d_from) if d_from else "NULL", compiled)
-        compiled = _DATE_TO_SLOT_RE.sub(_sql_literal(d_to) if d_to else "NULL", compiled)
-        compiled = _PERIOD_DAYS_SLOT_RE.sub(period_days_sql, compiled)
-        compiled = _LIMIT_SLOT_RE.sub(str(safe_limit), compiled)
+        select_dims_repl = f"{', '.join(dim_selects)}, " if dim_selects else ""
+        where_repl = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        and_where_repl = f"AND ({' AND '.join(where_parts)})" if where_parts else ""
+        group_by_repl = f"GROUP BY {', '.join(group_exprs)}" if group_exprs else ""
+        order_by_repl = f"ORDER BY {', '.join(tpl_order_parts)}" if tpl_order_parts else ""
+        date_from_repl = _sql_literal(d_from, dialect=kind) if d_from else "NULL"
+        date_to_repl = _sql_literal(d_to, dialect=kind) if d_to else "NULL"
+        limit_repl = str(safe_limit)
+
+        compiled = _SELECT_DIMS_SLOT_RE.sub(lambda _: select_dims_repl, sql_template)
+        compiled = _WHERE_SLOT_RE.sub(lambda _: where_repl, compiled)
+        compiled = _AND_WHERE_SLOT_RE.sub(lambda _: and_where_repl, compiled)
+        compiled = _GROUP_BY_SLOT_RE.sub(lambda _: group_by_repl, compiled)
+        compiled = _ORDER_BY_SLOT_RE.sub(lambda _: order_by_repl, compiled)
+        compiled = _DATE_FROM_SLOT_RE.sub(lambda _: date_from_repl, compiled)
+        compiled = _DATE_TO_SLOT_RE.sub(lambda _: date_to_repl, compiled)
+        compiled = _PERIOD_DAYS_SLOT_RE.sub(lambda _: period_days_sql, compiled)
+        compiled = _LIMIT_SLOT_RE.sub(lambda _: limit_repl, compiled)
         compiled = re.sub(r"[ \t]+\n", "\n", compiled).strip()
         compiled = _apply_row_limit(
             compiled,
@@ -2153,3 +2161,223 @@ async def suggest_metrics_from_source(
         "candidates": accepted,
         "skipped": skipped,
     }
+
+
+def to_caliber_card_spec(metric: SemanticMetric | Mapping[str, Any]) -> dict[str, Any]:
+    """将独立语义指标（SemanticMetric 或字典）转换为标准口径卡片 / QueryCore 兼容的规范化定义。"""
+    if isinstance(metric, Mapping):
+        raw = dict(metric)
+    else:
+        raw = {
+            "id": getattr(metric, "id", ""),
+            "key": getattr(metric, "key", ""),
+            "name": getattr(metric, "name", ""),
+            "aliases": list(getattr(metric, "aliases", None) or []),
+            "description": getattr(metric, "description", "") or "",
+            "unit": getattr(metric, "unit", "") or "",
+            "source_id": getattr(metric, "source_id", "") or "",
+            "calc_mode": getattr(metric, "calc_mode", "expression") or "expression",
+            "table_name": getattr(metric, "table_name", "") or "",
+            "sql_expression": getattr(metric, "sql_expression", "") or "",
+            "sql_template": getattr(metric, "sql_template", "") or "",
+            "date_column": getattr(metric, "date_column", "") or "",
+            "filter_sql": getattr(metric, "filter_sql", "") or "",
+            "dimensions": list(getattr(metric, "dimensions", None) or []),
+            "default_time_grain": getattr(metric, "default_time_grain", "day") or "day",
+            "status": getattr(metric, "status", "enabled") or "enabled",
+        }
+
+    key = normalize_metric_key(raw.get("key") or raw.get("metric_id") or raw.get("id") or "metric_value")
+    name = str(raw.get("name") or raw.get("display_name") or key).strip() or key
+    description = str(raw.get("description") or "").strip()
+    unit = str(raw.get("unit") or "").strip()
+    source_id = str(raw.get("source_id") or raw.get("datasource_id") or "").strip()
+    calc_mode = str(raw.get("calc_mode") or ("sql_template" if raw.get("sql_template") else "expression")).strip()
+    table_name = str(raw.get("table_name") or raw.get("source_table") or "").strip()
+    sql_expression = str(raw.get("sql_expression") or "").strip()
+    sql_template = str(raw.get("sql_template") or "").strip()
+    date_column = str(raw.get("date_column") or "").strip()
+    filter_sql = str(raw.get("filter_sql") or "").strip()
+    grain = str(raw.get("default_time_grain") or "day").strip() or "day"
+    status = str(raw.get("status") or "enabled").strip() or "enabled"
+    aliases = [str(a).strip() for a in (raw.get("aliases") or []) if str(a).strip()]
+
+    dims: list[dict[str, Any]] = []
+    for idx, d in enumerate(raw.get("dimensions") or []):
+        if isinstance(d, Mapping) and str(d.get("column") or d.get("key") or "").strip():
+            d_col = str(d.get("column") or d.get("key") or "").strip()
+            d_key = str(d.get("key") or "").strip().lower() or f"dim_{idx + 1}"
+            d_label = str(d.get("label") or d_key).strip() or d_key
+            d_ent = str(d.get("entity_key") or "").strip().lower()
+            dims.append({"key": d_key, "label": d_label, "column": d_col, "entity_key": d_ent})
+
+    entry_fields: list[dict[str, Any]] = []
+    if date_column or calc_mode == "sql_template":
+        entry_fields.extend(
+            [
+                {"name": "date_from", "type": "date", "required": False, "default": "", "description": "起始业务日期"},
+                {"name": "date_to", "type": "date", "required": False, "default": "", "description": "结束业务日期"},
+            ]
+        )
+    for d in dims:
+        entry_fields.append(
+            {
+                "name": d["key"],
+                "type": "string",
+                "required": False,
+                "default": "",
+                "description": d["label"],
+                **({"entity_key": d["entity_key"]} if d["entity_key"] else {}),
+            }
+        )
+
+    contract = {"shape": "scalar"}
+    metric_item = {
+        "id": key,
+        "metric_id": key,
+        "name": name,
+        "label": name,
+        "unit": unit,
+        "description": description,
+        "expression": f"cell(nodes.fetch, 0, {key!r})",
+        "contract": dict(contract),
+    }
+
+    return {
+        "kind": "caliber_card_spec",
+        "bridge_source": "semantic_metric",
+        "id": str(raw.get("id") or key),
+        "metric_id": key,
+        "key": key,
+        "name": name,
+        "display_name": name,
+        "aliases": aliases,
+        "description": description,
+        "unit": unit,
+        "status": status,
+        "source_id": source_id,
+        "datasource_id": source_id,
+        "calc_mode": calc_mode,
+        "aggregation_type": infer_aggregation_type(sql_expression),
+        "table_name": table_name,
+        "source_table": table_name,
+        "sql_expression": sql_expression,
+        "sql_template": sql_template,
+        "date_column": date_column,
+        "filter_sql": filter_sql,
+        "default_time_grain": grain,
+        "dimensions": dims,
+        "entry_fields": entry_fields,
+        "contract": contract,
+        "metrics": [metric_item],
+        "card": {
+            "caliber": name,
+            "caliber_version": "v1",
+            "metrics": [dict(metric_item)],
+        },
+    }
+
+
+async def authorized_metric_source_ids(session: AsyncSession, actor: Any) -> set[str]:
+    """解析受限普通用户（role == 'user'）通过 AppGrant 已获授权（>= use）的数据源 ID 集合。"""
+    from app.api.deps import Principal
+    from app.apps.access import app_role, at_least, usable_calibers
+    from app.auth.chat_policy import effective_actor
+    from app.db.models import WorkflowVersion
+    from app.db.models_apps import App, AppGrant, AppVersion
+    from app.db.models_blueprints import RecordsTable
+    from app.engine.launch import tool_bindings
+    from app.engine.schema import GraphSpec
+    from app.tools.datasource import source_of_tool
+
+    who = effective_actor(actor)
+    if not who:
+        return set()
+    principal = (
+        actor
+        if isinstance(actor, Principal)
+        else Principal(username=str(who), role="user", verified=True, mode="local")
+    )
+    authorized_ids: set[str] = set()
+    authorized_names: set[str] = set()
+
+    permitted_versions = await usable_calibers(session, who)
+    wf_pairs: set[tuple[str, int]] = set(permitted_versions.keys())
+
+    granted_app_ids = set((await session.execute(select(AppGrant.app_id))).scalars().all())
+    if granted_app_ids:
+        apps = list((await session.execute(select(App).where(App.id.in_(granted_app_ids)))).scalars().all())
+        permitted_app_ids: set[str] = set()
+        for app_row in apps:
+            if getattr(app_row, "status", "active") == "archived":
+                continue
+            role = await app_role(session, principal, app_row)
+            if at_least(role, "use"):
+                permitted_app_ids.add(app_row.id)
+        if permitted_app_ids:
+            rec_source_ids = (
+                await session.execute(
+                    select(RecordsTable.source_id).where(RecordsTable.app_id.in_(permitted_app_ids))
+                )
+            ).scalars().all()
+            authorized_ids.update(str(sid) for sid in rec_source_ids if sid)
+
+            ver_rows = list(
+                (
+                    await session.execute(
+                        select(AppVersion).where(AppVersion.app_id.in_(permitted_app_ids))
+                    )
+                ).scalars().all()
+            )
+            pub_ver_by_app = {a.id: a.published_version for a in apps if a.id in permitted_app_ids}
+            for vr in ver_rows:
+                target_v = pub_ver_by_app.get(vr.app_id)
+                if target_v is not None and vr.version != target_v:
+                    continue
+                for pin in vr.pins or []:
+                    if isinstance(pin, Mapping) and pin.get("workflow_id") and pin.get("version") is not None:
+                        try:
+                            wf_pairs.add((str(pin["workflow_id"]), int(pin["version"])))
+                        except (TypeError, ValueError):
+                            pass
+                slots = (vr.bindings or {}).get("slots") if isinstance(vr.bindings, Mapping) else None
+                if isinstance(slots, Mapping):
+                    for slot_val in slots.values():
+                        if isinstance(slot_val, Mapping):
+                            if slot_val.get("source_id"):
+                                authorized_ids.add(str(slot_val["source_id"]))
+                            if slot_val.get("source"):
+                                authorized_names.add(str(slot_val["source"]))
+
+    if wf_pairs:
+        wf_ids = {wf_id for wf_id, _ in wf_pairs}
+        wv_rows = list(
+            (await session.execute(select(WorkflowVersion).where(WorkflowVersion.workflow_id.in_(wf_ids))))
+            .scalars()
+            .all()
+        )
+        for wv in wv_rows:
+            if (str(wv.workflow_id), int(wv.version)) not in wf_pairs:
+                continue
+            if not isinstance(wv.graph, Mapping):
+                continue
+            try:
+                spec = GraphSpec.model_validate(dict(wv.graph))
+            except Exception:  # noqa: BLE001
+                continue
+            for _, tool_name in tool_bindings(spec):
+                if (sname := source_of_tool(tool_name)) is not None:
+                    authorized_names.add(sname)
+
+    if authorized_names:
+        ds_ids = (
+            await session.execute(
+                select(DataSource.id).where(
+                    DataSource.name.in_(authorized_names),
+                    DataSource.enabled.is_(True),
+                )
+            )
+        ).scalars().all()
+        authorized_ids.update(str(rid) for rid in ds_ids if rid)
+
+    return authorized_ids

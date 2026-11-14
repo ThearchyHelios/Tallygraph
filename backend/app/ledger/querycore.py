@@ -332,7 +332,13 @@ def _sql_of(node: Mapping[str, Any]) -> str | None:
     return sql if isinstance(sql, str) and sql.strip() else None
 
 
-def _plans(pinned: Any, closure: Any, values: Mapping[str, Any]) -> tuple[list[_Plan], list[dict[str, Any]]]:
+def _plans(
+    pinned: Any,
+    closure: Any,
+    values: Mapping[str, Any],
+    *,
+    dialects: Mapping[str, str] | None = None,
+) -> tuple[list[_Plan], list[dict[str, Any]]]:
     """这次要执行的每条查询的 K01 计划（闭包已经决定执行哪几条、要哪些参数）。
 
     检查、渲染、快照材料用的是同一份 resolved 值（params.plan）；不合规（缺参数、未声明、值承载不了）在这里就把
@@ -347,10 +353,12 @@ def _plans(pinned: Any, closure: Any, values: Mapping[str, Any]) -> tuple[list[_
         sql = _sql_of(node)
         if sql is None:
             continue                        # 闭包已经拒过「取数节点没有可读 SQL」，这里不重判
+        node_dialect = (dialects or {}).get(node_id)
         try:
             statement = params.plan(sql, fields=pinned.entry_fields, values=values,
                                     source={**pinned.ref(), "node_id": node_id}, node_id=node_id,
-                                    where=f"口径「{pinned.card_title}」的入口")
+                                    where=f"口径「{pinned.card_title}」的入口",
+                                    dialect=node_dialect)
         except params.ParameterRefused as e:
             problems += [p.as_dict() for p in e.problems]
             continue
@@ -815,7 +823,31 @@ async def _prepared(session: AsyncSession, *, workflow_id: str, card_id: str, me
     stages.mark("closure_ms")
     # 入口取值与校验（K01）到逐条查询的渲染和探针图成形都算「参数」这一段
     values, ignored = _inputs_of(loaded, inputs or {})
-    plans, parameter_problems = _plans(loaded, closure, values)
+    from sqlalchemy import select
+
+    from app.db.models import DataSource
+    from app.tools.datasource import source_of_tool
+
+    source_by_node: dict[str, str] = {}
+    for q in closure.queries:
+        if src := source_of_tool(str(getattr(q, "tool", "") or "")):
+            source_by_node[str(q.node_id)] = src
+    for fnode in loaded.fetches:
+        nid = str(fnode.get("id") or "")
+        if nid and nid not in source_by_node:
+            ftool = str(((fnode.get("data") or {}).get("config") or {}).get("tool") or "")
+            if src := source_of_tool(ftool):
+                source_by_node[nid] = src
+    dialects: dict[str, str] = {}
+    if source_by_node:
+        ds_rows = (
+            await session.execute(
+                select(DataSource.name, DataSource.kind).where(DataSource.name.in_(set(source_by_node.values())))
+            )
+        ).all()
+        kind_by_name = {str(sname): str(skind) for sname, skind in ds_rows if sname and skind}
+        dialects = {nid: kind_by_name[sname] for nid, sname in source_by_node.items() if sname in kind_by_name}
+    plans, parameter_problems = _plans(loaded, closure, values, dialects=dialects)
     if parameter_problems:
         first = parameter_problems[0]
         raise QueryCoreRefused(f"参数完整性不通过：{first.get('message') or first.get('code')}",

@@ -61,7 +61,30 @@ def _entry_fields(ctx: NodeContext) -> dict[str, dict[str, Any]]:
     return out
 
 
-def _tool_args(ctx: NodeContext, state: GraphState, name: str) -> tuple[Any, dict[str, Any] | None]:
+async def _query_dialect(name: str) -> str | None:
+    """取数工具对应数据源的方言（kind），用于按方言判定双引号/美元引号参数边界。"""
+    if not name.startswith(QUERY_PREFIX):
+        return None
+    source_name = name[len(QUERY_PREFIX) :]
+    if not source_name:
+        return None
+    from sqlalchemy import select
+
+    from app.db.models import DataSource
+
+    async with SessionLocal() as session:
+        return (
+            await session.execute(select(DataSource.kind).where(DataSource.name == source_name))
+        ).scalar_one_or_none()
+
+
+def _tool_args(
+    ctx: NodeContext,
+    state: GraphState,
+    name: str,
+    *,
+    dialect: str | None = None,
+) -> tuple[Any, dict[str, Any] | None]:
     """这一次调用工具的参数，以及查询快照要记的参数材料（ledger/params）。
 
     带参数契约的节点（组合式问数、对账图写，见 ledger/params 的 marker）：args 里已经是渲染好的字面语句——值渲染进去的
@@ -85,9 +108,13 @@ def _tool_args(ctx: NodeContext, state: GraphState, name: str) -> tuple[Any, dic
     if template and sql_params.mentions_input(template):
         fields = _entry_fields(ctx)
         if name.startswith(QUERY_PREFIX):
-            if problems := sql_params.runtime_problems(template, values=values, declared=fields):
+            if problems := sql_params.runtime_problems(
+                template, values=values, declared=fields, dialect=dialect
+            ):
                 raise ToolArgsError(PARAMETER_INCOMPLETE.format(tool=name, reason=sql_params.describe(problems)))
-            material = sql_params.material(template, values=values, declared_fields=fields)
+            material = sql_params.material(
+                template, values=values, declared_fields=fields, dialect=dialect
+            )
     return render_deep(raw, {**template_context(state), "input": values}), material
 
 
@@ -143,8 +170,20 @@ async def run_tool(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
     if not name:
         raise NodeError(ctx.node.id, "「调用工具」节点尚未选择工具")
 
+    raw_args = ctx.cfg("args", {})
+    raw_sql = str(raw_args.get("sql") or "") if isinstance(raw_args, dict) else ""
+    node_cfg = ctx.config if isinstance(ctx.config, dict) else {}
+    dialect: str | None = None
+    if (
+        name.startswith(QUERY_PREFIX)
+        and raw_sql
+        and not sql_params.is_literal(node_cfg, str(ctx.node.type))
+        and sql_params.mentions_input(raw_sql)
+    ):
+        dialect = await _query_dialect(name)
+
     try:
-        args, material = _tool_args(ctx, state, name)
+        args, material = _tool_args(ctx, state, name, dialect=dialect)
     except ToolArgsError as e:
         # 参数不完整（ledger/params）：查询根本没发出去，按调用工具节点一贯的失败处理
         ctx.emit(EventType.TOOL_ERROR, tool=name, error=str(e))

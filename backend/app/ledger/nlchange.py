@@ -899,7 +899,10 @@ def _auto_date_interval(text: str) -> tuple[str, str] | None:
     """原话里明确完整的单日/单月 → 半开区间 (含, 不含)。
 
     单日 `2026-10-01` / `2026年10月1日` → [当天, 次日)；单月 `2026-10` / `2026年10月` → [当月 1 日, 次月 1 日)。
-    别的（「上个月」「上个季度」「最近一周」）都交回 None——相对说法要按当下时刻算，这里不替它算。"""
+    出现多处日期（如 `2026-10-01~2026-10-07`）或别的相对说法（「上个月」「上个季度」「最近一周」）都交回 None——
+    绝不把多日区间截断成只算第一天。"""
+    if len(_auto_date_spans(text)) > 1:
+        return None
     day = _AUTO_DAY_CN.search(text) or _AUTO_DAY_DASH.search(text)
     if day is not None:
         try:
@@ -930,6 +933,8 @@ def _auto_inputs(selected: Any, text: str) -> dict[str, Any] | None:
     fields = [dict(f) for f in selected.entry_fields]
     inferred: dict[str, Any] = {}
     interval = _auto_date_interval(text)
+    if _auto_date_spans(text) and interval is None:
+        return None                          # 原话写了多处或非法日期：绝不静默退回缺省日期执行
     if interval is not None:
         start_field, end_field = _auto_interval_fields(fields)
         if start_field is None or end_field is None:

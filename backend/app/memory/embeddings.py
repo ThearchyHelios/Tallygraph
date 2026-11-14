@@ -10,6 +10,22 @@ import numpy as np
 
 _DIM = 512
 _TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+|[一-鿿]")
+CJK_STOPWORDS: frozenset[str] = frozenset(
+    {"的", "了", "是", "在", "和", "与", "或", "及", "把", "被", "着", "过", "吗", "呢", "吧", "啊"}
+)
+_KNOWN_EMBEDDING_DIMS: dict[str, int] = {
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "text-embedding-ada-002": 1536,
+    "bge-m3": 1024,
+    "bge-large-zh-v1.5": 1024,
+    "bge-large-en-v1.5": 1024,
+    "text-embedding-v3": 1024,
+    "text-embedding-v4": 1024,
+    "jina-embeddings-v3": 1024,
+    "nomic-embed-text": 768,
+    "mxbai-embed-large": 1024,
+}
 
 
 def _tokens(text: str) -> list[str]:
@@ -20,6 +36,12 @@ def _tokens(text: str) -> list[str]:
     raw = _TOKEN_RE.findall(text.lower())
     grams = [a + b for a, b in zip(raw, raw[1:]) if len(a) == 1 and len(b) == 1]
     return raw + grams
+
+
+def filter_query_tokens(tokens: Sequence[str]) -> list[str]:
+    """查询已经带有多字词或有效词项时跳过高频单字虚词，全为虚词则完整回退。"""
+    filtered = [t for t in tokens if t not in CJK_STOPWORDS]
+    return filtered if filtered else list(tokens)
 
 
 def _hash_index(token: str) -> int:
@@ -79,10 +101,14 @@ class OpenAIEmbedder:
             # 关掉之后发原文。我们的片段都在 800 字上下，也用不着那套长度保护
             kwargs["check_embedding_ctx_length"] = False
         self._impl = OpenAIEmbeddings(**kwargs)
-        # 维度必须问出来，不能按模型名猜。本地部署的模型五花八门——
-        # bge-m3 是 1024、Qwen3-Embedding-4B 是 2560，猜错的后果是所有存量
-        # 向量都被判成"和当前 embedder 对不上"，检索整体退回关键词
-        self.dim = len(self._impl.embed_query("dim probe"))
+        # 常见标准模型直接查已知维度表，避免在事件循环上发起同步 HTTP 探测阻塞；
+        # 未知自定义模型仍回退到实时探测，确保维度与存量向量严格对齐。
+        norm_model = (model or "").strip().lower().rsplit("/", 1)[-1].split(":", 1)[0]
+        known_dim = _KNOWN_EMBEDDING_DIMS.get(norm_model)
+        if known_dim is not None:
+            self.dim = known_dim
+        else:
+            self.dim = len(self._impl.embed_query("dim probe"))
 
     async def aembed(self, text: str) -> np.ndarray:
         vec = await self._impl.aembed_query(text)
@@ -116,6 +142,8 @@ def _make(kind: str, model: str, base_url: str = "", *,
     if kind != "openai":
         return _local
     try:
+        if strict and not base_url and not os.environ.get("OPENAI_API_KEY"):
+            raise RuntimeError("Error code: 401 - missing OPENAI_API_KEY")
         return OpenAIEmbedder(model=model or "text-embedding-3-small",
                               base_url=base_url or None)
     except Exception as e:  # noqa: BLE001
@@ -277,7 +305,7 @@ class BM25:
                 self.df[tok] = self.df.get(tok, 0) + 1
 
     def score(self, query: str) -> list[float]:
-        q_tokens = _tokens(query)
+        q_tokens = filter_query_tokens(_tokens(query))
         scores = [0.0] * self.n
         for tok in q_tokens:
             df = self.df.get(tok, 0)

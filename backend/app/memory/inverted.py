@@ -18,8 +18,9 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Chunk, ChunkTerm
-from app.memory.embeddings import _tokens
+from app.memory.embeddings import CJK_STOPWORDS, _tokens, filter_query_tokens
 
+_CJK_STOPWORDS = CJK_STOPWORDS
 _K1 = 1.5
 _B = 0.75
 _IN_BATCH = 500
@@ -70,7 +71,8 @@ async def candidates_with_scores(
     # 按查询词的出现次数加权，不能去重。原来的 BM25.score 遍历的是带重复的
     # 词表：「导出订单最多多少行」里「多」出现两次，它的贡献就加两次。去重会让
     # 同一个查询在倒排和全表扫两条路上给出不同的分——实测顶部那条差了 2.32
-    qcounts = Counter(t for t in _tokens(query) if len(t) <= 64)
+    raw_qtokens = [t for t in _tokens(query) if len(t) <= 64]
+    qcounts = Counter(filter_query_tokens(raw_qtokens))
     terms = list(qcounts)
     if not terms:
         return [], {}

@@ -1,9 +1,12 @@
 """读取并验证封存证据的公共服务，供试运行、证据接口和评测使用。"""
 from __future__ import annotations
 from dataclasses import dataclass, field
+import importlib
+import sys
 from typing import Any
 from sqlalchemy import select
-from app.core.artifact_store import load
+from app.core.artifact_store import load, manifest_hash
+from app.core.coded import CodedHTTPException
 from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import Run, RunEvent
@@ -14,6 +17,46 @@ from app.analysis.contract import LEDGER_KIND
 MASKED = "已遮罩"
 RUN_NOT_FOUND = "run_not_found"
 REPORT_NOT_FOUND = "evidence_report_not_found"
+_TERMINAL_EVENTS = (EventType.RUN_FINISHED, EventType.RUN_FAILED, EventType.RUN_CANCELLED)
+
+
+def _evidence_api() -> Any:
+    mod = sys.modules.get("app.api.evidence")
+    if mod is not None:
+        return mod
+    return importlib.import_module("app.api.evidence")
+
+
+def _verify_rows(
+    expected: str | None,
+    sealed_at: int | None,
+    rows: list[tuple[int, str, str | None, dict[str, Any]]],
+) -> dict[str, Any]:
+    if not expected:
+        return {
+            "sealed": False,
+            "ok": None,
+            "message": "这次运行尚未封存（尚未结束，或正停在人工审批）",
+        }
+    legacy = sealed_at is None
+    if legacy:
+        last = next((r for r in reversed(rows) if r[1] in _TERMINAL_EVENTS), None)
+        if last is None:
+            sealed_at = rows[-1][0] if rows else 0
+        elif last[1] == EventType.RUN_FINISHED:
+            sealed_at = last[0] - 1
+        else:
+            sealed_at = last[0]
+    covered = [r for r in rows if r[0] <= sealed_at]
+    ok = manifest_hash(covered) == expected
+    return {
+        "sealed": True,
+        "ok": ok,
+        "events": len(covered),
+        "sealed_at": sealed_at,
+        "legacy": legacy,
+        "message": "事件记录与封存时一致" if ok else "事件记录与封存时不一致：封存后有事件被修改、删除或插入",
+    }
 
 
 def _fetch(artifact: str) -> tuple[Any, bool]:
@@ -138,8 +181,6 @@ class Sealed:
 
 
 async def read_sealed(run_id: str) -> Sealed:
-    from app.engine.runner import verify_manifest
-
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
         if run is None:
@@ -150,7 +191,7 @@ async def read_sealed(run_id: str) -> Sealed:
         graph = run.graph if isinstance(run.graph, dict) else {}
         manifest, manifest_seq = run.manifest_hash, run.manifest_seq
         run_class, status, ledger_on = run.run_class, run.status, ledger_enabled(run)
-    verdict = await verify_manifest(run_id)
+    verdict = _verify_rows(manifest, manifest_seq, rows)
     bound = verdict.get("sealed_at") if verdict.get("sealed") else None
     # 没封存（还在跑、停在审批）的运行没有「封存之后」：现有的事件都算，但每件证据都标未封存
     events = [r for r in rows if bound is None or r[0] <= bound]
@@ -244,8 +285,6 @@ def metric_cards(sealed: Sealed) -> list[tuple[str, str, dict[str, Any]]]:
 
 async def load_sealed(run_id: str) -> Sealed:
     """读取封存范围；运行记录不存在时抛 404 CodedHTTPException（供引擎与领域层共用，无需引入 api/evidence）。"""
-    from app.api.coded import CodedHTTPException
-
     try:
         return await read_sealed(run_id)
     except LookupError:
@@ -320,8 +359,6 @@ def reports_of(sealed: Sealed, *, nested: bool = False) -> list[Report]:
 
 def choose_report(reports: list[Report], wanted: str | None, sealed: Sealed) -> Report:
     """从封存报告列表里选出目标报告（指定 wanted 优先，否则取出口 _evidence 主报告，再退回第一份）。"""
-    from app.api.coded import CodedHTTPException
-
     if wanted:
         chosen = next((r for r in reports if r.node_id == wanted), None)
         if chosen is None:
@@ -363,9 +400,7 @@ class ShownText:
 
 def open_masks(sealed: Sealed | None = None) -> Any:
     """获取请求级数据源遮罩上下文（通过统一边界暴露给领域层，兼容测试对证据遮罩构造器的桩替换）。"""
-    from app.api import evidence as _evidence_mod
-
-    return _evidence_mod._Masks(sealed)
+    return _evidence_api()._Masks(sealed)
 
 
 async def resolve_metric_masks(
@@ -381,9 +416,7 @@ async def resolve_metric_masks(
     sure: bool = False,
 ) -> tuple[dict[str, Any], str | None]:
     """判断单个指标及其输入是否命中的数据源遮罩。"""
-    from app.api import evidence as _evidence_mod
-
-    return await _evidence_mod._metric_masks(
+    return await _evidence_api()._metric_masks(
         metric,
         card_node,
         artifact,

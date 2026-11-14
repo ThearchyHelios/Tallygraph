@@ -74,8 +74,12 @@ class _Lease:
     memory_mb: int
     cpus: int
     last_used: float = field(default_factory=time.monotonic)
+    in_flight: int = 0
     # 这台是因为限额变更重建出来的，也就是说上一次的会话文件已经没了
     was_reset: bool = False
+
+
+_Entry = _Lease
 
 
 class MicroVMSandbox(Sandbox):
@@ -274,9 +278,15 @@ class MicroVMSandbox(Sandbox):
     async def _reap_idle(self) -> None:
         """回收闲置 VM：它们各自占着几百 MB 内存，不能一直挂着。"""
         cutoff = time.monotonic() - settings.microvm_idle_seconds
-        stale = [sid for sid, lease in self._leases.items() if lease.last_used < cutoff]
+        stale = [
+            sid
+            for sid, lease in self._leases.items()
+            if getattr(lease, "in_flight", 0) <= 0 and lease.last_used < cutoff
+        ]
         for sid in stale:
-            await self._destroy(sid)
+            lease = self._leases.get(sid)
+            if lease is not None and getattr(lease, "in_flight", 0) <= 0 and lease.last_used < cutoff:
+                await self._destroy(sid)
 
     # ---------------- 执行 ----------------
 
@@ -302,7 +312,7 @@ class MicroVMSandbox(Sandbox):
 
         ext, cmd = _LANG[language]
         entry = entry_name(ext)
-        sid = session_id or f"tmp{int(time.time() * 1000)}"
+        sid = session_id or f"tmp_{os.urandom(8).hex()}"
         ephemeral = session_id is None
         started = time.perf_counter()
 
@@ -324,100 +334,105 @@ class MicroVMSandbox(Sandbox):
                 error=f"microVM 启动失败：{describe_exception(e)}",
             )
 
+        lease.in_flight = getattr(lease, "in_flight", 0) + 1
         try:
-            payload = dict(files or {})
-            payload[entry] = code
-            for rel, content in payload.items():
-                rel = rel.lstrip("/")
-                if ".." in rel.split("/"):
-                    return ExecResult(ok=False, backend=self.name, error=f"非法文件路径：{rel}")
-                data = content.encode()
-                if len(data) > _MAX_FILE_BYTES:
-                    return ExecResult(ok=False, backend=self.name, error=f"{rel} 超过 8 MB 上限")
-                target = f"{_WORKDIR}/{rel}"
-                if "/" in rel:
-                    try:
-                        await lease.vm.fs.mkdir(target.rsplit("/", 1)[0])
-                    except Exception:  # noqa: BLE001
-                        pass
-                await lease.vm.fs.write(target, data)
+            try:
+                payload = dict(files or {})
+                payload[entry] = code
+                for rel, content in payload.items():
+                    rel = rel.lstrip("/")
+                    if ".." in rel.split("/"):
+                        return ExecResult(ok=False, backend=self.name, error=f"非法文件路径：{rel}")
+                    data = content.encode()
+                    if len(data) > _MAX_FILE_BYTES:
+                        return ExecResult(ok=False, backend=self.name, error=f"{rel} 超过 8 MB 上限")
+                    target = f"{_WORKDIR}/{rel}"
+                    if "/" in rel:
+                        try:
+                            await lease.vm.fs.mkdir(target.rsplit("/", 1)[0])
+                        except Exception:  # noqa: BLE001
+                            pass
+                    await lease.vm.fs.write(target, data)
 
-            # cwd / env / timeout 都是 exec 的原生参数，不用再拿 shell 拼
-            out = await lease.vm.exec(
-                cmd[0], [*cmd[1:], entry],
-                cwd=_WORKDIR,
-                env=({k: str(v) for k, v in env.items()} if env else None),
-                timeout=limits.timeout,
-            )
-        except ms.ExecTimeoutError:
-            # 超时的 VM 里多半还有进程在烧 CPU，得收拾掉。但**先别销毁整台 VM**：
-            # 会话契约说同 session 共享文件系统（上一步写的文件下一步要读回来），
-            # 销毁 VM 等于把工作区连同用户数据一起清空，而另外三个后端超时只
-            # killpg、工作目录照留。先试着在 VM 里把残留进程杀干净，
-            # 实在不行才销毁——并且如实告诉调用方会话被重置了。
-            killed = await self._kill_leftovers(sid, entry)
-            if not killed:
-                await self._destroy(sid)
+                # cwd / env / timeout 都是 exec 的原生参数，不用再拿 shell 拼
+                out = await lease.vm.exec(
+                    cmd[0], [*cmd[1:], entry],
+                    cwd=_WORKDIR,
+                    env=({k: str(v) for k, v in env.items()} if env else None),
+                    timeout=limits.timeout,
+                )
+            except ms.ExecTimeoutError:
+                # 超时的 VM 里多半还有进程在烧 CPU，得收拾掉。但**先别销毁整台 VM**：
+                # 会话契约说同 session 共享文件系统（上一步写的文件下一步要读回来），
+                # 销毁 VM 等于把工作区连同用户数据一起清空，而另外三个后端超时只
+                # killpg、工作目录照留。先试着在 VM 里把残留进程杀干净，
+                # 实在不行才销毁——并且如实告诉调用方会话被重置了。
+                killed = await self._kill_leftovers(sid, entry)
+                if not killed:
+                    await self._destroy(sid)
+                return ExecResult(
+                    ok=False, backend=self.name, timed_out=True, exit_code=124,
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    session_reset=not killed,
+                    error=f"执行超过 {limits.timeout} 秒，已终止"
+                          + ("" if killed else "；VM 已重置，该会话之前写的文件已丢失"),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("microVM 执行中断：%s", raw(e))
+                return ExecResult(
+                    ok=False, backend=self.name,
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    error=f"microVM 中的执行意外中断：{describe_exception(e)}",
+                )
+            finally:
+                if not ephemeral and sid in self._leases:
+                    # 入口脚本是这次执行的私有临时文件，跑完就收掉，
+                    # 免得会话工作区被历年的 __entry_xxx 堆满
+                    try:
+                        await lease.vm.fs.remove(f"{_WORKDIR}/{entry}")
+                    except Exception:  # noqa: BLE001 - 删不掉不影响执行结果
+                        pass
+
+            stdout, t1 = truncate(str(getattr(out, "stdout_text", "") or ""), limits.max_output)
+            stderr, t2 = truncate(str(getattr(out, "stderr_text", "") or ""), limits.max_output)
+            exit_code = int(getattr(out, "exit_code", 0) or 0)
+
+            # 退出码为负 = 进程被信号杀掉（SDK 用负值表示，具体是哪个信号它没给，
+            # 所以这里不编）。VM 里最常见的原因就是撞了内存上限，而且这种情况
+            # stdout/stderr 通常都是空的——不解释一句，用户只会看到"失败了"。
+            error = None
+            if exit_code < 0 and not stderr.strip():
+                error = (f"进程被内核终止（退出码 {exit_code}），"
+                         f"最常见的原因是超过了 {limits.memory_mb} MB 内存上限")
+
+            written: list[str] = []
+            if not ephemeral:
+                try:
+                    entries = await lease.vm.fs.list(_WORKDIR)
+                    # FsEntry 给的是 path（全路径），不是 name —— 取尾段当文件名。
+                    # 早先按 name 取，结果 files_written 里塞的是对象 repr。
+                    names = [str(getattr(e, "path", "") or "").rsplit("/", 1)[-1] for e in entries]
+                    written = [n for n in names if n and not n.startswith(ENTRY_PREFIX)][:50]
+                except Exception:  # noqa: BLE001 - 列目录失败不影响执行结果
+                    written = []
+
             return ExecResult(
-                ok=False, backend=self.name, timed_out=True, exit_code=124,
+                ok=exit_code == 0,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                truncated=t1 or t2,
+                backend=self.name,
                 duration_ms=int((time.perf_counter() - started) * 1000),
-                session_reset=not killed,
-                error=f"执行超过 {limits.timeout} 秒，已终止"
-                      + ("" if killed else "；VM 已重置，该会话之前写的文件已丢失"),
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("microVM 执行中断：%s", raw(e))
-            return ExecResult(
-                ok=False, backend=self.name,
-                duration_ms=int((time.perf_counter() - started) * 1000),
-                error=f"microVM 中的执行意外中断：{describe_exception(e)}",
+                files_written=written,
+                session_reset=lease.was_reset,
+                error=error,
             )
         finally:
+            lease.in_flight = max(0, getattr(lease, "in_flight", 0) - 1)
+            lease.last_used = time.monotonic()
             if ephemeral:
                 await self._destroy(sid)
-            elif sid in self._leases:
-                # 入口脚本是这次执行的私有临时文件，跑完就收掉，
-                # 免得会话工作区被历年的 __entry_xxx 堆满
-                try:
-                    await lease.vm.fs.remove(f"{_WORKDIR}/{entry}")
-                except Exception:  # noqa: BLE001 - 删不掉不影响执行结果
-                    pass
-
-        stdout, t1 = truncate(str(getattr(out, "stdout_text", "") or ""), limits.max_output)
-        stderr, t2 = truncate(str(getattr(out, "stderr_text", "") or ""), limits.max_output)
-        exit_code = int(getattr(out, "exit_code", 0) or 0)
-
-        # 退出码为负 = 进程被信号杀掉（SDK 用负值表示，具体是哪个信号它没给，
-        # 所以这里不编）。VM 里最常见的原因就是撞了内存上限，而且这种情况
-        # stdout/stderr 通常都是空的——不解释一句，用户只会看到"失败了"。
-        error = None
-        if exit_code < 0 and not stderr.strip():
-            error = (f"进程被内核终止（退出码 {exit_code}），"
-                     f"最常见的原因是超过了 {limits.memory_mb} MB 内存上限")
-
-        written: list[str] = []
-        if not ephemeral:
-            try:
-                entries = await lease.vm.fs.list(_WORKDIR)
-                # FsEntry 给的是 path（全路径），不是 name —— 取尾段当文件名。
-                # 早先按 name 取，结果 files_written 里塞的是对象 repr。
-                names = [str(getattr(e, "path", "") or "").rsplit("/", 1)[-1] for e in entries]
-                written = [n for n in names if n and not n.startswith(ENTRY_PREFIX)][:50]
-            except Exception:  # noqa: BLE001 - 列目录失败不影响执行结果
-                written = []
-
-        return ExecResult(
-            ok=exit_code == 0,
-            exit_code=exit_code,
-            stdout=stdout,
-            stderr=stderr,
-            truncated=t1 or t2,
-            backend=self.name,
-            duration_ms=int((time.perf_counter() - started) * 1000),
-            files_written=written,
-            session_reset=lease.was_reset,
-            error=error,
-        )
 
     async def cleanup(self, session_id: str) -> None:
         await self._destroy(session_id)

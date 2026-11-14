@@ -6,7 +6,7 @@ import time
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langgraph.errors import GraphRecursionError
+from langgraph.errors import GraphBubbleUp, GraphInterrupt, GraphRecursionError
 from langgraph.func import task
 
 from app.analysis.contract import CallError
@@ -16,8 +16,9 @@ from app.core.events import EventType
 from app.db.base import SessionLocal
 from app.db.models import Workflow
 from app.engine.context import (
-    LABEL_PREFIX_KEY, PREFIX_KEY, STREAM_KEY, NodeContext, NodeError, stream_writer,
+    LABEL_PREFIX_KEY, PREFIX_KEY, STREAM_KEY, NodeContext, NodeError, NodeRejected, stream_writer,
 )
+from app.process.actions import ActionPending
 from app.engine.evidence import ledger_enabled, next_exec
 from app.engine.lineage import whole_ref
 from app.engine.state import GraphState, message_text, template_context
@@ -298,9 +299,9 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
         t0 = time.perf_counter()
         try:
             out: dict[str, Any] = await _member(name, instruction, progress, tally)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GraphBubbleUp, GraphInterrupt, ActionPending, NodeRejected, KeyboardInterrupt, SystemExit):
             raise
-        except BaseException as exc:  # noqa: BLE001 - 一个专家挂了不该拖垮整轮
+        except Exception as exc:  # noqa: BLE001 - 一个专家挂了不该拖垮整轮
             # 把失败当成它的产出交回调度者，让它决定改派还是收工
             why = describe_exception(exc)
             text = f"（{name} 执行失败：{why}）"
@@ -578,7 +579,15 @@ async def run_supervisor(state: GraphState, ctx: NodeContext) -> dict[str, Any]:
             return await work(round_no, name, instruction, progress, parallel)
 
         started = time.perf_counter()
-        results = await asyncio.gather(*(_one(n, i, len(batch)) for n, i in batch))
+        tasks = [asyncio.create_task(_one(n, i, len(batch))) for n, i in batch]
+        try:
+            results = await asyncio.gather(*tasks)
+        except BaseException:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         wall_ms = int((time.perf_counter() - started) * 1000)
 
         # 进展仍按派活顺序拼：它是下一轮调度者读的输入，语义不随谁先回来而变

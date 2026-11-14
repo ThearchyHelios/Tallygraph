@@ -309,12 +309,18 @@ async def _process_in_background(doc_id: str) -> None:
         except Exception as e:  # noqa: BLE001
             logger.warning("文档 %s 处理失败：%s", doc_id, raw(e))
             await session.rollback()
+            await kb.cleanup_failed_document_chunks(session, doc_id)
             doc = await session.get(Document, doc_id)
+            collection_to_invalidate: str | None = None
             if doc:
+                collection_to_invalidate = doc.collection
                 reason, hint = explain(e)
+                doc.chunk_count = 0
                 doc.status = "failed"
                 doc.error = (f"文档分块或生成向量时出错：{reason}" + (f"。{hint}" if hint else ""))[:500]
-                await session.commit()
+            await session.commit()
+            if collection_to_invalidate is not None:
+                kb.invalidate_vector_cache(collection_to_invalidate)
 
 
 @kb_router.get("/search")

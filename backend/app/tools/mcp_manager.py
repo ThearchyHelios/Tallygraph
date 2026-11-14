@@ -209,7 +209,7 @@ class McpManager:
         self, server_id: str, key: str, status: str, error: str | None, tool_names: list[str],
         started: float,
     ) -> None:
-        from app.api.health import record
+        from app.capabilities.check_state import record
 
         async with SessionLocal() as session:
             row = await session.get(McpServer, server_id)

@@ -392,7 +392,7 @@ def _additive_result(env: Env, params: dict[str, Any], used: list[str], segs: li
         if parent_row is not None:
             expect = to_fraction(parent_row.get(side))
             if expect is None or not closes(total, expect, None, exact=True):
-                gaps.setdefault(side, (expect or Fraction(0)) - total)
+                gaps.setdefault(side, (Fraction(0) if expect is None else expect) - total)
     closed = not gaps
     deltas = {x.key: x.target - x.base for x in segs}
     shares = {k: d / delta for k, d in deltas.items()} if closed and delta != 0 else {}
@@ -524,8 +524,14 @@ def ratio(raw: Mapping[str, Any], env: Env) -> Any:
     side_b = _collect(bs, rows_b, by, reader(bs), dims, period_label)
     side_t = _collect(ts, rows_t, by, reader(ts), dims, period_label)
     for side in (side_b, side_t):
-        side.nulls = [k for k, v in side.values.items() if v[0] is None or v[1] is None]
-        side.values = {k: (v[0] or Fraction(0), v[1] or Fraction(0)) for k, v in side.values.items()}
+        side.nulls = [k for k, v in side.values.items() if v is None or v[0] is None or v[1] is None]
+        side.values = {
+            k: (
+                Fraction(0) if v is None or v[0] is None else v[0],
+                Fraction(0) if v is None or v[1] is None else v[1],
+            )
+            for k, v in side.values.items()
+        }
     if bs is ts:
         env.inputs.use(ts, "data", [*by, params["period"], num, den], side_b.rows + side_t.rows)
     else:
@@ -557,18 +563,36 @@ def ratio(raw: Mapping[str, Any], env: Env) -> Any:
                          criterion, target_snap=ts, note=note)
 
 
-def ratio_effects(segs: Sequence[tuple[Fraction, Fraction, Fraction, Fraction]]
+def _as_fraction_or_zero(value: Any) -> Fraction:
+    if value is None:
+        return Fraction(0)
+    if isinstance(value, Fraction):
+        return value
+    parsed = to_fraction(value)
+    return Fraction(0) if parsed is None else parsed
+
+
+def ratio_effects(segs: Sequence[tuple[Fraction | None, Fraction | None, Fraction | None, Fraction | None]]
                   ) -> tuple[Fraction, Fraction, list[tuple[Fraction, ...]]]:
     """比率拆解的计算（细案 §2.2，中点对称拆法）。segs 是各段 (分子_基期, 分母_基期, 分子_本期, 分母_本期)，两期分母都为 0
     的段先剔掉。交回 (R, R', 各段 (w, w', r, r', mix, rate))：Σmix + Σrate = R' − R 逐位成立（Σ(w' − w) = 0）。一边分母为 0
     的段：那一边权重 0、比率取另一边的（自身效应为 0，变化全记在结构上）。"""
-    db = sum((s[1] for s in segs), Fraction(0))
-    dt = sum((s[3] for s in segs), Fraction(0))
-    R = sum((s[0] for s in segs), Fraction(0)) / db
-    R2 = sum((s[2] for s in segs), Fraction(0)) / dt
+    if not segs:
+        return Fraction(0), Fraction(0), []
+    norm = [(_as_fraction_or_zero(s[0]), _as_fraction_or_zero(s[1]),
+             _as_fraction_or_zero(s[2]), _as_fraction_or_zero(s[3])) for s in segs]
+    db = sum((s[1] for s in norm), Fraction(0))
+    dt = sum((s[3] for s in norm), Fraction(0))
+    if db == 0 or dt == 0:
+        raise ValueError("比率拆解要求基期与本期的分母合计均不为 0")
+    R = sum((s[0] for s in norm), Fraction(0)) / db
+    R2 = sum((s[2] for s in norm), Fraction(0)) / dt
     mid = (R + R2) / 2
     out = []
-    for nb, d_b, nt, d_t in segs:
+    for nb, d_b, nt, d_t in norm:
+        if d_b == 0 and d_t == 0:
+            out.append((Fraction(0), Fraction(0), Fraction(0), Fraction(0), Fraction(0), Fraction(0)))
+            continue
         w, w2 = d_b / db, d_t / dt
         r = nb / d_b if d_b != 0 else None
         r2 = nt / d_t if d_t != 0 else None
@@ -603,7 +627,8 @@ def _ratio_result(env: Env, params: dict[str, Any], used: list[str], segs: list[
         for col, total in sums.items():
             expect = to_fraction(parent_row.get(col))
             if expect is None or not closes(total, expect, None, exact=True):
-                gaps.setdefault("base" if col.endswith("base") else "target", (expect or Fraction(0)) - total)
+                gaps.setdefault("base" if col.endswith("base") else "target",
+                                (Fraction(0) if expect is None else expect) - total)
     closed = not gaps
     mix_total = sum((e[4] for e in effects), Fraction(0))
     rate_total = sum((e[5] for e in effects), Fraction(0))

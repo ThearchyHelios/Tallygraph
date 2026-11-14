@@ -1,35 +1,21 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react'
-import type { ReactNode, RefObject } from 'react'
+import type { ComponentType, ReactNode, RefObject } from 'react'
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { Bell, BellOff, LogOut, Moon, RotateCw, Sun, UserRound } from 'lucide-react'
 import clsx from 'clsx'
-import { ApiError, NETWORK_MESSAGE, api } from './api/client'
+import { resolveBootSession } from './store/authSession'
 import { CATALOG_TIMEOUT_MS, catalogListState, useCatalog, useOnReconnect } from './store/catalog'
 import type { CatalogCheck } from './store/catalog'
-import { useStudio } from './store/studio'
-import { useChat } from './store/chat'
-import { useConversations } from './store/conversations'
-import { personalAppsOn } from './pages/blueprints/shared'
-import { Logo } from './components/Logo'
-import {
-  PAGES, flushThemePref, openShortcutHelp, toggleCommandPalette, toggleNotify,
-  toggleTheme, usePages, useShellOverlay, useTheme, visiblePages, waitedFor,
-} from './components/shellCommands'
-import { atLeast, authSettled, loginOn, loginUrl, needsLogin, prefsLocalOnly, principalName, useAuth } from './store/auth'
 import { ErrorBoundary, Kbd, OfflineBanner, Spinner, StatusBadge, isComposing, toast, useTicker } from './components/ui'
-import { applyTheme, normalizeTheme } from './lib/theme'
 import { ariaShortcut, isTypingTarget, matchShortcut } from './lib/keys'
 import { formatDateTime, formatDuration, formatRelative, shortId } from './lib/format'
 import { humanizeError } from './lib/errors'
-import { isActivePhase } from './run/trace'
-import {
-  composeTitle, flagAttention, notifyInBackground, notifySupported, paintFavicon, useSignals,
-} from './lib/notify'
+import type { useStudio as UseStudioHook } from './store/studio'
+import type { useChat as UseChatHook } from './store/chat'
+import type { useConversations as UseConversationsHook } from './store/conversations'
+import type { isActivePhase as IsActivePhaseFn } from './run/trace'
 import type { Attention, FaviconDot } from './lib/notify'
 import type { Principal } from './typesApp'
-import { useLeaveBlocker } from './lib/leave'
-import { useLocalActor } from './lib/actor'
-import { APP_TEXT, AUTH_MODE_LABEL, AUTH_TEXT, ROLE_LABEL, RUN_COMPARE_TEXT, TASK_NOTIFY_TEXT, runName } from './lib/terms'
 
 
 // 页面按需加载；外壳和导航始终可用，加载失败由现有错误边界提供恢复入口。
@@ -71,6 +57,11 @@ const LazyShellOverlays = lazy(() => import('./components/CommandPalette').then(
 /** 启动时认人（/auth/me）最多等多久再取目录 */
 const AUTH_WAIT_MS = 2500
 
+/** 页面开始加载外壳的时刻（头一回取目录的卡住从这里算，见 useStalledChecks） */
+const BOOT_AT = typeof performance !== 'undefined' ? performance.now() : 0
+/** 头一回取目录还没有着落 */
+let bootLoad = true
+
 /**
  * 分享页（/s#<分享 key>，04 细案 C2）不在外壳里，比登录页还早一步分开：拿到链接的人没有登录这回事，外壳的认人、取目录、
  * 心跳、读主题一样都不做（开了登录时它们会 401，再被请求层送去登录页）。整页加载时定一次：分享页上没有通往外壳的链接
@@ -78,7 +69,7 @@ const AUTH_WAIT_MS = 2500
 const SHARE_PAGE = typeof window !== 'undefined' && window.location.pathname === '/s'
 
 export default function App() {
-  return <Suspense fallback={<PageLoading />}>{SHARE_PAGE ? <SharePage /> : <Shell />}</Suspense>
+  return <Suspense fallback={<PageLoading />}>{SHARE_PAGE ? <SharePage /> : <ShellGate />}</Suspense>
 }
 
 function PageLoading() {
@@ -87,311 +78,416 @@ function PageLoading() {
   </div>
 }
 
-function Shell() {
-  const loaded = useCatalog((s) => s.loaded)
-  const backend = useCatalog((s) => s.backend)
-  const everOk = useCatalog((s) => s.lastOkAt != null)
-  const allFailed = useCatalog((s) => s.checks.length > 0 && s.checks.every((c) => c.state === 'error'))
+/**
+ * 登录门禁与主工作区外壳按需分片：/login 与 /s 不拉取编排画布、问数据、目录及全局命令依赖。
+ */
+function ShellGate() {
   const location = useLocation()
-  const [offlineOk, setOfflineOk] = useState(false)
-
   const navigate = useNavigate()
-  // 先认人（/auth/me）再取目录：使用者（开了登录的 user 角色）不取那几张表；开了登录还没登录的去登录页，什么都不取。
+  const [shellReady, setShellReady] = useState(false)
+
+  // 先认人（/auth/me）再进外壳取目录：使用者（开了登录的 user 角色）不取那几张表；开了登录还没登录的去登录页，什么都不取。
   // 关登录时 /me 恒为 off，和以前一样直接取
   useEffect(() => {
+    let cancelled = false
+    let unsubAuth: (() => void) | undefined
     void (async () => {
       // 认人最多等 AUTH_WAIT_MS：服务端卡着不回时不能把目录也一起拖住（启动页的「比平时慢」要点得出是哪几张表）。
       // 晚到的「还没登录」照样送去登录页（认人接口的 401 不整页跳，见 api/http）。load 同一时刻只发一个请求：
       // 开发模式下这个 effect 执行两次，也只认一次人
-      const loading = useAuth.getState().load()
+      const { authMod, me, loading } = await resolveBootSession(AUTH_WAIT_MS)
+      if (cancelled) return
+      unsubAuth = authMod.useAuth.subscribe((s) => {
+        if (s.ready && !authMod.needsLogin(s.me)) setShellReady(true)
+      })
+      if (authMod.useAuth.getState().ready && !authMod.needsLogin(authMod.useAuth.getState().me)) {
+        setShellReady(true)
+        return
+      }
       const toLoginPage = (who: Principal | null) => {
-        if (!needsLogin(who)) return false
-        if (window.location.pathname !== '/login') navigate(loginUrl(), { replace: true })
+        if (!authMod.needsLogin(who)) return false
+        if (window.location.pathname !== '/login') navigate(authMod.loginUrl(), { replace: true })
         return true
       }
-      const me = await Promise.race([
-        loading,
-        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), AUTH_WAIT_MS)),
-      ])
       if (me === undefined) void loading.then(toLoginPage)
       else if (toLoginPage(me)) return
-      void useCatalog.getState().refresh()
+      setShellReady(true)
     })()
+    return () => {
+      cancelled = true
+      unsubAuth?.()
+    }
     // 只在启动时认一次；登录、退出都整页重新加载
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-  // 启动时没连上、没认出人：恢复后再认一次（catalog 自己会重拉它那几张表）
-  useOnReconnect(() => { if (!useAuth.getState().ready) void useAuth.getState().load() })
-  // 连着时每 4 秒拉一次待审批和待办数，顺带当心跳；断开后的退避重试由 catalog 自己排。没登录时不拉
-  const signedOut = useAuth((s) => needsLogin(s.me))
-  useEffect(() => (signedOut ? undefined : useCatalog.getState().startHeartbeat()), [signedOut])
-  const roleRedirect = useRoleRedirect()
 
-  // 主题的真源在后端设置里。启动时没连上就等恢复再读一次，不然这次会话一直用缓存。
-  // 读到过、或者人在这台设备上换过（导航、⌘K 都派发 agentlab:theme），就不再读，
-  // 路上的那一次读回来也不应用：断线时换的主题不能在重连时被服务端的旧值翻回去
-  // 开了登录、又不是管理员（D-s）：主题只存本机，不读服务端那份全站共用的（使用者也读不到），先等认出人再决定
-  const themeSettled = useRef(false)
-  const loadTheme = () => {
-    if (themeSettled.current) return
-    void authSettled().then((me) => {
-      if (themeSettled.current) return
-      if (prefsLocalOnly(me)) { themeSettled.current = true; return }
-      api.settings.get().then((s) => {
-        if (themeSettled.current) return
-        themeSettled.current = true
-        applyTheme(normalizeTheme(s?.ui?.theme))
-      }).catch(() => {})
-    })
-  }
-  useEffect(loadTheme, [])
-  useEffect(() => {
-    const onLocal = () => { themeSettled.current = true }
-    window.addEventListener('agentlab:theme', onLocal)
-    return () => window.removeEventListener('agentlab:theme', onLocal)
-  }, [])
-  // 断线时换的那一下当时没存上：恢复后补存，而不是去读服务端
-  useOnReconnect(() => { if (!flushThemePref()) loadTheme() })
-
-  // 在 App 这一层算，从启动那一刻起计时：从启动页「先进去看看」时已经卡了好几秒，
-  // 进门那一下就得是琥珀，不能进了门再从头等
-  const stalled = useStalledChecks()
-
-  // 从没连上过就断着：停在启动页说清楚原因，而不是放人进去看一屏「还没有…」
-  const offlineAtBoot = !everOk && (backend === 'down' || (allFailed && backend === 'checking'))
-  const booting = !offlineOk && (!loaded || offlineAtBoot)
-  // 启动页的清单自己会说哪几项还在等、哪几项失败了；进了外壳才需要当面提醒
-  useCatalogWarning(stalled, !booting && location.pathname !== '/login')
   // 登录页不在外壳里：没登录时导航、目录、心跳都还没有
   if (location.pathname === '/login') return <LoginPage />
-  if (booting) return <BootScreen onEnterOffline={() => setOfflineOk(true)} />
-
-  return (
-    // 横向裁掉：导航项的悬停提示（不可见时也占位）在窄屏上伸出视口，整页就能左右滚出一块空白。clip 不建滚动容器，
-    // 粘性定位和纵向都照旧
-    <div className="flex h-full overflow-x-clip">
-      <Nav stalled={stalled} />
-
-      <main className="flex min-w-0 flex-1 flex-col">
-        {/* 横幅必须是 main 的第一个孩子：它把自己的高度写给 toast，toast 才会跟着下移 */}
-        <OfflineBanner />
-        <div className="relative min-h-0 flex-1">
-          {/* 「在看哪个」属于 URL，不属于 store。
-              每页写成两条显式路由（带 id / 不带 id），而不是可选参数 `:id?`：
-              「没带 id」是真要单独处理的一种情况（落到上次那个、或列表第一个），
-              藏在一个问号里下次就没人记得它存在了。
-              导航高亮不用动——NavLink 默认前缀匹配，/chat/abc 照样点亮「问数据」。*/}
-          <ErrorBoundary resetKey={location.pathname}>
-            {/* 开了登录的使用者只到得了「应用」和「设置」：别的地址（旧书签、手输）送回应用首页 */}
-            {roleRedirect ? <Navigate to={roleRedirect} replace /> : (
-            <Suspense fallback={<PageLoading />}><Routes>
-              {/* 默认落到对话页：多数人要的是答案，画布留给要自己编排的人。使用者落到应用首页 */}
-              <Route path="/" element={<HomeRedirect />} />
-              <Route path="/chat" element={<ChatPage />} />
-              <Route path="/chat/:conversationId" element={<ChatPage />} />
-              <Route path="/studio" element={<StudioPage />} />
-              <Route path="/studio/:workflowId" element={<StudioPage />} />
-              <Route path="/runs" element={<RunsPage />} />
-              {/* 固定路径写在 /runs/:runId 前面：读的人一眼看出 compare 不是运行 id */}
-              <Route path="/runs/compare" element={<ComparePage />} />
-              <Route path="/runs/:runId" element={<RunsPage />} />
-              <Route path="/data" element={<DataPage />} />
-              <Route path="/data/:tab" element={<DataPage />} />
-              {/* 数据源的数据目录：两段以上的 /data 地址不会落到上面的标签页 */}
-              <Route path="/data/catalog/:sourceId" element={<CatalogPage />} />
-              <Route path="/data/catalog/:sourceId/:table" element={<CatalogPage />} />
-              <Route path="/tools" element={<ToolsPage />} />
-              <Route path="/tools/:tab" element={<ToolsPage />} />
-              <Route path="/tools/:tab/:id" element={<ToolsPage />} />
-              <Route path="/knowledge" element={<KnowledgePage />} />
-              <Route path="/knowledge/:tab" element={<KnowledgePage />} />
-              <Route path="/knowledge/:tab/:id" element={<KnowledgePage />} />
-              <Route path="/schedules" element={<SchedulesPage />} />
-              <Route path="/schedules/:id" element={<SchedulesPage />} />
-              {/* 评测：/evals 题集列表，/evals/signals、/evals/snapshots 两个页签，/evals/suites/:id 题集，/evals/runs/:id 一次评测 */}
-              <Route path="/evals" element={<EvalsPage />} />
-              <Route path="/evals/:section" element={<EvalsPage />} />
-              <Route path="/evals/:section/:id" element={<EvalsPage />} />
-              <Route path="/ledger/calibers" element={<CaliberCatalog />} />
-              {/* 从业务文档起草口径：草稿只到定义为止，取数路径接一次真实运行 */}
-              <Route path="/ledger/drafts" element={<CaliberDrafts />} />
-              {/* 应用：固定路径（inbox）写在 /apps/:appId 前面，读的人一眼看出它不是应用 id */}
-              <Route path="/apps" element={<AppsHome />} />
-              {/* 要在 /apps/:appId 之前：create 不是应用 id */}
-              <Route path="/apps/create" element={<NewAppStart />} />
-              <Route path="/blueprints/:blueprintId" element={<BlueprintPage />} />
-              <Route path="/blueprints/:blueprintId/:section" element={<BlueprintPage />} />
-              <Route path="/apps/inbox/:taskId" element={<TaskPage />} />
-              <Route path="/apps/:appId" element={<AppPage />} />
-              <Route path="/apps/:appId/p/:pageId" element={<AppPage />} />
-              <Route path="/apps/:appId/new/:entryId" element={<EntryPage />} />
-              <Route path="/apps/:appId/i/:runId" element={<InstancePage />} />
-              <Route path="/apps/:appId/edit" element={<AppEditor />} />
-              <Route path="/apps/:appId/edit/:section" element={<AppEditor />} />
-              {/* /login 不在这里：它不在外壳里，App 开头就单独画了 */}
-              {/* 数据源搬到了顶级「数据」页；旧书签和各处「去设置 → 数据源」的链接还在 */}
-              <Route path="/settings/datasources" element={<Navigate to="/data" replace />} />
-              <Route path="/settings" element={<SettingsPage />} />
-              <Route path="/settings/:tab" element={<SettingsPage />} />
-              <Route path="*" element={<NotFound />} />
-            </Routes></Suspense>
-            )}
-          </ErrorBoundary>
-        </div>
-      </main>
-
-      <ShellOverlays />
-      <ShellKeys />
-      <ShellSignals />
-      <LeaveBlocker />
-    </div>
-  )
+  if (!shellReady) return <PageLoading />
+  return <LazyWorkspaceShell />
 }
 
-function ShellOverlays() {
-  const open = useShellOverlay()
-  const [everOpened, setEverOpened] = useState(false)
-  useEffect(() => {
-    if (open) setEverOpened(true)
-  }, [open])
-  if (!open && !everOpened) return null
-  return (
-    <Suspense fallback={null}>
-      <LazyShellOverlays />
-    </Suspense>
-  )
+interface WorkspaceDeps {
+  useStudio: typeof UseStudioHook
+  useChat: typeof UseChatHook
+  useConversations: typeof UseConversationsHook
+  isActivePhase: typeof IsActivePhaseFn
 }
 
-/** 首页：使用者（开了登录的 user 角色）落到应用首页，其余落到问数据 */
-function HomeRedirect() {
-  const me = useAuth((s) => s.me)
-  return <Navigate to={loginOn(me) && !atLeast(me, 'builder') ? '/apps' : '/chat'} replace />
+let workspaceDepsPromise: Promise<WorkspaceDeps> | null = null
+
+function loadWorkspaceDeps(): Promise<WorkspaceDeps> {
+  if (!workspaceDepsPromise) {
+    workspaceDepsPromise = Promise.all([
+      import('./store/studio'),
+      import('./store/chat'),
+      import('./store/conversations'),
+      import('./run/trace'),
+    ]).then(([studioMod, chatMod, convMod, traceMod]) => ({
+      useStudio: studioMod.useStudio,
+      useChat: chatMod.useChat,
+      useConversations: convMod.useConversations,
+      isActivePhase: traceMod.isActivePhase,
+    }))
+  }
+  return workspaceDepsPromise
 }
 
-/** 使用者到了看不到的页面：送回应用首页。搭建者以上、关登录时不管 */
-function useRoleRedirect(): string | null {
-  const me = useAuth((s) => s.me)
-  const { pathname } = useLocation()
-  if (!loginOn(me) || atLeast(me, 'builder') || pathname === '/') return null
-  // 个人蓝图（docs/design/normal-user-apps.md N7）：管理员开了个人应用时，使用者能进自己的蓝图页。它不是导航页，不在页面目录里
-  if (personalAppsOn(me) && pathname.startsWith('/blueprints/')) return null
-  const ok = visiblePages(me).some((p) => pathname === p.to || pathname.startsWith(`${p.to}/`))
-  return ok ? null : '/apps'
-}
+async function loadShellComponent(): Promise<{ default: ComponentType }> {
+  const [
+    authMod,
+    clientMod,
+    sharedMod,
+    logoMod,
+    shellCommandsMod,
+    themeMod,
+    notifyMod,
+    leaveMod,
+    actorMod,
+    termsMod,
+  ] = await Promise.all([
+    import('./store/auth'),
+    import('./api/client'),
+    import('./pages/blueprints/shared'),
+    import('./components/Logo'),
+    import('./components/shellCommands'),
+    import('./lib/theme'),
+    import('./lib/notify'),
+    import('./lib/leave'),
+    import('./lib/actor'),
+    import('./lib/terms'),
+  ])
 
-// -------------------------------------------------------------------------
-// 全局快捷键
-// -------------------------------------------------------------------------
+  const { atLeast, authSettled, loginOn, loginUrl, needsLogin, prefsLocalOnly, principalName, useAuth } = authMod
+  const { ApiError, NETWORK_MESSAGE, api } = clientMod
+  const { personalAppsOn } = sharedMod
+  const { Logo } = logoMod
+  const {
+    PAGES, flushThemePref, openShortcutHelp, toggleCommandPalette, toggleNotify,
+    toggleTheme, usePages, useShellOverlay, useTheme, visiblePages, waitedFor,
+  } = shellCommandsMod
+  const { applyTheme, normalizeTheme } = themeMod
+  const { composeTitle, flagAttention, notifyInBackground, notifySupported, paintFavicon, useSignals } = notifyMod
+  const { useLeaveBlocker } = leaveMod
+  const { useLocalActor } = actorMod
+  const { APP_TEXT, AUTH_MODE_LABEL, AUTH_TEXT, ROLE_LABEL, RUN_COMPARE_TEXT, TASK_NOTIFY_TEXT, runName } = termsMod
 
-/**
- * 离开前确认的那一个 blocker（lib/leave）：导航、链接、⌘K、⌥ 数字、浏览器后退，
- * 换页都先经过页面登记的守卫。单独成一个组件，blocker 变了只重绘它
- */
-function LeaveBlocker() {
-  useLeaveBlocker()
-  return null
-}
+  const LazyBrandLink = lazy(() => loadWorkspaceDeps().then((deps) => ({
+    default: function LiveBrandLink() {
+      const studio = useStudioActivity(deps.useStudio)
+      const chat = useChatActivity(deps.useChat)
+      return <BrandLink live={studio.startsWith('run') || chat === 'run'} />
+    },
+  })))
 
-/** 启动页上不挂：那时按下的 ⌘K 会在加载完之后才突然弹出面板 */
-function ShellKeys() {
-  const navigate = useNavigate()
-  const navRef = useRef(navigate)
-  navRef.current = navigate
+  const LazyShellSignals = lazy(() => loadWorkspaceDeps().then((deps) => ({
+    default: function ConnectedShellSignals() {
+      return <ShellSignals {...deps} />
+    },
+  })))
 
-  useEffect(() => {
-    // 捕获阶段注册：比各页面自己挂在 window 上的监听先到，? 只弹一层
-    const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented || isComposing(e)) return
-      // 别的弹窗开着时键盘归它：在弹窗上再叠一层命令面板，Esc 该关谁就乱了
-      const modal = document.querySelector('[aria-modal="true"]:not([data-command-palette])')
-      if (matchShortcut(e, 'Mod+K')) {
-        if (modal) return
-        e.preventDefault()
-        // 按住不放会连发：面板开了又关、关了又开
-        if (!e.repeat) toggleCommandPalette()
-        return
+  function Shell() {
+    const loaded = useCatalog((s) => s.loaded)
+    const backend = useCatalog((s) => s.backend)
+    const everOk = useCatalog((s) => s.lastOkAt != null)
+    const allFailed = useCatalog((s) => s.checks.length > 0 && s.checks.every((c) => c.state === 'error'))
+    const location = useLocation()
+    const navigate = useNavigate()
+    const [offlineOk, setOfflineOk] = useState(false)
+
+    useEffect(() => {
+      void useCatalog.getState().refresh()
+    }, [])
+
+    // 启动时没连上、没认出人：恢复后再认一次（catalog 自己会重拉它那几张表）
+    useOnReconnect(() => {
+      if (!useAuth.getState().ready) {
+        void useAuth.getState().load().then((who) => {
+          if (needsLogin(who) && window.location.pathname !== '/login') {
+            navigate(loginUrl(), { replace: true })
+          }
+        })
       }
-      // 其余的都让给打字：输入框里的 ? 是问号，⌥1 在 Mac 上是「¡」
-      if (modal || document.querySelector('[data-command-palette]') || isTypingTarget(e.target)) return
-      if (matchShortcut(e, '?')) {
-        e.preventDefault()
-        e.stopPropagation()
-        openShortcutHelp()
-        return
-      }
-      const page = visiblePages(useAuth.getState().me).find((p) => matchShortcut(e, p.shortcut))
-      if (page) {
-        e.preventDefault()
-        // 有没保存的改动时由 LeaveBlocker 先问，这里照常跳
-        navRef.current(page.to)
-      }
+    })
+    // 连着时每 4 秒拉一次待审批和待办数，顺带当心跳；断开后的退避重试由 catalog 自己排。没登录时不拉
+    const signedOut = useAuth((s) => needsLogin(s.me))
+    useEffect(() => (signedOut ? undefined : useCatalog.getState().startHeartbeat()), [signedOut])
+    const roleRedirect = useRoleRedirect()
+
+    // 主题的真源在后端设置里。启动时没连上就等恢复再读一次，不然这次会话一直用缓存。
+    // 读到过、或者人在这台设备上换过（导航、⌘K 都派发 agentlab:theme），就不再读，
+    // 路上的那一次读回来也不应用：断线时换的主题不能在重连时被服务端的旧值翻回去
+    // 开了登录、又不是管理员（D-s）：主题只存本机，不读服务端那份全站共用的（使用者也读不到），先等认出人再决定
+    const themeSettled = useRef(false)
+    const loadTheme = () => {
+      if (themeSettled.current) return
+      void authSettled().then((me) => {
+        if (themeSettled.current) return
+        if (prefsLocalOnly(me)) { themeSettled.current = true; return }
+        api.settings.get().then((s) => {
+          if (themeSettled.current) return
+          themeSettled.current = true
+          applyTheme(normalizeTheme(s?.ui?.theme))
+        }).catch(() => {})
+      })
     }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [])
-  return null
-}
+    useEffect(loadTheme, [])
+    useEffect(() => {
+      const onLocal = () => { themeSettled.current = true }
+      window.addEventListener('agentlab:theme', onLocal)
+      return () => window.removeEventListener('agentlab:theme', onLocal)
+    }, [])
+    // 断线时换的那一下当时没存上：恢复后补存，而不是去读服务端
+    useOnReconnect(() => { if (!flushThemePref()) loadTheme() })
 
-// -------------------------------------------------------------------------
-// 导航
-// -------------------------------------------------------------------------
+    // 在 App 这一层算，从启动那一刻起计时：从启动页「先进去看看」时已经卡了好几秒，
+    // 进门那一下就得是琥珀，不能进了门再从头等
+    const stalled = useStalledChecks()
 
-/** 悬停提示：挂在导航右侧，读屏不念（导航项自己有文字，提示只是补充） */
-function Tip({ children, badge = false }: { children: ReactNode; badge?: boolean }) {
-  return (
-    <span
-      aria-hidden
-      className={clsx(
-        'pointer-events-none invisible absolute left-full top-1/2 z-40 ml-2.5 flex -translate-y-1/2 items-center gap-2',
-        'whitespace-nowrap rounded-md border bg-elev px-2 py-1 text-xs font-normal text-fg opacity-0 shadow-elev-2',
-        'transition-opacity duration-150',
-        badge
-          ? 'group-hover/badge:visible group-hover/badge:opacity-100 group-focus-visible/badge:visible group-focus-visible/badge:opacity-100'
-          : 'group-hover:visible group-hover:opacity-100 group-hover:delay-300 group-focus-visible:visible group-focus-visible:opacity-100',
-      )}
-    >
-      {children}
-    </span>
-  )
-}
+    // 从没连上过就断着：停在启动页说清楚原因，而不是放人进去看一屏「还没有…」
+    const offlineAtBoot = !everOk && (backend === 'down' || (allFailed && backend === 'checking'))
+    const booting = !offlineOk && (!loaded || offlineAtBoot)
+    // 启动页的清单自己会说哪几项还在等、哪几项失败了；进了外壳才需要当面提醒
+    useCatalogWarning(stalled, !booting && location.pathname !== '/login')
+    if (booting) return <BootScreen onEnterOffline={() => setOfflineOk(true)} />
 
-/** 有没有运行在跑：品牌标的起点节点亮起、标题加前缀都看它 */
-function useStudioActivity(): string {
-  return useStudio((s) => {
-    if (s.runPhase === 'running' || s.runPhase === 'queued') {
-      const total = s.trace.nodesTotal ?? s.nodes.length
-      let done = 0
-      for (const n of Object.values(s.trace.nodes)) if (n.state === 'done' || n.state === 'skipped') done++
-      return total ? `run:${Math.min(done, total)}/${total}` : 'run'
-    }
-    return s.copilot.active ? 'gen' : ''
-  })
-}
+    return (
+      // 横向裁掉：导航项的悬停提示（不可见时也占位）在窄屏上伸出视口，整页就能左右滚出一块空白。clip 不建滚动容器，
+      // 粘性定位和纵向都照旧
+      <div className="flex h-full overflow-x-clip">
+        <Nav stalled={stalled} />
 
-function useChatActivity(): '' | 'run' | 'gen' {
-  return useChat((s) => {
-    let gen = false
-    for (const turns of Object.values(s.byConversation)) {
-      for (const t of turns) {
-        if (t.phase === 'running') return 'run'
-        if (t.phase === 'planning' || t.phase === 'building') gen = true
+        <main className="flex min-w-0 flex-1 flex-col">
+          {/* 横幅必须是 main 的第一个孩子：它把自己的高度写给 toast，toast 才会跟着下移 */}
+          <OfflineBanner />
+          <div className="relative min-h-0 flex-1">
+            {/* 「在看哪个」属于 URL，不属于 store。
+                每页写成两条显式路由（带 id / 不带 id），而不是可选参数 `:id?`：
+                「没带 id」是真要单独处理的一种情况（落到上次那个、或列表第一个），
+                藏在一个问号里下次就没人记得它存在了。
+                导航高亮不用动——NavLink 默认前缀匹配，/chat/abc 照样点亮「问数据」。*/}
+            <ErrorBoundary resetKey={location.pathname}>
+              {/* 开了登录的使用者只到得了「应用」和「设置」：别的地址（旧书签、手输）送回应用首页 */}
+              {roleRedirect ? <Navigate to={roleRedirect} replace /> : (
+              <Suspense fallback={<PageLoading />}><Routes>
+                {/* 默认落到对话页：多数人要的是答案，画布留给要自己编排的人。使用者落到应用首页 */}
+                <Route path="/" element={<HomeRedirect />} />
+                <Route path="/chat" element={<ChatPage />} />
+                <Route path="/chat/:conversationId" element={<ChatPage />} />
+                <Route path="/studio" element={<StudioPage />} />
+                <Route path="/studio/:workflowId" element={<StudioPage />} />
+                <Route path="/runs" element={<RunsPage />} />
+                {/* 固定路径写在 /runs/:runId 前面：读的人一眼看出 compare 不是运行 id */}
+                <Route path="/runs/compare" element={<ComparePage />} />
+                <Route path="/runs/:runId" element={<RunsPage />} />
+                <Route path="/data" element={<DataPage />} />
+                <Route path="/data/:tab" element={<DataPage />} />
+                {/* 数据源的数据目录：两段以上的 /data 地址不会落到上面的标签页 */}
+                <Route path="/data/catalog/:sourceId" element={<CatalogPage />} />
+                <Route path="/data/catalog/:sourceId/:table" element={<CatalogPage />} />
+                <Route path="/tools" element={<ToolsPage />} />
+                <Route path="/tools/:tab" element={<ToolsPage />} />
+                <Route path="/tools/:tab/:id" element={<ToolsPage />} />
+                <Route path="/knowledge" element={<KnowledgePage />} />
+                <Route path="/knowledge/:tab" element={<KnowledgePage />} />
+                <Route path="/knowledge/:tab/:id" element={<KnowledgePage />} />
+                <Route path="/schedules" element={<SchedulesPage />} />
+                <Route path="/schedules/:id" element={<SchedulesPage />} />
+                {/* 评测：/evals 题集列表，/evals/signals、/evals/snapshots 两个页签，/evals/suites/:id 题集，/evals/runs/:id 一次评测 */}
+                <Route path="/evals" element={<EvalsPage />} />
+                <Route path="/evals/:section" element={<EvalsPage />} />
+                <Route path="/evals/:section/:id" element={<EvalsPage />} />
+                <Route path="/ledger/calibers" element={<CaliberCatalog />} />
+                {/* 从业务文档起草口径：草稿只到定义为止，取数路径接一次真实运行 */}
+                <Route path="/ledger/drafts" element={<CaliberDrafts />} />
+                {/* 应用：固定路径（inbox）写在 /apps/:appId 前面，读的人一眼看出它不是应用 id */}
+                <Route path="/apps" element={<AppsHome />} />
+                {/* 要在 /apps/:appId 之前：create 不是应用 id */}
+                <Route path="/apps/create" element={<NewAppStart />} />
+                <Route path="/blueprints/:blueprintId" element={<BlueprintPage />} />
+                <Route path="/blueprints/:blueprintId/:section" element={<BlueprintPage />} />
+                <Route path="/apps/inbox/:taskId" element={<TaskPage />} />
+                <Route path="/apps/:appId" element={<AppPage />} />
+                <Route path="/apps/:appId/p/:pageId" element={<AppPage />} />
+                <Route path="/apps/:appId/new/:entryId" element={<EntryPage />} />
+                <Route path="/apps/:appId/i/:runId" element={<InstancePage />} />
+                <Route path="/apps/:appId/edit" element={<AppEditor />} />
+                <Route path="/apps/:appId/edit/:section" element={<AppEditor />} />
+                {/* /login 不在这里：它不在外壳里，App 开头就单独画了 */}
+                {/* 数据源搬到了顶级「数据」页；旧书签和各处「去设置 → 数据源」的链接还在 */}
+                <Route path="/settings/datasources" element={<Navigate to="/data" replace />} />
+                <Route path="/settings" element={<SettingsPage />} />
+                <Route path="/settings/:tab" element={<SettingsPage />} />
+                <Route path="*" element={<NotFound />} />
+              </Routes></Suspense>
+              )}
+            </ErrorBoundary>
+          </div>
+        </main>
+
+        <ShellOverlays />
+        <ShellKeys />
+        <Suspense fallback={null}><LazyShellSignals /></Suspense>
+        <LeaveBlocker />
+      </div>
+    )
+  }
+
+  function ShellOverlays() {
+    const open = useShellOverlay()
+    const [everOpened, setEverOpened] = useState(false)
+    useEffect(() => {
+      if (open) setEverOpened(true)
+    }, [open])
+    if (!open && !everOpened) return null
+    return (
+      <Suspense fallback={null}>
+        <LazyShellOverlays />
+      </Suspense>
+    )
+  }
+
+  /** 首页：使用者（开了登录的 user 角色）落到应用首页，其余落到问数据 */
+  function HomeRedirect() {
+    const me = useAuth((s) => s.me)
+    return <Navigate to={loginOn(me) && !atLeast(me, 'builder') ? '/apps' : '/chat'} replace />
+  }
+
+  /** 使用者到了看不到的页面：送回应用首页。搭建者以上、关登录时不管 */
+  function useRoleRedirect(): string | null {
+    const me = useAuth((s) => s.me)
+    const { pathname } = useLocation()
+    if (!loginOn(me) || atLeast(me, 'builder') || pathname === '/') return null
+    // 个人蓝图（docs/design/normal-user-apps.md N7）：管理员开了个人应用时，使用者能进自己的蓝图页。它不是导航页，不在页面目录里
+    if (personalAppsOn(me) && pathname.startsWith('/blueprints/')) return null
+    const ok = visiblePages(me).some((p) => pathname === p.to || pathname.startsWith(`${p.to}/`))
+    return ok ? null : '/apps'
+  }
+
+  // -------------------------------------------------------------------------
+  // 全局快捷键
+  // -------------------------------------------------------------------------
+
+  /**
+   * 离开前确认的那一个 blocker（lib/leave）：导航、链接、⌘K、⌥ 数字、浏览器后退，
+   * 换页都先经过页面登记的守卫。单独成一个组件，blocker 变了只重绘它
+   */
+  function LeaveBlocker() {
+    useLeaveBlocker()
+    return null
+  }
+
+  /** 启动页上不挂：那时按下的 ⌘K 会在加载完之后才突然弹出面板 */
+  function ShellKeys() {
+    const navigate = useNavigate()
+    const navRef = useRef(navigate)
+    navRef.current = navigate
+
+    useEffect(() => {
+      // 捕获阶段注册：比各页面自己挂在 window 上的监听先到，? 只弹一层
+      const onKey = (e: KeyboardEvent) => {
+        if (e.defaultPrevented || isComposing(e)) return
+        // 别的弹窗开着时键盘归它：在弹窗上再叠一层命令面板，Esc 该关谁就乱了
+        const modal = document.querySelector('[aria-modal="true"]:not([data-command-palette])')
+        if (matchShortcut(e, 'Mod+K')) {
+          if (modal) return
+          e.preventDefault()
+          // 按住不放会连发：面板开了又关、关了又开
+          if (!e.repeat) toggleCommandPalette()
+          return
+        }
+        // 其余的都让给打字：输入框里的 ? 是问号，⌥1 在 Mac 上是「¡」
+        if (modal || document.querySelector('[data-command-palette]') || isTypingTarget(e.target)) return
+        if (matchShortcut(e, '?')) {
+          e.preventDefault()
+          e.stopPropagation()
+          openShortcutHelp()
+          return
+        }
+        const page = visiblePages(useAuth.getState().me).find((p) => matchShortcut(e, p.shortcut))
+        if (page) {
+          e.preventDefault()
+          // 有没保存的改动时由 LeaveBlocker 先问，这里照常跳
+          navRef.current(page.to)
+        }
       }
-    }
-    return gen ? 'gen' : ''
-  })
-}
+      window.addEventListener('keydown', onKey, true)
+      return () => window.removeEventListener('keydown', onKey, true)
+    }, [])
+    return null
+  }
 
-function Nav({ stalled }: { stalled: CatalogCheck[] }) {
-  const studio = useStudioActivity()
-  const chat = useChatActivity()
-  const live = studio.startsWith('run') || chat === 'run'
+  // -------------------------------------------------------------------------
+  // 导航
+  // -------------------------------------------------------------------------
 
-  const pages = usePages()
-  // 11 项导航在中等高度用 36px，在 ≤520px 用 28px；最矮档图标和文字紧排，logo 同步收紧。
-  // 保留所有入口，且不在 nav 上加 overflow，以免裁掉侧向提示和遥测浮层。
-  // 增加入口后检查 700、600、520、480px：遥测和底部 padding 都必须留在视口内。
-  return (
-    <nav aria-label="主导航" className="relative z-30 flex w-16 shrink-0 flex-col border-r bg-panel">
+  /** 悬停提示：挂在导航右侧，读屏不念（导航项自己有文字，提示只是补充） */
+  function Tip({ children, badge = false }: { children: ReactNode; badge?: boolean }) {
+    return (
+      <span
+        aria-hidden
+        className={clsx(
+          'pointer-events-none invisible absolute left-full top-1/2 z-40 ml-2.5 flex -translate-y-1/2 items-center gap-2',
+          'whitespace-nowrap rounded-md border bg-elev px-2 py-1 text-xs font-normal text-fg opacity-0 shadow-elev-2',
+          'transition-opacity duration-150',
+          badge
+            ? 'group-hover/badge:visible group-hover/badge:opacity-100 group-focus-visible/badge:visible group-focus-visible/badge:opacity-100'
+            : 'group-hover:visible group-hover:opacity-100 group-hover:delay-300 group-focus-visible:visible group-focus-visible:opacity-100',
+        )}
+      >
+        {children}
+      </span>
+    )
+  }
+
+  /** 有没有运行在跑：品牌标的起点节点亮起、标题加前缀都看它 */
+  function useStudioActivity(useStudio: typeof UseStudioHook): string {
+    return useStudio((s) => {
+      if (s.runPhase === 'running' || s.runPhase === 'queued') {
+        const total = s.trace.nodesTotal ?? s.nodes.length
+        let done = 0
+        for (const n of Object.values(s.trace.nodes)) if (n.state === 'done' || n.state === 'skipped') done++
+        return total ? `run:${Math.min(done, total)}/${total}` : 'run'
+      }
+      return s.copilot.active ? 'gen' : ''
+    })
+  }
+
+  function useChatActivity(useChat: typeof UseChatHook): '' | 'run' | 'gen' {
+    return useChat((s) => {
+      let gen = false
+      for (const turns of Object.values(s.byConversation)) {
+        for (const t of turns) {
+          if (t.phase === 'running') return 'run'
+          if (t.phase === 'planning' || t.phase === 'building') gen = true
+        }
+      }
+      return gen ? 'gen' : ''
+    })
+  }
+
+  function BrandLink({ live }: { live: boolean }) {
+    return (
       <Link
         to="/"
         aria-label={live ? 'AgentLab 首页（有运行正在进行）' : 'AgentLab 首页'}
@@ -403,926 +499,945 @@ function Nav({ stalled }: { stalled: CatalogCheck[] }) {
           <span className="text-faint">受限动态编排{live ? ' · 有运行正在进行' : ''}</span>
         </Tip>
       </Link>
-      <div aria-hidden className="mx-4 mb-2 h-px shrink-0 bg-hairline [@media(max-height:760px)]:mb-1" />
+    )
+  }
 
-      <ul className="flex flex-col gap-0.5">
-        {pages.map((p) => (
-          <li key={p.to} className="relative px-1">
-            <NavLink
-              to={p.to}
-              aria-keyshortcuts={ariaShortcut(p.shortcut)}
-              className={({ isActive }) => clsx(
-                'group relative flex h-12 w-full flex-col items-center justify-center gap-1 rounded-md text-2xs leading-none outline-none',
-                // 两档媒体条件互斥，避免 Tailwind 排序让中等高度规则覆盖最矮档。
-                '[@media(min-height:521px)_and_(max-height:760px)]:h-9 [@media(max-height:520px)]:h-7 [@media(max-height:520px)]:gap-0',
-                'transition-colors focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
-                isActive ? 'bg-hover font-medium text-fg' : 'text-dim hover:bg-hover hover:text-fg',
-              )}
-            >
-              {({ isActive }) => (
-                <>
-                  {/* 选中态三条通道：左缘竖条、图标变强调色、底色——只靠淡灰底根本认不出在哪一页 */}
-                  {isActive && <span aria-hidden className="absolute -left-1 bottom-2 top-2 w-0.5 rounded-r bg-accent" />}
-                  <p.icon size={17} strokeWidth={isActive ? 2 : 1.75} className={isActive ? 'text-accent' : undefined} />
-                  <span>{p.label}</span>
-                  <Tip>
-                    <span className="font-medium">{p.label}</span>
-                    <span className="text-faint">{p.hint}</span>
-                    <Kbd combo={p.shortcut} />
-                  </Tip>
-                </>
-              )}
-            </NavLink>
-            {p.to === '/runs' && <ApprovalBadge />}
-            {p.to === '/apps' && <AppsBadge />}
+  function Nav({ stalled }: { stalled: CatalogCheck[] }) {
+    const pages = usePages()
+    // 11 项导航在中等高度用 36px，在 ≤520px 用 28px；最矮档图标和文字紧排，logo 同步收紧。
+    // 保留所有入口，且不在 nav 上加 overflow，以免裁掉侧向提示和遥测浮层。
+    // 增加入口后检查 700、600、520、480px：遥测和底部 padding 都必须留在视口内。
+    return (
+      <nav aria-label="主导航" className="relative z-30 flex w-16 shrink-0 flex-col border-r bg-panel">
+        <Suspense fallback={<BrandLink live={false} />}>
+          <LazyBrandLink />
+        </Suspense>
+        <div aria-hidden className="mx-4 mb-2 h-px shrink-0 bg-hairline [@media(max-height:760px)]:mb-1" />
+
+        <ul className="flex flex-col gap-0.5">
+          {pages.map((p) => (
+            <li key={p.to} className="relative px-1">
+              <NavLink
+                to={p.to}
+                aria-keyshortcuts={ariaShortcut(p.shortcut)}
+                className={({ isActive }) => clsx(
+                  'group relative flex h-12 w-full flex-col items-center justify-center gap-1 rounded-md text-2xs leading-none outline-none',
+                  // 两档媒体条件互斥，避免 Tailwind 排序让中等高度规则覆盖最矮档。
+                  '[@media(min-height:521px)_and_(max-height:760px)]:h-9 [@media(max-height:520px)]:h-7 [@media(max-height:520px)]:gap-0',
+                  'transition-colors focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
+                  isActive ? 'bg-hover font-medium text-fg' : 'text-dim hover:bg-hover hover:text-fg',
+                )}
+              >
+                {({ isActive }) => (
+                  <>
+                    {/* 选中态三条通道：左缘竖条、图标变强调色、底色——只靠淡灰底根本认不出在哪一页 */}
+                    {isActive && <span aria-hidden className="absolute -left-1 bottom-2 top-2 w-0.5 rounded-r bg-accent" />}
+                    <p.icon size={17} strokeWidth={isActive ? 2 : 1.75} className={isActive ? 'text-accent' : undefined} />
+                    <span>{p.label}</span>
+                    <Tip>
+                      <span className="font-medium">{p.label}</span>
+                      <span className="text-faint">{p.hint}</span>
+                      <Kbd combo={p.shortcut} />
+                    </Tip>
+                  </>
+                )}
+              </NavLink>
+              {p.to === '/runs' && <ApprovalBadge />}
+              {p.to === '/apps' && <AppsBadge />}
+            </li>
+          ))}
+        </ul>
+
+        <div className="mt-auto flex flex-col items-center gap-1.5 pb-2 pt-3 [@media(max-height:760px)]:gap-1 [@media(max-height:760px)]:pb-1 [@media(max-height:760px)]:pt-2">
+          <div className="flex items-center gap-0.5">
+            <NotifyToggle />
+            <ThemeToggle />
+          </div>
+          {/* 开了登录：账户（显示名、角色、退出），没有署名框——签批记的是登录身份 */}
+          <AccountOrActor />
+          <div aria-hidden className="h-px w-8 bg-hairline" />
+          <Telemetry stalled={stalled} />
+        </div>
+      </nav>
+    )
+  }
+
+  /** 导航项右上角的徽标：图标右上角外侧，外圈一道面板底色的描边把它从图标上抠开 */
+  const BADGE_CLASS = clsx(
+    'group/badge absolute left-[calc(50%+7px)] top-[3px] z-10 flex h-4 min-w-4 items-center justify-center rounded-full px-1',
+    '[@media(max-height:760px)]:top-0',
+    'bg-warn-solid text-[10px] font-semibold leading-none text-on-warn tnum ring-2 ring-[var(--bg-panel)]',
+    'outline-none focus-visible:ring-[var(--accent)]',
+  )
+
+  /**
+   * 待审批徽标（「记录」上）。
+   *
+   * 它是一个单独的链接（直达记录页的待审批页签），不是「记录」的一部分：导航
+   * 项本身永远进 /runs，否则同一个入口时而进列表、时而进某条详情，人就摸不准
+   * 点下去会到哪。浅色下用 warn-solid 配 on-warn，不再是黑字压在深琥珀上糊成一团。
+   *
+   * 徽标按来源分开、不重复计数：这里只数不属于应用的运行的待办（画布、定时任务的审批），应用里的数在「应用」上。
+   * 老服务端没有待办数时按待审批数。「最久已等待」按待审批列表算，所以只在应用里没有待办时写
+   */
+  function ApprovalBadge() {
+    const approvals = useCatalog((s) => s.approvals)
+    const counts = useCatalog((s) => s.taskCounts)
+    const pending = approvals.filter((a) => a.status === 'pending')
+    const count = counts ? counts.other : pending.length
+    if (!count) return null
+    const oldest = pending.length && (!counts || !counts.apps)
+      ? pending.reduce((a, b) => ((a.created_at ?? '') <= (b.created_at ?? '') ? a : b)) : null
+    const waited = oldest ? waitedFor(oldest.created_at) : null
+    const text = `${count} 项待审批${waited ? `，最久已等待 ${waited}` : ''}`
+    return (
+      <Link to="/runs?tab=approvals" aria-label={`${text}。打开待审批`} data-approval-badge="" className={BADGE_CLASS}>
+        {count > 99 ? '99+' : count}
+        <Tip badge>
+          <span className="font-medium">{text}</span>
+          <span className="text-faint">点击处理</span>
+        </Tip>
+      </Link>
+    )
+  }
+
+  /** 应用里派给我的待办（「应用」上）：直达应用首页的待办页签 */
+  function AppsBadge() {
+    const count = useCatalog((s) => s.taskCounts?.apps ?? 0)
+    if (!count) return null
+    const text = APP_TEXT.navBadge(count)
+    return (
+      <Link to="/apps?tab=inbox" aria-label={`${text}。${APP_TEXT.navBadgeOpen}`} data-apps-badge="" className={BADGE_CLASS}>
+        {count > 99 ? '99+' : count}
+        <Tip badge>
+          <span className="font-medium">{text}</span>
+          <span className="text-faint">{APP_TEXT.navBadgeOpen}</span>
+        </Tip>
+      </Link>
+    )
+  }
+
+  function NotifyToggle() {
+    const notify = useSignals((s) => s.notify)
+    const permission = useSignals((s) => s.permission)
+    if (!notifySupported()) return null
+    const Icon = notify ? Bell : BellOff
+    const tip = notify
+      ? '后台提醒：已开启 · 运行结束、失败或有新的待审批、待办时发送系统通知'
+      : permission === 'denied'
+        ? '后台提醒：浏览器已拒绝通知权限，请在站点设置中允许'
+        : '后台提醒：已关闭 · 开启时浏览器将请求通知权限'
+    return (
+      <button
+        type="button"
+        aria-label="后台提醒"
+        aria-pressed={notify}
+        onClick={() => void toggleNotify()}
+        className={clsx(
+          'group relative flex h-8 w-7 items-center justify-center rounded-md outline-none hover:bg-hover [@media(max-height:660px)]:h-7',
+          'focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
+          notify ? 'text-accent' : 'text-faint hover:text-fg',
+        )}
+      >
+        <Icon size={15} aria-hidden />
+        <Tip>{tip}</Tip>
+      </button>
+    )
+  }
+
+  function ThemeToggle() {
+    const { pref, resolved } = useTheme()
+    const now = resolved === 'dark' ? '深色' : '浅色'
+    const next = resolved === 'dark' ? '浅色' : '深色'
+    const Icon = resolved === 'dark' ? Moon : Sun
+    return (
+      <button
+        type="button"
+        aria-label={`切换到${next}主题`}
+        onClick={toggleTheme}
+        className="group relative flex h-8 w-7 items-center justify-center rounded-md text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-[var(--accent)] [@media(max-height:660px)]:h-7"
+      >
+        <Icon size={15} aria-hidden />
+        <Tip>
+          切换到{next}主题
+          <span className="text-faint">当前{pref === 'system' ? `跟随系统（${now}）` : now}</span>
+        </Tip>
+      </button>
+    )
+  }
+
+  /** 关登录：本机署名；开登录：账户 */
+  function AccountOrActor() {
+    const on = useAuth((s) => loginOn(s.me))
+    return on ? <AccountButton /> : <ActorButton />
+  }
+
+  /**
+   * 账户（开了登录时）：首字圆钮，点开是显示名、用户名、角色、登录方式和「退出登录」。没有署名框：发布、审批、发起都记
+   * 登录的用户名。退出后整页回到登录页，各个 store 里上一个人的数据一并丢掉
+   */
+  function AccountButton() {
+    const me = useAuth((s) => s.me)
+    const [open, setOpen] = useState(false)
+    const [busy, setBusy] = useState(false)
+    const btnRef = useRef<HTMLButtonElement>(null)
+    const panelRef = useRef<HTMLDivElement>(null)
+    useEffect(() => {
+      if (!open) return
+      panelRef.current?.focus()
+      const onDown = (e: MouseEvent) => {
+        const t = e.target as Node
+        if (!panelRef.current?.contains(t) && !btnRef.current?.contains(t)) setOpen(false)
+      }
+      window.addEventListener('mousedown', onDown)
+      return () => window.removeEventListener('mousedown', onDown)
+    }, [open])
+    if (!me) return null
+    const name = principalName(me)
+    const initial = Array.from(me.display_name || me.username || '?')[0].toUpperCase()
+    const logout = async () => {
+      setBusy(true)
+      try {
+        await useAuth.getState().logout()
+        window.location.assign('/login')
+      } catch (e) {
+        toast.error(e)
+        setBusy(false)
+      }
+    }
+    return (
+      <div className="relative">
+        <button ref={btnRef} type="button" aria-label={`${AUTH_TEXT.signedInAs(name)}。${AUTH_TEXT.accountTip}`}
+                aria-expanded={open} aria-haspopup="dialog" data-account={me.role} onClick={() => setOpen((o) => !o)}
+                className="group relative flex h-7 w-7 items-center justify-center rounded-full border bg-elev text-xs font-semibold text-fg outline-none hover:border-[var(--border-strong)] hover:bg-hover focus-visible:ring-2 focus-visible:ring-[var(--accent)]">
+          {initial}
+          {!open && <Tip>{AUTH_TEXT.signedInAs(name)}<span className="text-faint">{ROLE_LABEL[me.role]}</span></Tip>}
+        </button>
+        {open && (
+          <div ref={panelRef} role="dialog" aria-label={AUTH_TEXT.account} tabIndex={-1} data-account-menu=""
+               onKeyDown={(e) => { if (e.key === 'Escape' && !isComposing(e)) { e.stopPropagation(); setOpen(false); btnRef.current?.focus() } }}
+               className="fade-up absolute bottom-0 left-full z-40 ml-2.5 w-60 rounded-lg border bg-panel text-xs shadow-elev-3 outline-none">
+            <div className="border-b px-3 py-2.5">
+              <div className="truncate font-semibold text-fg" title={name}>{me.display_name || me.username}</div>
+              {me.display_name && me.username && <div className="mono truncate text-2xs text-faint">{me.username}</div>}
+            </div>
+            <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 px-3 py-2 text-2xs">
+              <dt className="text-faint">{AUTH_TEXT.roleLabel}</dt><dd className="text-dim" data-account-role={me.role}>{ROLE_LABEL[me.role]}</dd>
+              <dt className="text-faint">{AUTH_TEXT.modeLabel}</dt><dd className="text-dim">{AUTH_MODE_LABEL[me.mode]}</dd>
+              {me.groups.length > 0 && <><dt className="text-faint">{AUTH_TEXT.groupsLabel}</dt><dd className="text-dim">{me.groups.join('、')}</dd></>}
+            </dl>
+            <div className="flex border-t px-3 py-2">
+              <button type="button" className="btn btn-sm w-full justify-center" disabled={busy} data-logout=""
+                      onClick={() => void logout()}>
+                {busy ? <Spinner size={12} /> : <LogOut size={12} aria-hidden />} {AUTH_TEXT.logout}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  /** 操作者署名的首字：发布、审批、正式运行都记在这个名下，得一直看得见是谁 */
+  function ActorButton() {
+    const actor = useLocalActor()
+    // 兜底：绕开 setLocalActor 直接写 localStorage 的地方不会通知，导航重绘时也重读一次
+    useLocation()
+    const initial = actor ? Array.from(actor)[0].toUpperCase() : ''
+    return (
+      <Link
+        to="/settings/prefs"
+        aria-label={actor ? `署名：${actor}。前往设置修改` : '尚未署名。前往设置填写'}
+        className={clsx(
+          'group relative flex h-7 w-7 items-center justify-center rounded-full border text-xs font-semibold outline-none',
+          'hover:border-[var(--border-strong)] hover:bg-hover focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
+          actor ? 'bg-elev text-fg' : 'border-dashed text-faint',
+        )}
+      >
+        {initial || <UserRound size={13} aria-hidden />}
+        <Tip>
+          {actor ? <span>署名 <span className="font-medium">{actor}</span></span> : <span>未署名</span>}
+          <span className="text-faint">发布、审批和正式运行以此署名记录 · 点击修改</span>
+        </Tip>
+      </Link>
+    )
+  }
+
+  /** 延迟超过这个数就算慢：本机和内网通常是几十毫秒 */
+  const SLOW_MS = 1500
+
+  interface Tone { color: string; text: string; label: string; word: string }
+
+  /**
+   * 五档：离线（红）、加载中（琥珀：连得上，但请求卡着没回来）、降级（琥珀：连得上，
+   * 但有几张表报错）、偏慢（琥珀）、在线（绿）。加载中和降级单列出来：那几张表对应
+   * 的下拉和列表是空的，不说就像"没有"
+   */
+  function backendTone(backend: string, latency: number | null, failing: number, stalled: number): Tone {
+    if (backend === 'down') return { color: 'var(--st-failed)', text: '离线', label: '服务端未连接', word: '未连接' }
+    if (backend === 'checking') return { color: 'var(--text-faint)', text: '检测中', label: '正在检测服务端', word: '检测中' }
+    if (stalled > 0) {
+      return { color: 'var(--st-waiting)', text: '加载中', label: `服务端在线，但仍有 ${stalled} 项未加载完成`, word: '加载中' }
+    }
+    if (failing > 0) {
+      return { color: 'var(--st-waiting)', text: '降级', label: `服务端在线，但有 ${failing} 项加载失败`, word: '降级' }
+    }
+    if (latency != null && latency >= SLOW_MS) {
+      return { color: 'var(--st-waiting)', text: `${latency}ms`, label: `服务端响应慢，延迟 ${latency} 毫秒`, word: '偏慢' }
+    }
+    return {
+      color: 'var(--st-done)',
+      text: latency != null ? `${latency}ms` : '在线',
+      label: latency != null ? `服务端在线，延迟 ${latency} 毫秒` : '服务端在线',
+      word: '在线',
+    }
+  }
+
+  const useFailingChecks = () => useCatalog((s) => s.checks.filter((c) => c.state === 'error').length)
+
+  const NO_CHECKS: CatalogCheck[] = []
+
+  /** 请求发出去这么久还没回来，就不算「还在加载」，算卡住了 */
+  const STALL_MS = 3000
+
+  /**
+   * 卡着没回来的 catalog 请求（后端没断时）。
+   *
+   * refresh 按表各自请求、先回先填，每个请求最多等 CATALOG_TIMEOUT_MS。一张表卡住
+   * （后端连得上、就是不回）只拖它自己：卡着的这段时间遥测点是「加载中」，到点那一项
+   * 记成出错，遥测点转成「降级」。正常刷新几十毫秒就回，不到 STALL_MS 不算，免得
+   * 每次刷新遥测点都闪一下琥珀。
+   */
+  function useStalledChecks(): CatalogCheck[] {
+    const waiting = useCatalog((s) => s.checks.some((c) => c.state === 'pending'))
+    const down = useCatalog((s) => s.backend === 'down')
+    const checks = useCatalog((s) => s.checks)
+    const [stalled, setStalled] = useState(false)
+    useEffect(() => {
+      if (!waiting) {
+        // 头一回取目录有了着落（取回来了或出错了）：之后的刷新都从发出请求算
+        if (checks.length) bootLoad = false
+        return
+      }
+      // 启动时先认人（最多等 AUTH_WAIT_MS）再取目录：头一回加载从启动算起，认人等掉的那段也算——人已经在启动页上
+      // 等了那么久，进来以后不能还说「在线」
+      const wait = bootLoad ? Math.max(0, STALL_MS - (performance.now() - BOOT_AT)) : STALL_MS
+      const t = setTimeout(() => setStalled(true), wait)
+      return () => { clearTimeout(t); setStalled(false) }
+    }, [waiting, checks.length])
+    // 断开时归离线横幅说，这里不再叠一层
+    return stalled && waiting && !down ? checks.filter((c) => c.state === 'pending') : NO_CHECKS
+  }
+
+  /** 失败的那一项怎么说：回了错误码写码；等满 CATALOG_TIMEOUT_MS 才断的是超时；其余是够不着 */
+  function failWord(c: CatalogCheck): string {
+    if (c.status) return String(c.status)
+    return c.ms != null && c.ms >= CATALOG_TIMEOUT_MS ? '超时' : '连接失败'
+  }
+
+  /**
+   * 眼下是空的、却不能当「没有」的那几张表：从没取回来过（catalogListState 不是 ok），
+   * 请求又卡着（超过 STALL_MS）或者已经失败了（回了错误码、超时）。人眼前是「还没有
+   * 工作流」和一个「新建」按钮，得当面说一句，而且一直挂着，直到那几张表取回来：
+   * 卡着的那一项到点超时，提示跟着改口说「没加载成功」，不能悄悄撤掉。
+   *
+   * 取回来过的表刷新卡住、失败了都不算：失败不清空，手上的还是真数据，遥测点说一声
+   * 就够。后端断开归离线横幅说；启动页上清单自己会说（enabled=false）。
+   */
+  function useCatalogWarning(stalled: CatalogCheck[], enabled: boolean) {
+    // 选成字符串：只在「是哪几张表」变了的时候才换提示
+    const waiting = useCatalog((s) => stalled
+      .filter((c) => catalogListState(s, c.key) === 'loading').map((c) => c.key).join(','))
+    const failed = useCatalog((s) => s.checks
+      .filter((c) => catalogListState(s, c.key) === 'error').map((c) => c.key).join(','))
+    useEffect(() => {
+      if (!enabled || (!waiting && !failed)) return
+      const { checks } = useCatalog.getState()
+      const pick = (keys: string) => keys.split(',').filter(Boolean)
+        .map((k) => checks.find((c) => c.key === k)).filter((c): c is CatalogCheck => !!c)
+      const w = pick(waiting)
+      const f = pick(failed)
+      const text = [
+        w.length ? `仍有 ${w.length} 项未加载完成（${w.map((c) => c.label).join('、')}）` : '',
+        f.length ? `${w.length ? '' : '有 '}${f.length} 项加载失败（${f.map((c) => `${c.label} ${failWord(c)}`).join('、')}）` : '',
+      ].filter(Boolean).join('，')
+      const detail = [
+        w.length ? '服务端可以连接，但这些请求已等待数秒仍未返回。' : '',
+        ...f.map((c) => `${c.label}：${c.error ?? failWord(c)}`),
+        '加载完成前，相关列表和下拉选项可能为空，不代表数据丢失。可在导航底部的连接指示灯中查看各项状态。',
+      ].filter(Boolean).join('\n')
+      // 键跟着「是哪几张表」走：同一个键的提示只会累计次数，不会换字
+      const id = toast.warn(`${text}：列表可能不完整，建议加载完成后再新建`, {
+        sticky: true,
+        key: `catalog-unknown:${waiting}|${failed}`,
+        detail,
+        action: { label: '重试', onClick: () => void useCatalog.getState().refresh() },
+      })
+      return () => toast.dismiss(id)
+    }, [enabled, waiting, failed])
+  }
+
+  /** 连接遥测点：导航最底下，像仪表盘上的指示灯。点开看地址、延迟、最近一次错误 */
+  function Telemetry({ stalled }: { stalled: CatalogCheck[] }) {
+    const backend = useCatalog((s) => s.backend)
+    const latency = useCatalog((s) => s.latencyMs)
+    const failing = useFailingChecks()
+    const [open, setOpen] = useState(false)
+    const btnRef = useRef<HTMLButtonElement>(null)
+    const tone = backendTone(backend, latency, failing, stalled.length)
+    return (
+      <div className="relative">
+        <button
+          ref={btnRef}
+          type="button"
+          aria-label={`${tone.label}。查看连接详情`}
+          aria-expanded={open}
+          aria-haspopup="dialog"
+          data-telemetry={backend}
+          data-tone={tone.word}
+          onClick={() => setOpen((o) => !o)}
+          className={clsx(
+            'group relative flex h-6 w-14 items-center justify-center gap-1.5 rounded-md text-2xs outline-none',
+            'hover:bg-hover focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
+            backend === 'down' ? 'text-[var(--st-failed)]' : 'text-faint hover:text-dim',
+          )}
+        >
+          <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: tone.color }} />
+          <span className="mono tnum">{tone.text}</span>
+          {!open && <Tip>{tone.label}<span className="text-faint">点击查看详情</span></Tip>}
+        </button>
+        {open && (
+          <TelemetryPanel
+            stalled={stalled}
+            anchor={btnRef}
+            onClose={(refocus) => { setOpen(false); if (refocus) btnRef.current?.focus() }}
+          />
+        )}
+      </div>
+    )
+  }
+
+  function TelemetryPanel({ onClose, anchor, stalled }: {
+    onClose: (refocus: boolean) => void
+    anchor: RefObject<HTMLButtonElement | null>
+    stalled: CatalogCheck[]
+  }) {
+    const backend = useCatalog((s) => s.backend)
+    const latency = useCatalog((s) => s.latencyMs)
+    const lastOkAt = useCatalog((s) => s.lastOkAt)
+    const backendError = useCatalog((s) => s.backendError)
+    const retryAt = useCatalog((s) => s.retryAt)
+    const checks = useCatalog((s) => s.checks)
+    const [busy, setBusy] = useState(false)
+    const ref = useRef<HTMLDivElement>(null)
+    const down = backend === 'down'
+    const now = useTicker(1000, down)
+    const tone = backendTone(backend, latency, useFailingChecks(), stalled.length)
+    // 卡着的里头有没有从没取回来过的：有的话那张表眼下是空的，才要劝一句别急着新建
+    const unknown = useCatalog((s) => stalled.some((c) => catalogListState(s, c.key) !== 'ok'))
+
+    const onCloseRef = useRef(onClose)
+    onCloseRef.current = onClose
+    useEffect(() => { ref.current?.focus() }, [])
+    useEffect(() => {
+      const onDown = (e: MouseEvent) => {
+        const t = e.target as Node
+        if (!ref.current?.contains(t) && !anchor.current?.contains(t)) onCloseRef.current(false)
+      }
+      window.addEventListener('mousedown', onDown)
+      return () => window.removeEventListener('mousedown', onDown)
+    }, [anchor])
+
+    const secs = down && retryAt ? Math.max(0, Math.ceil((retryAt - now) / 1000)) : null
+    const retry = async () => {
+      if (busy) return
+      setBusy(true)
+      try {
+        const ok = await useCatalog.getState().checkBackend()
+        if (ok && !down) await useCatalog.getState().refresh()
+      } finally {
+        setBusy(false)
+      }
+    }
+
+    return (
+      <div
+        ref={ref}
+        role="dialog"
+        aria-label="服务端连接"
+        tabIndex={-1}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape' && !isComposing(e)) {
+            e.stopPropagation()
+            onClose(true)
+          }
+        }}
+        className="fade-up absolute bottom-0 left-full z-40 ml-2.5 w-80 rounded-lg border bg-panel text-xs shadow-elev-3 outline-none"
+      >
+        <div className="flex items-center justify-between border-b px-3 py-2">
+          <span className="font-semibold text-fg">服务端连接</span>
+          <span className="flex items-center gap-1.5" style={{ color: tone.color }}>
+            <span aria-hidden className="h-1.5 w-1.5 rounded-full" style={{ background: tone.color }} />
+            {tone.word}
+          </span>
+        </div>
+        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 px-3 py-2.5">
+          <dt className="text-faint">地址</dt>
+          <dd className="mono truncate text-dim" title={`${window.location.origin}/api`}>{window.location.origin}/api</dd>
+          <dt className="text-faint">延迟</dt>
+          <dd className="mono tnum text-dim">{latency != null ? `${latency} ms` : '—'}</dd>
+          <dt className="text-faint">最后连通</dt>
+          <dd className="text-dim" title={lastOkAt ? formatDateTime(lastOkAt) : undefined}>
+            {lastOkAt ? formatRelative(lastOkAt) : '—'}
+          </dd>
+          {secs != null && (
+            <>
+              <dt className="text-faint">自动重试</dt>
+              <dd className="tnum text-dim">{secs} 秒后</dd>
+            </>
+          )}
+        </dl>
+        {backendError && (
+          <div className="mx-3 mb-2.5 rounded-md border px-2 py-1.5 text-2xs leading-relaxed"
+               style={{ borderColor: 'color-mix(in srgb, var(--err) 35%, var(--border))', background: 'var(--st-failed-soft)' }}>
+            <div className="text-[var(--st-failed)]">最近一次错误</div>
+            <div className="mono mt-0.5 break-all text-dim">{backendError}</div>
+          </div>
+        )}
+        {stalled.length > 0 && (
+          <div className="mx-3 mb-2.5 rounded-md border px-2 py-1.5 text-2xs leading-relaxed"
+               style={{ borderColor: 'color-mix(in srgb, var(--warn) 35%, var(--border))', background: 'var(--st-waiting-soft)' }}>
+            <div className="text-[var(--st-waiting)]">{stalled.map((c) => c.label).join('、')}尚未返回</div>
+            <div className="mt-0.5 text-dim">
+              {unknown
+                ? '加载完成前各页面的列表可能不完整，不代表数据丢失，建议暂缓新建。'
+                : '页面显示的是上次加载的列表，加载完成后将自动更新。'}
+            </div>
+          </div>
+        )}
+        {checks.length > 0 && (
+          <div className="border-t px-3 py-2">
+            <div className="mb-1 text-2xs text-faint">最近一次全量加载</div>
+            <CheckList checks={checks} />
+          </div>
+        )}
+        <div className="flex justify-end border-t px-3 py-2">
+          {/* 忙着时用 aria-disabled 而不是 disabled：按钮一 disabled 焦点就掉到 body，
+              Esc 到不了浮层，键盘用户关不掉它 */}
+          <button type="button" className="btn btn-sm aria-disabled:cursor-not-allowed aria-disabled:opacity-45"
+                  aria-disabled={busy || undefined} onClick={() => void retry()}>
+            {busy ? <Spinner size={12} /> : <RotateCw size={12} aria-hidden />} {down ? '立即重试' : '重新检测'}
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  /** catalog.refresh 的逐项结果：每一行都是一个真实请求，✓ 带耗时，✕ 带状态码 */
+  function CheckList({ checks, lead }: { checks: CatalogCheck[]; lead?: ReactNode }) {
+    return (
+      <ul className="flex flex-col">
+        {lead}
+        {checks.map((c) => (
+          <li key={c.key} className="flex h-6 items-center gap-2 text-xs" data-check={c.key} data-state={c.state}>
+            <CheckGlyph state={c.state} />
+            <span className={c.state === 'error' ? 'text-fg' : 'text-dim'}>{c.label}</span>
+            <span className="mono ml-auto tnum text-2xs" style={{ color: c.state === 'error' ? 'var(--st-failed)' : 'var(--text-faint)' }}
+                  title={c.error}>
+              {/* 勾叉是装饰图形，读屏靠这一个词分辨成败 */}
+              <span className="sr-only">{c.state === 'pending' ? '等待中' : c.state === 'ok' ? '已加载 ' : '失败 '}</span>
+              {c.state === 'pending'
+                ? <span aria-hidden>…</span>
+                : c.state === 'ok' ? `${c.ms ?? '—'} ms` : failWord(c)}
+            </span>
           </li>
         ))}
       </ul>
-
-      <div className="mt-auto flex flex-col items-center gap-1.5 pb-2 pt-3 [@media(max-height:760px)]:gap-1 [@media(max-height:760px)]:pb-1 [@media(max-height:760px)]:pt-2">
-        <div className="flex items-center gap-0.5">
-          <NotifyToggle />
-          <ThemeToggle />
-        </div>
-        {/* 开了登录：账户（显示名、角色、退出），没有署名框——签批记的是登录身份 */}
-        <AccountOrActor />
-        <div aria-hidden className="h-px w-8 bg-hairline" />
-        <Telemetry stalled={stalled} />
-      </div>
-    </nav>
-  )
-}
-
-/** 导航项右上角的徽标：图标右上角外侧，外圈一道面板底色的描边把它从图标上抠开 */
-const BADGE_CLASS = clsx(
-  'group/badge absolute left-[calc(50%+7px)] top-[3px] z-10 flex h-4 min-w-4 items-center justify-center rounded-full px-1',
-  '[@media(max-height:760px)]:top-0',
-  'bg-warn-solid text-[10px] font-semibold leading-none text-on-warn tnum ring-2 ring-[var(--bg-panel)]',
-  'outline-none focus-visible:ring-[var(--accent)]',
-)
-
-/**
- * 待审批徽标（「记录」上）。
- *
- * 它是一个单独的链接（直达记录页的待审批页签），不是「记录」的一部分：导航
- * 项本身永远进 /runs，否则同一个入口时而进列表、时而进某条详情，人就摸不准
- * 点下去会到哪。浅色下用 warn-solid 配 on-warn，不再是黑字压在深琥珀上糊成一团。
- *
- * 徽标按来源分开、不重复计数：这里只数不属于应用的运行的待办（画布、定时任务的审批），应用里的数在「应用」上。
- * 老服务端没有待办数时按待审批数。「最久已等待」按待审批列表算，所以只在应用里没有待办时写
- */
-function ApprovalBadge() {
-  const approvals = useCatalog((s) => s.approvals)
-  const counts = useCatalog((s) => s.taskCounts)
-  const pending = approvals.filter((a) => a.status === 'pending')
-  const count = counts ? counts.other : pending.length
-  if (!count) return null
-  const oldest = pending.length && (!counts || !counts.apps)
-    ? pending.reduce((a, b) => ((a.created_at ?? '') <= (b.created_at ?? '') ? a : b)) : null
-  const waited = oldest ? waitedFor(oldest.created_at) : null
-  const text = `${count} 项待审批${waited ? `，最久已等待 ${waited}` : ''}`
-  return (
-    <Link to="/runs?tab=approvals" aria-label={`${text}。打开待审批`} data-approval-badge="" className={BADGE_CLASS}>
-      {count > 99 ? '99+' : count}
-      <Tip badge>
-        <span className="font-medium">{text}</span>
-        <span className="text-faint">点击处理</span>
-      </Tip>
-    </Link>
-  )
-}
-
-/** 应用里派给我的待办（「应用」上）：直达应用首页的待办页签 */
-function AppsBadge() {
-  const count = useCatalog((s) => s.taskCounts?.apps ?? 0)
-  if (!count) return null
-  const text = APP_TEXT.navBadge(count)
-  return (
-    <Link to="/apps?tab=inbox" aria-label={`${text}。${APP_TEXT.navBadgeOpen}`} data-apps-badge="" className={BADGE_CLASS}>
-      {count > 99 ? '99+' : count}
-      <Tip badge>
-        <span className="font-medium">{text}</span>
-        <span className="text-faint">{APP_TEXT.navBadgeOpen}</span>
-      </Tip>
-    </Link>
-  )
-}
-
-function NotifyToggle() {
-  const notify = useSignals((s) => s.notify)
-  const permission = useSignals((s) => s.permission)
-  if (!notifySupported()) return null
-  const Icon = notify ? Bell : BellOff
-  const tip = notify
-    ? '后台提醒：已开启 · 运行结束、失败或有新的待审批、待办时发送系统通知'
-    : permission === 'denied'
-      ? '后台提醒：浏览器已拒绝通知权限，请在站点设置中允许'
-      : '后台提醒：已关闭 · 开启时浏览器将请求通知权限'
-  return (
-    <button
-      type="button"
-      aria-label="后台提醒"
-      aria-pressed={notify}
-      onClick={() => void toggleNotify()}
-      className={clsx(
-        'group relative flex h-8 w-7 items-center justify-center rounded-md outline-none hover:bg-hover [@media(max-height:660px)]:h-7',
-        'focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
-        notify ? 'text-accent' : 'text-faint hover:text-fg',
-      )}
-    >
-      <Icon size={15} aria-hidden />
-      <Tip>{tip}</Tip>
-    </button>
-  )
-}
-
-function ThemeToggle() {
-  const { pref, resolved } = useTheme()
-  const now = resolved === 'dark' ? '深色' : '浅色'
-  const next = resolved === 'dark' ? '浅色' : '深色'
-  const Icon = resolved === 'dark' ? Moon : Sun
-  return (
-    <button
-      type="button"
-      aria-label={`切换到${next}主题`}
-      onClick={toggleTheme}
-      className="group relative flex h-8 w-7 items-center justify-center rounded-md text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-[var(--accent)] [@media(max-height:660px)]:h-7"
-    >
-      <Icon size={15} aria-hidden />
-      <Tip>
-        切换到{next}主题
-        <span className="text-faint">当前{pref === 'system' ? `跟随系统（${now}）` : now}</span>
-      </Tip>
-    </button>
-  )
-}
-
-/** 关登录：本机署名；开登录：账户 */
-function AccountOrActor() {
-  const on = useAuth((s) => loginOn(s.me))
-  return on ? <AccountButton /> : <ActorButton />
-}
-
-/**
- * 账户（开了登录时）：首字圆钮，点开是显示名、用户名、角色、登录方式和「退出登录」。没有署名框：发布、审批、发起都记
- * 登录的用户名。退出后整页回到登录页，各个 store 里上一个人的数据一并丢掉
- */
-function AccountButton() {
-  const me = useAuth((s) => s.me)
-  const [open, setOpen] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const btnRef = useRef<HTMLButtonElement>(null)
-  const panelRef = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    if (!open) return
-    panelRef.current?.focus()
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node
-      if (!panelRef.current?.contains(t) && !btnRef.current?.contains(t)) setOpen(false)
-    }
-    window.addEventListener('mousedown', onDown)
-    return () => window.removeEventListener('mousedown', onDown)
-  }, [open])
-  if (!me) return null
-  const name = principalName(me)
-  const initial = Array.from(me.display_name || me.username || '?')[0].toUpperCase()
-  const logout = async () => {
-    setBusy(true)
-    try {
-      await useAuth.getState().logout()
-      window.location.assign('/login')
-    } catch (e) {
-      toast.error(e)
-      setBusy(false)
-    }
-  }
-  return (
-    <div className="relative">
-      <button ref={btnRef} type="button" aria-label={`${AUTH_TEXT.signedInAs(name)}。${AUTH_TEXT.accountTip}`}
-              aria-expanded={open} aria-haspopup="dialog" data-account={me.role} onClick={() => setOpen((o) => !o)}
-              className="group relative flex h-7 w-7 items-center justify-center rounded-full border bg-elev text-xs font-semibold text-fg outline-none hover:border-[var(--border-strong)] hover:bg-hover focus-visible:ring-2 focus-visible:ring-[var(--accent)]">
-        {initial}
-        {!open && <Tip>{AUTH_TEXT.signedInAs(name)}<span className="text-faint">{ROLE_LABEL[me.role]}</span></Tip>}
-      </button>
-      {open && (
-        <div ref={panelRef} role="dialog" aria-label={AUTH_TEXT.account} tabIndex={-1} data-account-menu=""
-             onKeyDown={(e) => { if (e.key === 'Escape' && !isComposing(e)) { e.stopPropagation(); setOpen(false); btnRef.current?.focus() } }}
-             className="fade-up absolute bottom-0 left-full z-40 ml-2.5 w-60 rounded-lg border bg-panel text-xs shadow-elev-3 outline-none">
-          <div className="border-b px-3 py-2.5">
-            <div className="truncate font-semibold text-fg" title={name}>{me.display_name || me.username}</div>
-            {me.display_name && me.username && <div className="mono truncate text-2xs text-faint">{me.username}</div>}
-          </div>
-          <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 px-3 py-2 text-2xs">
-            <dt className="text-faint">{AUTH_TEXT.roleLabel}</dt><dd className="text-dim" data-account-role={me.role}>{ROLE_LABEL[me.role]}</dd>
-            <dt className="text-faint">{AUTH_TEXT.modeLabel}</dt><dd className="text-dim">{AUTH_MODE_LABEL[me.mode]}</dd>
-            {me.groups.length > 0 && <><dt className="text-faint">{AUTH_TEXT.groupsLabel}</dt><dd className="text-dim">{me.groups.join('、')}</dd></>}
-          </dl>
-          <div className="flex border-t px-3 py-2">
-            <button type="button" className="btn btn-sm w-full justify-center" disabled={busy} data-logout=""
-                    onClick={() => void logout()}>
-              {busy ? <Spinner size={12} /> : <LogOut size={12} aria-hidden />} {AUTH_TEXT.logout}
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-/** 操作者署名的首字：发布、审批、正式运行都记在这个名下，得一直看得见是谁 */
-function ActorButton() {
-  const actor = useLocalActor()
-  // 兜底：绕开 setLocalActor 直接写 localStorage 的地方不会通知，导航重绘时也重读一次
-  useLocation()
-  const initial = actor ? Array.from(actor)[0].toUpperCase() : ''
-  return (
-    <Link
-      to="/settings/prefs"
-      aria-label={actor ? `署名：${actor}。前往设置修改` : '尚未署名。前往设置填写'}
-      className={clsx(
-        'group relative flex h-7 w-7 items-center justify-center rounded-full border text-xs font-semibold outline-none',
-        'hover:border-[var(--border-strong)] hover:bg-hover focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
-        actor ? 'bg-elev text-fg' : 'border-dashed text-faint',
-      )}
-    >
-      {initial || <UserRound size={13} aria-hidden />}
-      <Tip>
-        {actor ? <span>署名 <span className="font-medium">{actor}</span></span> : <span>未署名</span>}
-        <span className="text-faint">发布、审批和正式运行以此署名记录 · 点击修改</span>
-      </Tip>
-    </Link>
-  )
-}
-
-/** 延迟超过这个数就算慢：本机和内网通常是几十毫秒 */
-const SLOW_MS = 1500
-
-interface Tone { color: string; text: string; label: string; word: string }
-
-/**
- * 五档：离线（红）、加载中（琥珀：连得上，但请求卡着没回来）、降级（琥珀：连得上，
- * 但有几张表报错）、偏慢（琥珀）、在线（绿）。加载中和降级单列出来：那几张表对应
- * 的下拉和列表是空的，不说就像"没有"
- */
-function backendTone(backend: string, latency: number | null, failing: number, stalled: number): Tone {
-  if (backend === 'down') return { color: 'var(--st-failed)', text: '离线', label: '服务端未连接', word: '未连接' }
-  if (backend === 'checking') return { color: 'var(--text-faint)', text: '检测中', label: '正在检测服务端', word: '检测中' }
-  if (stalled > 0) {
-    return { color: 'var(--st-waiting)', text: '加载中', label: `服务端在线，但仍有 ${stalled} 项未加载完成`, word: '加载中' }
-  }
-  if (failing > 0) {
-    return { color: 'var(--st-waiting)', text: '降级', label: `服务端在线，但有 ${failing} 项加载失败`, word: '降级' }
-  }
-  if (latency != null && latency >= SLOW_MS) {
-    return { color: 'var(--st-waiting)', text: `${latency}ms`, label: `服务端响应慢，延迟 ${latency} 毫秒`, word: '偏慢' }
-  }
-  return {
-    color: 'var(--st-done)',
-    text: latency != null ? `${latency}ms` : '在线',
-    label: latency != null ? `服务端在线，延迟 ${latency} 毫秒` : '服务端在线',
-    word: '在线',
-  }
-}
-
-const useFailingChecks = () => useCatalog((s) => s.checks.filter((c) => c.state === 'error').length)
-
-const NO_CHECKS: CatalogCheck[] = []
-
-/** 请求发出去这么久还没回来，就不算「还在加载」，算卡住了 */
-const STALL_MS = 3000
-/** 页面开始加载外壳的时刻（头一回取目录的卡住从这里算，见 useStalledChecks） */
-const BOOT_AT = performance.now()
-/** 头一回取目录还没有着落 */
-let bootLoad = true
-
-/**
- * 卡着没回来的 catalog 请求（后端没断时）。
- *
- * refresh 按表各自请求、先回先填，每个请求最多等 CATALOG_TIMEOUT_MS。一张表卡住
- * （后端连得上、就是不回）只拖它自己：卡着的这段时间遥测点是「加载中」，到点那一项
- * 记成出错，遥测点转成「降级」。正常刷新几十毫秒就回，不到 STALL_MS 不算，免得
- * 每次刷新遥测点都闪一下琥珀。
- */
-function useStalledChecks(): CatalogCheck[] {
-  const waiting = useCatalog((s) => s.checks.some((c) => c.state === 'pending'))
-  const down = useCatalog((s) => s.backend === 'down')
-  const checks = useCatalog((s) => s.checks)
-  const [stalled, setStalled] = useState(false)
-  useEffect(() => {
-    if (!waiting) {
-      // 头一回取目录有了着落（取回来了或出错了）：之后的刷新都从发出请求算
-      if (checks.length) bootLoad = false
-      return
-    }
-    // 启动时先认人（最多等 AUTH_WAIT_MS）再取目录：头一回加载从启动算起，认人等掉的那段也算——人已经在启动页上
-    // 等了那么久，进来以后不能还说「在线」
-    const wait = bootLoad ? Math.max(0, STALL_MS - (performance.now() - BOOT_AT)) : STALL_MS
-    const t = setTimeout(() => setStalled(true), wait)
-    return () => { clearTimeout(t); setStalled(false) }
-  }, [waiting, checks.length])
-  // 断开时归离线横幅说，这里不再叠一层
-  return stalled && waiting && !down ? checks.filter((c) => c.state === 'pending') : NO_CHECKS
-}
-
-/** 失败的那一项怎么说：回了错误码写码；等满 CATALOG_TIMEOUT_MS 才断的是超时；其余是够不着 */
-function failWord(c: CatalogCheck): string {
-  if (c.status) return String(c.status)
-  return c.ms != null && c.ms >= CATALOG_TIMEOUT_MS ? '超时' : '连接失败'
-}
-
-/**
- * 眼下是空的、却不能当「没有」的那几张表：从没取回来过（catalogListState 不是 ok），
- * 请求又卡着（超过 STALL_MS）或者已经失败了（回了错误码、超时）。人眼前是「还没有
- * 工作流」和一个「新建」按钮，得当面说一句，而且一直挂着，直到那几张表取回来：
- * 卡着的那一项到点超时，提示跟着改口说「没加载成功」，不能悄悄撤掉。
- *
- * 取回来过的表刷新卡住、失败了都不算：失败不清空，手上的还是真数据，遥测点说一声
- * 就够。后端断开归离线横幅说；启动页上清单自己会说（enabled=false）。
- */
-function useCatalogWarning(stalled: CatalogCheck[], enabled: boolean) {
-  // 选成字符串：只在「是哪几张表」变了的时候才换提示
-  const waiting = useCatalog((s) => stalled
-    .filter((c) => catalogListState(s, c.key) === 'loading').map((c) => c.key).join(','))
-  const failed = useCatalog((s) => s.checks
-    .filter((c) => catalogListState(s, c.key) === 'error').map((c) => c.key).join(','))
-  useEffect(() => {
-    if (!enabled || (!waiting && !failed)) return
-    const { checks } = useCatalog.getState()
-    const pick = (keys: string) => keys.split(',').filter(Boolean)
-      .map((k) => checks.find((c) => c.key === k)).filter((c): c is CatalogCheck => !!c)
-    const w = pick(waiting)
-    const f = pick(failed)
-    const text = [
-      w.length ? `仍有 ${w.length} 项未加载完成（${w.map((c) => c.label).join('、')}）` : '',
-      f.length ? `${w.length ? '' : '有 '}${f.length} 项加载失败（${f.map((c) => `${c.label} ${failWord(c)}`).join('、')}）` : '',
-    ].filter(Boolean).join('，')
-    const detail = [
-      w.length ? '服务端可以连接，但这些请求已等待数秒仍未返回。' : '',
-      ...f.map((c) => `${c.label}：${c.error ?? failWord(c)}`),
-      '加载完成前，相关列表和下拉选项可能为空，不代表数据丢失。可在导航底部的连接指示灯中查看各项状态。',
-    ].filter(Boolean).join('\n')
-    // 键跟着「是哪几张表」走：同一个键的提示只会累计次数，不会换字
-    const id = toast.warn(`${text}：列表可能不完整，建议加载完成后再新建`, {
-      sticky: true,
-      key: `catalog-unknown:${waiting}|${failed}`,
-      detail,
-      action: { label: '重试', onClick: () => void useCatalog.getState().refresh() },
-    })
-    return () => toast.dismiss(id)
-  }, [enabled, waiting, failed])
-}
-
-/** 连接遥测点：导航最底下，像仪表盘上的指示灯。点开看地址、延迟、最近一次错误 */
-function Telemetry({ stalled }: { stalled: CatalogCheck[] }) {
-  const backend = useCatalog((s) => s.backend)
-  const latency = useCatalog((s) => s.latencyMs)
-  const failing = useFailingChecks()
-  const [open, setOpen] = useState(false)
-  const btnRef = useRef<HTMLButtonElement>(null)
-  const tone = backendTone(backend, latency, failing, stalled.length)
-  return (
-    <div className="relative">
-      <button
-        ref={btnRef}
-        type="button"
-        aria-label={`${tone.label}。查看连接详情`}
-        aria-expanded={open}
-        aria-haspopup="dialog"
-        data-telemetry={backend}
-        data-tone={tone.word}
-        onClick={() => setOpen((o) => !o)}
-        className={clsx(
-          'group relative flex h-6 w-14 items-center justify-center gap-1.5 rounded-md text-2xs outline-none',
-          'hover:bg-hover focus-visible:ring-2 focus-visible:ring-[var(--accent)]',
-          backend === 'down' ? 'text-[var(--st-failed)]' : 'text-faint hover:text-dim',
-        )}
-      >
-        <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: tone.color }} />
-        <span className="mono tnum">{tone.text}</span>
-        {!open && <Tip>{tone.label}<span className="text-faint">点击查看详情</span></Tip>}
-      </button>
-      {open && (
-        <TelemetryPanel
-          stalled={stalled}
-          anchor={btnRef}
-          onClose={(refocus) => { setOpen(false); if (refocus) btnRef.current?.focus() }}
-        />
-      )}
-    </div>
-  )
-}
-
-function TelemetryPanel({ onClose, anchor, stalled }: {
-  onClose: (refocus: boolean) => void
-  anchor: RefObject<HTMLButtonElement | null>
-  stalled: CatalogCheck[]
-}) {
-  const backend = useCatalog((s) => s.backend)
-  const latency = useCatalog((s) => s.latencyMs)
-  const lastOkAt = useCatalog((s) => s.lastOkAt)
-  const backendError = useCatalog((s) => s.backendError)
-  const retryAt = useCatalog((s) => s.retryAt)
-  const checks = useCatalog((s) => s.checks)
-  const [busy, setBusy] = useState(false)
-  const ref = useRef<HTMLDivElement>(null)
-  const down = backend === 'down'
-  const now = useTicker(1000, down)
-  const tone = backendTone(backend, latency, useFailingChecks(), stalled.length)
-  // 卡着的里头有没有从没取回来过的：有的话那张表眼下是空的，才要劝一句别急着新建
-  const unknown = useCatalog((s) => stalled.some((c) => catalogListState(s, c.key) !== 'ok'))
-
-  const onCloseRef = useRef(onClose)
-  onCloseRef.current = onClose
-  useEffect(() => { ref.current?.focus() }, [])
-  useEffect(() => {
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node
-      if (!ref.current?.contains(t) && !anchor.current?.contains(t)) onCloseRef.current(false)
-    }
-    window.addEventListener('mousedown', onDown)
-    return () => window.removeEventListener('mousedown', onDown)
-  }, [anchor])
-
-  const secs = down && retryAt ? Math.max(0, Math.ceil((retryAt - now) / 1000)) : null
-  const retry = async () => {
-    if (busy) return
-    setBusy(true)
-    try {
-      const ok = await useCatalog.getState().checkBackend()
-      if (ok && !down) await useCatalog.getState().refresh()
-    } finally {
-      setBusy(false)
-    }
+    )
   }
 
-  return (
-    <div
-      ref={ref}
-      role="dialog"
-      aria-label="服务端连接"
-      tabIndex={-1}
-      onKeyDown={(e) => {
-        if (e.key === 'Escape' && !isComposing(e)) {
-          e.stopPropagation()
-          onClose(true)
-        }
-      }}
-      className="fade-up absolute bottom-0 left-full z-40 ml-2.5 w-80 rounded-lg border bg-panel text-xs shadow-elev-3 outline-none"
-    >
-      <div className="flex items-center justify-between border-b px-3 py-2">
-        <span className="font-semibold text-fg">服务端连接</span>
-        <span className="flex items-center gap-1.5" style={{ color: tone.color }}>
-          <span aria-hidden className="h-1.5 w-1.5 rounded-full" style={{ background: tone.color }} />
-          {tone.word}
-        </span>
-      </div>
-      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 px-3 py-2.5">
-        <dt className="text-faint">地址</dt>
-        <dd className="mono truncate text-dim" title={`${window.location.origin}/api`}>{window.location.origin}/api</dd>
-        <dt className="text-faint">延迟</dt>
-        <dd className="mono tnum text-dim">{latency != null ? `${latency} ms` : '—'}</dd>
-        <dt className="text-faint">最后连通</dt>
-        <dd className="text-dim" title={lastOkAt ? formatDateTime(lastOkAt) : undefined}>
-          {lastOkAt ? formatRelative(lastOkAt) : '—'}
-        </dd>
-        {secs != null && (
-          <>
-            <dt className="text-faint">自动重试</dt>
-            <dd className="tnum text-dim">{secs} 秒后</dd>
-          </>
-        )}
-      </dl>
-      {backendError && (
-        <div className="mx-3 mb-2.5 rounded-md border px-2 py-1.5 text-2xs leading-relaxed"
-             style={{ borderColor: 'color-mix(in srgb, var(--err) 35%, var(--border))', background: 'var(--st-failed-soft)' }}>
-          <div className="text-[var(--st-failed)]">最近一次错误</div>
-          <div className="mono mt-0.5 break-all text-dim">{backendError}</div>
-        </div>
-      )}
-      {stalled.length > 0 && (
-        <div className="mx-3 mb-2.5 rounded-md border px-2 py-1.5 text-2xs leading-relaxed"
-             style={{ borderColor: 'color-mix(in srgb, var(--warn) 35%, var(--border))', background: 'var(--st-waiting-soft)' }}>
-          <div className="text-[var(--st-waiting)]">{stalled.map((c) => c.label).join('、')}尚未返回</div>
-          <div className="mt-0.5 text-dim">
-            {unknown
-              ? '加载完成前各页面的列表可能不完整，不代表数据丢失，建议暂缓新建。'
-              : '页面显示的是上次加载的列表，加载完成后将自动更新。'}
-          </div>
-        </div>
-      )}
-      {checks.length > 0 && (
-        <div className="border-t px-3 py-2">
-          <div className="mb-1 text-2xs text-faint">最近一次全量加载</div>
-          <CheckList checks={checks} />
-        </div>
-      )}
-      <div className="flex justify-end border-t px-3 py-2">
-        {/* 忙着时用 aria-disabled 而不是 disabled：按钮一 disabled 焦点就掉到 body，
-            Esc 到不了浮层，键盘用户关不掉它 */}
-        <button type="button" className="btn btn-sm aria-disabled:cursor-not-allowed aria-disabled:opacity-45"
-                aria-disabled={busy || undefined} onClick={() => void retry()}>
-          {busy ? <Spinner size={12} /> : <RotateCw size={12} aria-hidden />} {down ? '立即重试' : '重新检测'}
-        </button>
-      </div>
-    </div>
-  )
-}
-
-/** catalog.refresh 的逐项结果：每一行都是一个真实请求，✓ 带耗时，✕ 带状态码 */
-function CheckList({ checks, lead }: { checks: CatalogCheck[]; lead?: ReactNode }) {
-  return (
-    <ul className="flex flex-col">
-      {lead}
-      {checks.map((c) => (
-        <li key={c.key} className="flex h-6 items-center gap-2 text-xs" data-check={c.key} data-state={c.state}>
-          <CheckGlyph state={c.state} />
-          <span className={c.state === 'error' ? 'text-fg' : 'text-dim'}>{c.label}</span>
-          <span className="mono ml-auto tnum text-2xs" style={{ color: c.state === 'error' ? 'var(--st-failed)' : 'var(--text-faint)' }}
-                title={c.error}>
-            {/* 勾叉是装饰图形，读屏靠这一个词分辨成败 */}
-            <span className="sr-only">{c.state === 'pending' ? '等待中' : c.state === 'ok' ? '已加载 ' : '失败 '}</span>
-            {c.state === 'pending'
-              ? <span aria-hidden>…</span>
-              : c.state === 'ok' ? `${c.ms ?? '—'} ms` : failWord(c)}
-          </span>
-        </li>
-      ))}
-    </ul>
-  )
-}
-
-/** 启动慢的时候读屏念什么：还在等哪几项、哪几项失败了 */
-function bootProgress(checks: CatalogCheck[]): string | null {
-  const waiting = checks.filter((c) => c.state === 'pending').map((c) => c.label)
-  const failed = checks.filter((c) => c.state === 'error').map((c) => c.label)
-  return [waiting.length && `正在等待${waiting.join('、')}`, failed.length && `${failed.join('、')}加载失败`]
-    .filter(Boolean).join('；') || null
-}
-
-function CheckGlyph({ state }: { state: CatalogCheck['state'] }) {
-  if (state === 'pending') return <span className="flex w-3.5 justify-center text-faint"><Spinner size={11} /></span>
-  return <StatusBadge status={state === 'ok' ? 'done' : 'failed'} size={13} decorative animate={false} />
-}
-
-// -------------------------------------------------------------------------
-// 启动页
-// -------------------------------------------------------------------------
-
-/** 这么久还没加载完就不再只是「正在连接」：主动探一次、给出重试 */
-const SLOW_BOOT_MS = 5000
-
-/**
- * 启动页：品牌标 + 启动清单。
- *
- * 之前只有一个转圈和「正在连接后端…」，后端没起就永远转下去，看不出卡在哪。
- * 清单的每一行都是 catalog.refresh 的一个真实请求——✓ 带耗时，✕ 带状态码；
- * 从没连上过就停在这里说清原因和怎么办，给重试，也允许先进去（离线横幅会一直
- * 挂着），不放人进一屏「还没有工作流」。
- */
-function BootScreen({ onEnterOffline }: { onEnterOffline: () => void }) {
-  const checks = useCatalog((s) => s.checks)
-  const backend = useCatalog((s) => s.backend)
-  const latency = useCatalog((s) => s.latencyMs)
-  const backendError = useCatalog((s) => s.backendError)
-  const retryAt = useCatalog((s) => s.retryAt)
-  const loaded = useCatalog((s) => s.loaded)
-  const [t0] = useState(() => Date.now())
-  const now = useTicker(250)
-  const [busy, setBusy] = useState(false)
-  const elapsed = now - t0
-  const down = backend === 'down'
-  const slow = !down && !loaded && elapsed > SLOW_BOOT_MS
-  // 一闪而过的启动（本机几十毫秒）不画清单，免得整屏跳一下
-  const reveal = down || elapsed > 300
-
-  // 每张表要等满 CATALOG_TIMEOUT_MS 才记成失败，后端卡死（连得上但不回）时启动页得
-  // 干等 15 秒：到点先主动探一次 /health，它的超时短得多，卡死和断开都能在这里先判出来
-  useEffect(() => { if (slow) void useCatalog.getState().checkBackend() }, [slow])
-
-  const retry = async () => {
-    setBusy(true)
-    try {
-      const ok = await useCatalog.getState().checkBackend()
-      // 从断开恢复时 catalog 自己会重拉；本来就连着（只是慢）就再拉一遍
-      if (ok && !down) await useCatalog.getState().refresh()
-    } finally {
-      setBusy(false)
-    }
+  /** 启动慢的时候读屏念什么：还在等哪几项、哪几项失败了 */
+  function bootProgress(checks: CatalogCheck[]): string | null {
+    const waiting = checks.filter((c) => c.state === 'pending').map((c) => c.label)
+    const failed = checks.filter((c) => c.state === 'error').map((c) => c.label)
+    return [waiting.length && `正在等待${waiting.join('、')}`, failed.length && `${failed.join('、')}加载失败`]
+      .filter(Boolean).join('；') || null
   }
 
-  const done = checks.filter((c) => c.state !== 'pending').length
-  const secs = down && retryAt ? Math.max(0, Math.ceil((retryAt - now) / 1000)) : null
-  const h = down ? humanizeError(new ApiError(0, backendError || NETWORK_MESSAGE, { kind: 'network' })) : null
-  const headline = down ? '无法连接服务' : slow ? '比平时慢' : '正在连接服务'
-  // 读屏只播这一句：阶段变了（连接中 → 比平时慢 → 连不上）、慢的时候哪几项回来了。
-  // 计时器和倒计时一秒一跳，放进播报区就是一秒念一遍
-  const spoken = down ? h?.reason : slow ? bootProgress(checks) : null
-
-  return (
-    <div className="flex h-full items-center justify-center overflow-auto bg-bg p-6" data-boot={down ? 'down' : slow ? 'slow' : 'loading'}>
-      <div className="w-full max-w-[360px]">
-        <div className="flex items-center gap-3">
-          <Logo size={34} className="text-accent" title="AgentLab" />
-          <div>
-            <div className="text-lg font-semibold leading-tight text-fg">AgentLab</div>
-            <div className="text-2xs text-faint">受限动态编排</div>
-          </div>
-        </div>
-
-        <div className={clsx('mt-6 overflow-hidden rounded-lg border bg-panel shadow-elev-1 transition-opacity duration-200', reveal ? 'opacity-100' : 'opacity-0')}>
-          {/* 进度条只按「已经回来了几个请求」走，不插值、不做假进度 */}
-          <div aria-hidden className="h-px bg-hairline">
-            <div
-              className="h-px origin-left transition-transform duration-200"
-              style={{
-                transform: `scaleX(${checks.length ? done / checks.length : 0})`,
-                background: down ? 'var(--st-failed)' : 'var(--accent)',
-              }}
-            />
-          </div>
-          <div className="flex items-center justify-between px-3 pb-1.5 pt-2.5">
-            <span role="status" className="flex items-center gap-2 text-sm font-medium" style={{ color: down ? 'var(--st-failed)' : slow ? 'var(--st-waiting)' : undefined }}>
-              {!down && <Spinner size={13} />}
-              {headline}
-              {spoken && <span className="sr-only">：{spoken}</span>}
-            </span>
-            {!down && <span aria-hidden className="mono text-2xs text-faint tnum">{formatDuration(elapsed)}</span>}
-          </div>
-          <div className="px-3 pb-2.5">
-            <CheckList
-              checks={checks}
-              lead={
-                <li className="flex h-6 items-center gap-2 text-xs" data-check="backend" data-state={backend}>
-                  {backend === 'checking'
-                    ? <span className="flex w-3.5 justify-center text-faint"><Spinner size={11} /></span>
-                    : <StatusBadge status={down ? 'failed' : 'done'} size={13} decorative animate={false} />}
-                  <span className={down ? 'text-fg' : 'text-dim'}>服务端</span>
-                  <span className="mono ml-auto text-2xs tnum" style={{ color: down ? 'var(--st-failed)' : 'var(--text-faint)' }}>
-                    {down ? '连接失败' : backend === 'ok' && latency != null ? `${latency} ms` : '/api'}
-                  </span>
-                </li>
-              }
-            />
-          </div>
-
-          {(down || slow) && (
-            <div className="border-t px-3 py-3 text-xs leading-relaxed">
-              {down ? (
-                <>
-                  <div className="text-fg">{h?.reason ?? backendError ?? '请求未到达服务端'}</div>
-                  <div className="mt-1 text-dim">
-                    请确认服务端已启动；如问题持续，请联系管理员。
-                  </div>
-                  <div className="mono mt-1 break-all text-2xs text-faint">
-                    {window.location.origin}/api · 开发环境：./scripts/dev.sh
-                    {backendError && backendError !== NETWORK_MESSAGE && <> · {backendError}</>}
-                  </div>
-                </>
-              ) : (
-                <>
-                  <div className="text-dim">
-                    请求已发出 {Math.floor(elapsed / 1000)} 秒，仍有部分未返回：服务端可能正在启动，或某个请求处理缓慢。
-                  </div>
-                  {/* 后端连得上时「先进去」也还是一条路：一个请求卡死就把人永远关在门外更糟。
-                      但进去之前先说清楚代价，进去以后遥测点和提示会接着说 */}
-                  <div className="mt-1 text-faint">直接进入时，未返回的数据在页面上将显示为空，不代表没有数据。</div>
-                </>
-              )}
-              <div className="mt-3 flex items-center gap-2">
-                <button type="button" className="btn btn-sm btn-primary" disabled={busy} onClick={() => void retry()}>
-                  {busy ? <Spinner size={12} /> : <RotateCw size={12} aria-hidden />} 立即重试
-                </button>
-                <button type="button" className="btn btn-sm btn-ghost" onClick={onEnterOffline}>直接进入</button>
-                {secs != null && !busy && <span className="ml-auto text-2xs text-faint tnum">{secs} 秒后自动重试</span>}
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// -------------------------------------------------------------------------
-// 后台信号：标题、favicon、系统通知
-// -------------------------------------------------------------------------
-
-const PAGE_LABEL: Record<string, string> = Object.fromEntries(PAGES.map((p) => [p.to.slice(1), p.label]))
-
-function describePath(
-  pathname: string, search: string, ctx: { workflowName: string | null; conversationTitle: string | null },
-): [string, string | null] {
-  const [seg, id] = pathname.split('/').filter(Boolean)
-  if (!seg) return ['问数据', null]
-  const page = PAGE_LABEL[seg]
-  if (!page) return ['页面不存在', null]
-  if (seg === 'studio' && id) return [page, ctx.workflowName]
-  if (seg === 'chat' && id) return [page, ctx.conversationTitle || null]
-  if (seg === 'runs') {
-    if (id === 'compare') return [page, RUN_COMPARE_TEXT.title]
-    if (id) return [page, `运行 ${shortId(id)}`]
-    return [page, new URLSearchParams(search).get('tab') === 'approvals' ? '待审批' : null]
+  function CheckGlyph({ state }: { state: CatalogCheck['state'] }) {
+    if (state === 'pending') return <span className="flex w-3.5 justify-center text-faint"><Spinner size={11} /></span>
+    return <StatusBadge status={state === 'ok' ? 'done' : 'failed'} size={13} decorative animate={false} />
   }
-  return [page, null]
-}
 
-type Go = (to: string | null) => void
+  // -------------------------------------------------------------------------
+  // 启动页
+  // -------------------------------------------------------------------------
 
-/** 在后台时结束的事：挂到标题和 favicon 上，开了提醒就再发一条系统通知 */
-function report(go: Go, n: { attention: Attention; title: string; body?: string; to: string | null; tag: string }) {
-  if (!document.hidden) return
-  flagAttention(n.attention)
-  notifyInBackground({ title: n.title, body: n.body, tag: n.tag, onClick: () => go(n.to) })
-}
+  /** 这么久还没加载完就不再只是「正在连接」：主动探一次、给出重试 */
+  const SLOW_BOOT_MS = 5000
 
-/** 回放、打开历史运行时事件是一口气灌进来的：活跃不到这么久就结束的，不算"刚跑完" */
-const MIN_LIVE_MS = 1000
+  /**
+   * 启动页：品牌标 + 启动清单。
+   *
+   * 之前只有一个转圈和「正在连接后端…」，后端没起就永远转下去，看不出卡在哪。
+   * 清单的每一行都是 catalog.refresh 的一个真实请求——✓ 带耗时，✕ 带状态码；
+   * 从没连上过就停在这里说清原因和怎么办，给重试，也允许先进去（离线横幅会一直
+   * 挂着），不放人进一屏「还没有工作流」。
+   */
+  function BootScreen({ onEnterOffline }: { onEnterOffline: () => void }) {
+    const checks = useCatalog((s) => s.checks)
+    const backend = useCatalog((s) => s.backend)
+    const latency = useCatalog((s) => s.latencyMs)
+    const backendError = useCatalog((s) => s.backendError)
+    const retryAt = useCatalog((s) => s.retryAt)
+    const loaded = useCatalog((s) => s.loaded)
+    const [t0] = useState(() => Date.now())
+    const now = useTicker(250)
+    const [busy, setBusy] = useState(false)
+    const elapsed = now - t0
+    const down = backend === 'down'
+    const slow = !down && !loaded && elapsed > SLOW_BOOT_MS
+    // 一闪而过的启动（本机几十毫秒）不画清单，免得整屏跳一下
+    const reveal = down || elapsed > 300
 
-function watchStudio(go: Go): () => void {
-  let watch: { runId: string; since: number } | null = null
-  return useStudio.subscribe((s, p) => {
-    if (s.runPhase === p.runPhase && s.run?.id === p.run?.id) return
-    const id = s.run?.id ?? null
-    if (!id) { watch = null; return }
-    if (isActivePhase(s.runPhase)) {
-      if (watch?.runId !== id) watch = { runId: id, since: Date.now() }
-      return
-    }
-    const w = watch
-    watch = null
-    if (!w || w.runId !== id || s.trace?.lastReplay || Date.now() - w.since < MIN_LIVE_MS) return
-    const name = s.workflow?.name || (s.run?.workflow_name && runName(s.run)) || '工作流'
-    // 人多半还停在这张画布上：点通知回来就行，不跳走
-    const here = s.workflow && window.location.pathname.startsWith(`/studio/${s.workflow.id}`)
-    const to = here ? null : `/runs/${id}`
-    const tag = `run:${id}`
-    if (s.runPhase === 'succeeded') {
-      const t = s.trace
-      const wall = t.timing?.wallMs ?? (t.startedAt && t.endedAt ? t.endedAt - t.startedAt : null)
-      report(go, {
-        attention: { tone: 'ok', text: '✓ 运行完成' }, title: `「${name}」运行完成`,
-        body: wall != null ? `总时长 ${formatDuration(wall)}` : undefined, to, tag,
-      })
-    } else if (s.runPhase === 'failed') {
-      const nodeId = s.trace.failedNodeId
-      const label = nodeId ? s.nodes.find((n) => n.id === nodeId)?.data?.label || nodeId : null
-      const error = (nodeId && s.trace.nodes[nodeId]?.error) || s.run?.error || ''
-      report(go, {
-        attention: { tone: 'err', text: '✕ 运行失败' }, title: `「${name}」运行失败`,
-        body: [label && `停在「${label}」`, error.split('\n')[0]].filter(Boolean).join('：') || undefined, to, tag,
-      })
-    } else if (s.runPhase === 'suspended') {
-      report(go, {
-        attention: { tone: 'warn', text: '‖ 运行中断' }, title: `「${name}」运行已中断`,
-        body: '服务重启中断了本次运行，可从断点继续运行', to, tag,
-      })
-    }
-  })
-}
+    // 每张表要等满 CATALOG_TIMEOUT_MS 才记成失败，后端卡死（连得上但不回）时启动页得
+    // 干等 15 秒：到点先主动探一次 /health，它的超时短得多，卡死和断开都能在这里先判出来
+    useEffect(() => { if (slow) void useCatalog.getState().checkBackend() }, [slow])
 
-function watchChat(go: Go): () => void {
-  const seen = new Map<string, number | null>()
-  return useChat.subscribe((s, p) => {
-    if (s.byConversation === p.byConversation) return
-    for (const [cid, turns] of Object.entries(s.byConversation)) {
-      for (const t of turns) {
-        const active = t.phase === 'planning' || t.phase === 'building' || t.phase === 'running'
-        const since = seen.get(t.id) ?? null
-        if (active) {
-          if (since == null) seen.set(t.id, Date.now())
-          continue
-        }
-        if (since == null) continue
-        seen.set(t.id, null)
-        if (t.restored || Date.now() - since < MIN_LIVE_MS) continue
-        const to = window.location.pathname === `/chat/${cid}` ? null : `/chat/${cid}`
-        const question = t.question.length > 60 ? `${t.question.slice(0, 60)}…` : t.question
-        if (t.phase === 'done') {
-          report(go, { attention: { tone: 'ok', text: '✓ 已回答' }, title: '问数据：回答已生成', body: question, to, tag: `turn:${t.id}` })
-        } else if (t.phase === 'error') {
-          report(go, { attention: { tone: 'err', text: '✕ 回答失败' }, title: '问数据：本次提问失败', body: question, to, tag: `turn:${t.id}` })
-        }
+    const retry = async () => {
+      setBusy(true)
+      try {
+        const ok = await useCatalog.getState().checkBackend()
+        // 从断开恢复时 catalog 自己会重拉；本来就连着（只是慢）就再拉一遍
+        if (ok && !down) await useCatalog.getState().refresh()
+      } finally {
+        setBusy(false)
       }
     }
-  })
-}
 
-function watchApprovals(go: Go): () => void {
-  const pendingIds = (list: { id: string; status: string }[]) => list.filter((a) => a.status === 'pending').map((a) => a.id)
-  // 已有的那些不算「新来的」：拿到过一次真列表才记底。启动时那一拉若失败了，
-  // 列表是兜底的空数组，拿它记底，下一拍心跳就会把老的全当成新的
-  const listed = (s: ReturnType<typeof useCatalog.getState>) =>
-    s.loaded && s.checks.find((c) => c.key === 'approvals')?.state === 'ok'
-  let seen: Set<string> | null = listed(useCatalog.getState()) ? new Set(pendingIds(useCatalog.getState().approvals)) : null
-  return useCatalog.subscribe((s, p) => {
-    if (s.approvals === p.approvals) return
-    if (!seen) {
-      if (listed(s) || (s.loaded && s.backend === 'ok')) seen = new Set(pendingIds(s.approvals))
-      return
-    }
-    const fresh = s.approvals.filter((a) => a.status === 'pending' && !seen!.has(a.id))
-    fresh.forEach((a) => seen!.add(a.id))
-    for (const a of fresh) {
-      notifyInBackground({
-        title: `新的待审批：${a.title || '有步骤等待处理'}`,
-        body: [a.workflow_name && runName(a), a.node_label].filter(Boolean).join(' · ') || undefined,
-        tag: `approval:${a.id}`,
-        onClick: () => go(`/runs/${a.run_id}`),
-      })
-    }
-  })
-}
+    const done = checks.filter((c) => c.state !== 'pending').length
+    const secs = down && retryAt ? Math.max(0, Math.ceil((retryAt - now) / 1000)) : null
+    const h = down ? humanizeError(new ApiError(0, backendError || NETWORK_MESSAGE, { kind: 'network' })) : null
+    const headline = down ? '无法连接服务' : slow ? '比平时慢' : '正在连接服务'
+    // 读屏只播这一句：阶段变了（连接中 → 比平时慢 → 连不上）、慢的时候哪几项回来了。
+    // 计时器和倒计时一秒一跳，放进播报区就是一秒念一遍
+    const spoken = down ? h?.reason : slow ? bootProgress(checks) : null
 
-/**
- * 派给自己的新待办：规则同待审批——拿到过一次真列表才记底，之后新来的、标签页在后台时发系统通知。不每拍都取列表：
- * 心跳取的「派给我的」待办数或最新一条的时间（taskCounts.mine / latest）变了才取一次派给我的待处理待办。搭建者以上已经按待审批发过通知的
- * （待办带着那条审批）不再发第二条；核实、等外部系统这类没有审批的待办只在这里通知
- */
-function watchTasks(go: Go): () => void {
-  let seen: Set<string> | null = null
-  let inflight = false
-  let again = false
-  const pull = async () => {
-    if (inflight) { again = true; return }
-    inflight = true
-    try {
-      const { items } = await api.tasks.list({ assigned: 'me', status: 'pending', limit: 100 })
-      const pending = items.filter((t) => t.status === 'pending')
-      if (!seen) { seen = new Set(pending.map((t) => t.id)); return }
-      const fresh = pending.filter((t) => !seen!.has(t.id))
-      fresh.forEach((t) => seen!.add(t.id))
-      const builder = atLeast(useAuth.getState().me, 'builder')
-      const approvals = useCatalog.getState().approvals
-      for (const t of fresh) {
-        if (builder && t.approval_id && approvals.some((a) => a.id === t.approval_id)) continue
-        const owner = t.app_name ?? (t.workflow_name || t.workflow_id ? runName(t) : null)
-        notifyInBackground({
-          title: `${TASK_NOTIFY_TEXT.title}${t.title || TASK_NOTIFY_TEXT.untitled}`,
-          body: [owner, t.node_label].filter(Boolean).join(' · ') || undefined,
-          tag: `task:${t.id}`,
-          // 应用里的待办、口径召回（挂在召回运行上，记录页里没有这张卡）、使用者（进不了记录页）都去待办页；
-          // 搭建者的别的待办去那次运行
-          onClick: () => go(t.app_id || t.kind === 'recall' || !builder
-            ? `/apps/inbox/${encodeURIComponent(t.id)}` : `/runs/${t.run_id}`),
+    return (
+      <div className="flex h-full items-center justify-center overflow-auto bg-bg p-6" data-boot={down ? 'down' : slow ? 'slow' : 'loading'}>
+        <div className="w-full max-w-[360px]">
+          <div className="flex items-center gap-3">
+            <Logo size={34} className="text-accent" title="AgentLab" />
+            <div>
+              <div className="text-lg font-semibold leading-tight text-fg">AgentLab</div>
+              <div className="text-2xs text-faint">受限动态编排</div>
+            </div>
+          </div>
+
+          <div className={clsx('mt-6 overflow-hidden rounded-lg border bg-panel shadow-elev-1 transition-opacity duration-200', reveal ? 'opacity-100' : 'opacity-0')}>
+            {/* 进度条只按「已经回来了几个请求」走，不插值、不做假进度 */}
+            <div aria-hidden className="h-px bg-hairline">
+              <div
+                className="h-px origin-left transition-transform duration-200"
+                style={{
+                  transform: `scaleX(${checks.length ? done / checks.length : 0})`,
+                  background: down ? 'var(--st-failed)' : 'var(--accent)',
+                }}
+              />
+            </div>
+            <div className="flex items-center justify-between px-3 pb-1.5 pt-2.5">
+              <span role="status" className="flex items-center gap-2 text-sm font-medium" style={{ color: down ? 'var(--st-failed)' : slow ? 'var(--st-waiting)' : undefined }}>
+                {!down && <Spinner size={13} />}
+                {headline}
+                {spoken && <span className="sr-only">：{spoken}</span>}
+              </span>
+              {!down && <span aria-hidden className="mono text-2xs text-faint tnum">{formatDuration(elapsed)}</span>}
+            </div>
+            <div className="px-3 pb-2.5">
+              <CheckList
+                checks={checks}
+                lead={
+                  <li className="flex h-6 items-center gap-2 text-xs" data-check="backend" data-state={backend}>
+                    {backend === 'checking'
+                      ? <span className="flex w-3.5 justify-center text-faint"><Spinner size={11} /></span>
+                      : <StatusBadge status={down ? 'failed' : 'done'} size={13} decorative animate={false} />}
+                    <span className={down ? 'text-fg' : 'text-dim'}>服务端</span>
+                    <span className="mono ml-auto text-2xs tnum" style={{ color: down ? 'var(--st-failed)' : 'var(--text-faint)' }}>
+                      {down ? '连接失败' : backend === 'ok' && latency != null ? `${latency} ms` : '/api'}
+                    </span>
+                  </li>
+                }
+              />
+            </div>
+
+            {(down || slow) && (
+              <div className="border-t px-3 py-3 text-xs leading-relaxed">
+                {down ? (
+                  <>
+                    <div className="text-fg">{h?.reason ?? backendError ?? '请求未到达服务端'}</div>
+                    <div className="mt-1 text-dim">
+                      请确认服务端已启动；如问题持续，请联系管理员。
+                    </div>
+                    <div className="mono mt-1 break-all text-2xs text-faint">
+                      {window.location.origin}/api · 开发环境：./scripts/dev.sh
+                      {backendError && backendError !== NETWORK_MESSAGE && <> · {backendError}</>}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="text-dim">
+                      请求已发出 {Math.floor(elapsed / 1000)} 秒，仍有部分未返回：服务端可能正在启动，或某个请求处理缓慢。
+                    </div>
+                    {/* 后端连得上时「先进去」也还是一条路：一个请求卡死就把人永远关在门外更糟。
+                        但进去之前先说清楚代价，进去以后遥测点和提示会接着说 */}
+                    <div className="mt-1 text-faint">直接进入时，未返回的数据在页面上将显示为空，不代表没有数据。</div>
+                  </>
+                )}
+                <div className="mt-3 flex items-center gap-2">
+                  <button type="button" className="btn btn-sm btn-primary" disabled={busy} onClick={() => void retry()}>
+                    {busy ? <Spinner size={12} /> : <RotateCw size={12} aria-hidden />} 立即重试
+                  </button>
+                  <button type="button" className="btn btn-sm btn-ghost" onClick={onEnterOffline}>直接进入</button>
+                  {secs != null && !busy && <span className="ml-auto text-2xs text-faint tnum">{secs} 秒后自动重试</span>}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // -------------------------------------------------------------------------
+  // 后台信号：标题、favicon、系统通知
+  // -------------------------------------------------------------------------
+
+  const PAGE_LABEL: Record<string, string> = Object.fromEntries(PAGES.map((p) => [p.to.slice(1), p.label]))
+
+  function describePath(
+    pathname: string, search: string, ctx: { workflowName: string | null; conversationTitle: string | null },
+  ): [string, string | null] {
+    const [seg, id] = pathname.split('/').filter(Boolean)
+    if (!seg) return ['问数据', null]
+    const page = PAGE_LABEL[seg]
+    if (!page) return ['页面不存在', null]
+    if (seg === 'studio' && id) return [page, ctx.workflowName]
+    if (seg === 'chat' && id) return [page, ctx.conversationTitle || null]
+    if (seg === 'runs') {
+      if (id === 'compare') return [page, RUN_COMPARE_TEXT.title]
+      if (id) return [page, `运行 ${shortId(id)}`]
+      return [page, new URLSearchParams(search).get('tab') === 'approvals' ? '待审批' : null]
+    }
+    return [page, null]
+  }
+
+  type Go = (to: string | null) => void
+
+  /** 在后台时结束的事：挂到标题和 favicon 上，开了提醒就再发一条系统通知 */
+  function report(go: Go, n: { attention: Attention; title: string; body?: string; to: string | null; tag: string }) {
+    if (!document.hidden) return
+    flagAttention(n.attention)
+    notifyInBackground({ title: n.title, body: n.body, tag: n.tag, onClick: () => go(n.to) })
+  }
+
+  /** 回放、打开历史运行时事件是一口气灌进来的：活跃不到这么久就结束的，不算"刚跑完" */
+  const MIN_LIVE_MS = 1000
+
+  function watchStudio(go: Go, useStudio: typeof UseStudioHook, isActivePhase: typeof IsActivePhaseFn): () => void {
+    let watch: { runId: string; since: number } | null = null
+    return useStudio.subscribe((s, p) => {
+      if (s.runPhase === p.runPhase && s.run?.id === p.run?.id) return
+      const id = s.run?.id ?? null
+      if (!id) { watch = null; return }
+      if (isActivePhase(s.runPhase)) {
+        if (watch?.runId !== id) watch = { runId: id, since: Date.now() }
+        return
+      }
+      const w = watch
+      watch = null
+      if (!w || w.runId !== id || s.trace?.lastReplay || Date.now() - w.since < MIN_LIVE_MS) return
+      const name = s.workflow?.name || (s.run?.workflow_name && runName(s.run)) || '工作流'
+      // 人多半还停在这张画布上：点通知回来就行，不跳走
+      const here = s.workflow && window.location.pathname.startsWith(`/studio/${s.workflow.id}`)
+      const to = here ? null : `/runs/${id}`
+      const tag = `run:${id}`
+      if (s.runPhase === 'succeeded') {
+        const t = s.trace
+        const wall = t.timing?.wallMs ?? (t.startedAt && t.endedAt ? t.endedAt - t.startedAt : null)
+        report(go, {
+          attention: { tone: 'ok', text: '✓ 运行完成' }, title: `「${name}」运行完成`,
+          body: wall != null ? `总时长 ${formatDuration(wall)}` : undefined, to, tag,
+        })
+      } else if (s.runPhase === 'failed') {
+        const nodeId = s.trace.failedNodeId
+        const label = nodeId ? s.nodes.find((n) => n.id === nodeId)?.data?.label || nodeId : null
+        const error = (nodeId && s.trace.nodes[nodeId]?.error) || s.run?.error || ''
+        report(go, {
+          attention: { tone: 'err', text: '✕ 运行失败' }, title: `「${name}」运行失败`,
+          body: [label && `停在「${label}」`, error.split('\n')[0]].filter(Boolean).join('：') || undefined, to, tag,
+        })
+      } else if (s.runPhase === 'suspended') {
+        report(go, {
+          attention: { tone: 'warn', text: '‖ 运行中断' }, title: `「${name}」运行已中断`,
+          body: '服务重启中断了本次运行，可从断点继续运行', to, tag,
         })
       }
-    } catch {
-      // 下次待办数变了再取；没记底之前不发通知
-    } finally {
-      inflight = false
-      if (again) { again = false; void pull() }
-    }
-  }
-  // 待办数随目录在启动时就取了，常常早于外壳挂上这个订阅：已经有数时当场记底，别等到它下一次变——那时新来的
-  // 已经在列表里，会被当成「已有的」记进底里，一条通知都不发
-  if (useCatalog.getState().taskCounts && !needsLogin(useAuth.getState().me)) void pull()
-  return useCatalog.subscribe((s, p) => {
-    if (s.taskCounts === p.taskCounts || !s.taskCounts) return
-    if (seen && s.taskCounts.mine === p.taskCounts?.mine && s.taskCounts.latest === p.taskCounts?.latest) return
-    if (needsLogin(useAuth.getState().me)) return
-    void pull()
-  })
-}
-
-function ShellSignals() {
-  const { pathname, search } = useLocation()
-  const navigate = useNavigate()
-  // 标签页标题上的待处理数：搭建者以上照旧数待审批；使用者没有待审批列表，数派给自己的待办
-  const builder = useAuth((s) => atLeast(s.me, 'builder'))
-  const pending = useCatalog((s) => (builder ? s.approvals.filter((a) => a.status === 'pending').length : s.taskCounts?.mine ?? 0))
-  const studio = useStudioActivity()
-  const chat = useChatActivity()
-  const attention = useSignals((s) => s.attention)
-  const pageTitle = useSignals((s) => s.pageTitle)
-  const workflowName = useStudio((s) => s.workflow?.name ?? null)
-  const conversationTitle = useConversations((s) => s.list.find((c) => c.id === s.currentId)?.title ?? null)
-
-  const [page, object] = describePath(pathname, search, { workflowName, conversationTitle })
-  const progress = studio.startsWith('run:') ? ` ${studio.slice(4)}` : ''
-  const activity = studio.startsWith('run') || chat === 'run'
-    ? `● 运行中${progress}`
-    : studio === 'gen' || chat === 'gen' ? '● 生成中' : null
-
-  useEffect(() => {
-    document.title = composeTitle({
-      pending, activity, attention, page: pageTitle ?? page, object: pageTitle ? null : object,
     })
-  })
+  }
 
-  // 点的优先级：失败 > 等人 > 在跑 > 后台时跑完了
-  const dot: FaviconDot | null = attention?.tone === 'err'
-    ? 'failed'
-    : pending > 0 || attention?.tone === 'warn'
-      ? 'waiting'
-      : activity ? 'running' : attention?.tone === 'ok' ? 'done' : null
-  useEffect(() => { paintFavicon(dot) }, [dot])
+  function watchChat(go: Go, useChat: typeof UseChatHook): () => void {
+    const seen = new Map<string, number | null>()
+    return useChat.subscribe((s, p) => {
+      if (s.byConversation === p.byConversation) return
+      for (const [cid, turns] of Object.entries(s.byConversation)) {
+        for (const t of turns) {
+          const active = t.phase === 'planning' || t.phase === 'building' || t.phase === 'running'
+          const since = seen.get(t.id) ?? null
+          if (active) {
+            if (since == null) seen.set(t.id, Date.now())
+            continue
+          }
+          if (since == null) continue
+          seen.set(t.id, null)
+          if (t.restored || Date.now() - since < MIN_LIVE_MS) continue
+          const to = window.location.pathname === `/chat/${cid}` ? null : `/chat/${cid}`
+          const question = t.question.length > 60 ? `${t.question.slice(0, 60)}…` : t.question
+          if (t.phase === 'done') {
+            report(go, { attention: { tone: 'ok', text: '✓ 已回答' }, title: '问数据：回答已生成', body: question, to, tag: `turn:${t.id}` })
+          } else if (t.phase === 'error') {
+            report(go, { attention: { tone: 'err', text: '✕ 回答失败' }, title: '问数据：本次提问失败', body: question, to, tag: `turn:${t.id}` })
+          }
+        }
+      }
+    })
+  }
 
-  const navRef = useRef(navigate)
-  navRef.current = navigate
-  useEffect(() => {
-    const go: Go = (to) => { if (to) navRef.current(to) }
-    const stops = [watchStudio(go), watchChat(go), watchApprovals(go), watchTasks(go)]
-    return () => stops.forEach((stop) => stop())
-  }, [])
-  return null
+  function watchApprovals(go: Go): () => void {
+    const pendingIds = (list: { id: string; status: string }[]) => list.filter((a) => a.status === 'pending').map((a) => a.id)
+    // 已有的那些不算「新来的」：拿到过一次真列表才记底。启动时那一拉若失败了，
+    // 列表是兜底的空数组，拿它记底，下一拍心跳就会把老的全当成新的
+    const listed = (s: ReturnType<typeof useCatalog.getState>) =>
+      s.loaded && s.checks.find((c) => c.key === 'approvals')?.state === 'ok'
+    let seen: Set<string> | null = listed(useCatalog.getState()) ? new Set(pendingIds(useCatalog.getState().approvals)) : null
+    return useCatalog.subscribe((s, p) => {
+      if (s.approvals === p.approvals) return
+      if (!seen) {
+        if (listed(s) || (s.loaded && s.backend === 'ok')) seen = new Set(pendingIds(s.approvals))
+        return
+      }
+      const fresh = s.approvals.filter((a) => a.status === 'pending' && !seen!.has(a.id))
+      fresh.forEach((a) => seen!.add(a.id))
+      for (const a of fresh) {
+        notifyInBackground({
+          title: `新的待审批：${a.title || '有步骤等待处理'}`,
+          body: [a.workflow_name && runName(a), a.node_label].filter(Boolean).join(' · ') || undefined,
+          tag: `approval:${a.id}`,
+          onClick: () => go(`/runs/${a.run_id}`),
+        })
+      }
+    })
+  }
+
+  /**
+   * 派给自己的新待办：规则同待审批——拿到过一次真列表才记底，之后新来的、标签页在后台时发系统通知。不每拍都取列表：
+   * 心跳取的「派给我的」待办数或最新一条的时间（taskCounts.mine / latest）变了才取一次派给我的待处理待办。搭建者以上已经按待审批发过通知的
+   * （待办带着那条审批）不再发第二条；核实、等外部系统这类没有审批的待办只在这里通知
+   */
+  function watchTasks(go: Go): () => void {
+    let seen: Set<string> | null = null
+    let inflight = false
+    let again = false
+    const pull = async () => {
+      if (inflight) { again = true; return }
+      inflight = true
+      try {
+        const { items } = await api.tasks.list({ assigned: 'me', status: 'pending', limit: 100 })
+        const pending = items.filter((t) => t.status === 'pending')
+        if (!seen) { seen = new Set(pending.map((t) => t.id)); return }
+        const fresh = pending.filter((t) => !seen!.has(t.id))
+        fresh.forEach((t) => seen!.add(t.id))
+        const builder = atLeast(useAuth.getState().me, 'builder')
+        const approvals = useCatalog.getState().approvals
+        for (const t of fresh) {
+          if (builder && t.approval_id && approvals.some((a) => a.id === t.approval_id)) continue
+          const owner = t.app_name ?? (t.workflow_name || t.workflow_id ? runName(t) : null)
+          notifyInBackground({
+            title: `${TASK_NOTIFY_TEXT.title}${t.title || TASK_NOTIFY_TEXT.untitled}`,
+            body: [owner, t.node_label].filter(Boolean).join(' · ') || undefined,
+            tag: `task:${t.id}`,
+            // 应用里的待办、口径召回（挂在召回运行上，记录页里没有这张卡）、使用者（进不了记录页）都去待办页；
+            // 搭建者的别的待办去那次运行
+            onClick: () => go(t.app_id || t.kind === 'recall' || !builder
+              ? `/apps/inbox/${encodeURIComponent(t.id)}` : `/runs/${t.run_id}`),
+          })
+        }
+      } catch {
+        // 下次待办数变了再取；没记底之前不发通知
+      } finally {
+        inflight = false
+        if (again) { again = false; void pull() }
+      }
+    }
+    // 待办数随目录在启动时就取了，常常早于外壳挂上这个订阅：已经有数时当场记底，别等到它下一次变——那时新来的
+    // 已经在列表里，会被当成「已有的」记进底里，一条通知都不发
+    if (useCatalog.getState().taskCounts && !needsLogin(useAuth.getState().me)) void pull()
+    return useCatalog.subscribe((s, p) => {
+      if (s.taskCounts === p.taskCounts || !s.taskCounts) return
+      if (seen && s.taskCounts.mine === p.taskCounts?.mine && s.taskCounts.latest === p.taskCounts?.latest) return
+      if (needsLogin(useAuth.getState().me)) return
+      void pull()
+    })
+  }
+
+  function ShellSignals({ useStudio, useChat, useConversations, isActivePhase }: WorkspaceDeps) {
+    const { pathname, search } = useLocation()
+    const navigate = useNavigate()
+    // 标签页标题上的待处理数：搭建者以上照旧数待审批；使用者没有待审批列表，数派给自己的待办
+    const builder = useAuth((s) => atLeast(s.me, 'builder'))
+    const pending = useCatalog((s) => (builder ? s.approvals.filter((a) => a.status === 'pending').length : s.taskCounts?.mine ?? 0))
+    const studio = useStudioActivity(useStudio)
+    const chat = useChatActivity(useChat)
+    const attention = useSignals((s) => s.attention)
+    const pageTitle = useSignals((s) => s.pageTitle)
+    const workflowName = useStudio((s) => s.workflow?.name ?? null)
+    const conversationTitle = useConversations((s) => s.list.find((c) => c.id === s.currentId)?.title ?? null)
+
+    const [page, object] = describePath(pathname, search, { workflowName, conversationTitle })
+    const progress = studio.startsWith('run:') ? ` ${studio.slice(4)}` : ''
+    const activity = studio.startsWith('run') || chat === 'run'
+      ? `● 运行中${progress}`
+      : studio === 'gen' || chat === 'gen' ? '● 生成中' : null
+
+    useEffect(() => {
+      document.title = composeTitle({
+        pending, activity, attention, page: pageTitle ?? page, object: pageTitle ? null : object,
+      })
+    })
+
+    // 点的优先级：失败 > 等人 > 在跑 > 后台时跑完了
+    const dot: FaviconDot | null = attention?.tone === 'err'
+      ? 'failed'
+      : pending > 0 || attention?.tone === 'warn'
+        ? 'waiting'
+        : activity ? 'running' : attention?.tone === 'ok' ? 'done' : null
+    useEffect(() => { paintFavicon(dot) }, [dot])
+
+    const navRef = useRef(navigate)
+    navRef.current = navigate
+    useEffect(() => {
+      const go: Go = (to) => { if (to) navRef.current(to) }
+      const stops = [
+        watchStudio(go, useStudio, isActivePhase),
+        watchChat(go, useChat),
+        watchApprovals(go),
+        watchTasks(go),
+      ]
+      return () => stops.forEach((stop) => stop())
+    }, [useStudio, useChat, isActivePhase])
+    return null
+  }
+
+  return { default: Shell }
 }
+
+const LazyWorkspaceShell = lazy(loadShellComponent)

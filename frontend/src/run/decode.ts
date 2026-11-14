@@ -1837,54 +1837,92 @@ function actionStep(type: string, d: Record<string, any>, seq: number, nodeId?: 
   }
 }
 
-export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOptions): Step[] {
-  const out: Step[] = []
+function cloneStep(s: Step): Step {
+  return {
+    ...s,
+    ...(s.execs ? { execs: s.execs.map((e) => ({ ...e })) } : {}),
+    ...(s.children ? { children: s.children.map(cloneStep) } : {}),
+  }
+}
+
+export interface RunDecoder {
+  /** 增量消费新增事件并投影当前步骤树；当输入引用和终态均未变时 O(1) 返回缓存结果 */
+  decode: (events: readonly RunEvent[], final?: RunFinal) => Step[]
+  /** 仅用于内部前缀缓存校验：检查 events 是否以已解码序列为严格前缀 */
+  canAdvanceTo: (events: readonly RunEvent[], exitLabelOf?: ExitLabelOf) => boolean
+}
+
+export function createRunDecoder(opts?: DecodeOptions): RunDecoder {
+  let out: Step[] = []
   /** node_id → 该节点的顶层 Step，用于把子步骤挂进去 */
-  const nodeSteps = new Map<string, Step>()
+  let nodeSteps = new Map<string, Step>()
   /** call_id（或工具名兜底）→ 待配对的工具 Step */
-  const pendingTools = new Map<string, Step>()
+  let pendingTools = new Map<string, Step>()
   /** node_id → 待配对的模型调用 Step */
-  const pendingLlm = new Map<string, Step>()
+  let pendingLlm = new Map<string, Step>()
   /** supervisor 里待配对的单个 agent 步骤 */
-  const pendingAgents = new Map<string, Step>()
+  let pendingAgents = new Map<string, Step>()
   /** node_id|round → 调度者这一轮的决策行（route.start 开、route.end 收） */
-  const pendingRoutes = new Map<string, Step>()
+  let pendingRoutes = new Map<string, Step>()
   /** 已经有结构化调度事件的轮次。同一轮那条带 round 的 log 说的是同一件事，不再成行 */
-  const routed = new Set<string>()
+  let routed = new Set<string>()
   /** node_id → 协作团队的泳道数据。边解码边攒，最后挂到该节点的顶层 Step 上 */
-  const teams = new Map<string, TeamRunEx>()
+  let teams = new Map<string, TeamRunEx>()
   /** node_id → 校验节点最近一次修复。被作废的说明（repair_invented）折进这一行 */
-  const repairs = new Map<string, Step>()
+  let repairs = new Map<string, Step>()
   /**
    * node_id → 门控拦下、还没见到下文的调用。下文是 human.requested（agent、工具节点：交给人批），
    * 或者 code 为 tool_needs_approval 的 log（协作团队：成员停不下来，这次不执行）
    */
-  const escalated = new Map<string, { step: Step; tool: string; reason: string }[]>()
+  let escalated = new Map<string, { step: Step; tool: string; reason: string }[]>()
   /** node_id → 起止时刻。用来事后认出"哪几个节点是同时跑的" */
-  const spans = new Map<string, { start: number; end: number; ms: number }>()
+  let spans = new Map<string, { start: number; end: number; ms: number }>()
   /**
    * 分析那一行（Agent 工具按 call_id，分析卡按节点 + 项）：紧跟着的那条「没有做成」的提醒（log analysis_refused）说的是同一件事，
    * 那一行已经写了判定语（「…没有做成：原因」），不再另起一行
    */
-  const analysisSteps = new Map<string, Step>()
+  let analysisSteps = new Map<string, Step>()
+  let openInterrupts = new Map<string, Step>()
+  let thought = new WeakSet<Step>()
+  /** 上一条就是恢复事件——用来认出紧随其后的那条重复的"继续运行" */
+  let justResumed = false
+  /** 恢复事件带来的签批人：run.resumed 有，紧接着的 human.resolved 老后端不一定有 */
+  let resumedActor: unknown
+  /** 相位跟着事件走，结局要知道此刻是不是停在审批上 */
+  let phase: PhaseState = { phase: 'idle', awaiting: false }
+  let processed: RunEvent[] = []
+  let lastEventsRef: readonly RunEvent[] | null = null
+  let lastSnapshot: { count: number; status?: string; pending?: boolean; steps: Step[] } | null = null
+  const exitLabelOf = opts?.exitLabelOf
+
+  const reset = () => {
+    out = []
+    nodeSteps = new Map()
+    pendingTools = new Map()
+    pendingLlm = new Map()
+    pendingAgents = new Map()
+    pendingRoutes = new Map()
+    routed = new Set()
+    teams = new Map()
+    repairs = new Map()
+    escalated = new Map()
+    spans = new Map()
+    analysisSteps = new Map()
+    openInterrupts = new Map()
+    thought = new WeakSet()
+    justResumed = false
+    resumedActor = undefined
+    phase = { phase: 'idle', awaiting: false }
+    processed = []
+    lastEventsRef = null
+    lastSnapshot = null
+  }
 
   /** 协作团队的状态只有一个来源：reduceTeam。画布那边调的是同一个函数 */
   const trackTeam = (event: RunEvent): void => {
     const next = reduceTeam(teams.get(event.node_id ?? ''), event)
     if (next && event.node_id) teams.set(event.node_id, next)
   }
-  /**
-   * node_id → 这个节点当前那条尚未闭合的审批步骤。
-   *
-   * 审批是"开→闭"配对的，不能只靠内容去重。同一次中断会发三条事件
-   * （human.requested、run.interrupted，恢复后节点重放又来一条
-   * human.requested），三条内容完全一样；而一个循环里连续三轮审批
-   * （驳回 → 改写 → 再审）内容也完全一样。按内容去重的话，要么把重放
-   * 算成新的一轮，要么把真实的第二轮当成重放吞掉——两种都错。
-   *
-   * 开着就是同一次，闭了才是新一次。
-   */
-  const openInterrupts = new Map<string, Step>()
 
   const push = (step: Step, nodeId?: string) => {
     const parent = nodeId ? nodeSteps.get(nodeId) : undefined
@@ -1902,13 +1940,6 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
     return execs?.[execs.length - 1]
   }
 
-  /**
-   * 老后端的 agent 不发 llm.end，一次模型调用做没做完只能看它后面来了什么：同一节点接着
-   * 调了工具、开始了下一次调用、节点收了尾，前一次就是做完了。不收的话它们一直挂着，
-   * 运行被取消或失败时终态清扫把一整列「思考并作答」都写成已取消——而它们后面明明跟着
-   * 真执行过的工具。结束时刻取那条事件的时刻；清扫只剩最后那一次真在进行中的
-   */
-  const thought = new WeakSet<Step>()
   const closeLlm = (nodeId: string | undefined, status: StepStatus, at?: number) => {
     const step = pendingLlm.get(nodeId ?? '_')
     if (!step) return
@@ -1920,12 +1951,6 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
     pendingLlm.delete(nodeId ?? '_')
   }
 
-  /**
-   * 把决定折进那条审批行，而不是另起一行——"问了什么 → 怎么定的"是一件事。
-   *
-   * 谁定的照事件里的 actor 写。以前一律写"你驳回了"，而多人使用时批的可能是
-   * 别人；没署名（actor 为 null、老数据没有这个字段）就只说结果，不猜是谁。
-   */
   const verdict = (approved: unknown, actor: unknown): string => {
     const who = typeof actor === 'string' && actor.trim() ? actor.trim() : ''
     const what = approved === false ? '驳回' : '批准'
@@ -1942,13 +1967,6 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
     return true
   }
 
-  /** 上一条就是恢复事件——用来认出紧随其后的那条重复的"继续运行" */
-  let justResumed = false
-  /** 恢复事件带来的签批人：run.resumed 有，紧接着的 human.resolved 老后端不一定有 */
-  let resumedActor: unknown
-
-  /** 相位跟着事件走，结局要知道此刻是不是停在审批上 */
-  let phase: PhaseState = { phase: 'idle', awaiting: false }
   const settle = (ending: Ending) => {
     settleSteps(out, ending)
     for (const [id, team] of teams) teams.set(id, settleTeam(team, ending))
@@ -1962,7 +1980,10 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
     }
   }
 
-  for (const event of events) {
+  const ingestRange = (events: readonly RunEvent[], startIndex: number) => {
+    for (let idx = startIndex; idx < events.length; idx += 1) {
+      const event = events[idx]
+      processed.push(event)
     const type = String(event.type)
     if (EPHEMERAL.has(type) || SILENT.has(type)) continue
     const awaiting = phase.awaiting
@@ -3142,26 +3163,87 @@ export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOpt
           detail: `事件类型：${type}\n${JSON.stringify(d, null, 2).slice(0, 1000)}`,
         }, nodeId)
     }
+    }
   }
 
-  // 事件之外知道的结局（对账查到的状态）。已经收过的再收一次也不会变
-  if (final?.status) {
-    const ending = endingOf(finalEvent(final), phase.awaiting)
-    if (ending) settle(ending)
+  const project = (final?: RunFinal): Step[] => {
+    const clonedNodeSteps = new Map<string, Step>()
+    const projected = out.map((rawStep) => {
+      const cloned = cloneStep(rawStep)
+      if (rawStep.nodeId && nodeSteps.get(rawStep.nodeId) === rawStep) {
+        clonedNodeSteps.set(rawStep.nodeId, cloned)
+      }
+      return cloned
+    })
+    const projectedTeams = new Map(teams)
+
+    // 事件之外知道的结局（对账查到的状态）。已经收过的再收一次也不会变
+    if (final?.status) {
+      const ending = endingOf(finalEvent(final), phase.awaiting)
+      if (ending) {
+        settleSteps(projected, ending)
+        for (const [id, team] of projectedTeams) projectedTeams.set(id, settleTeam(team, ending))
+      }
+    }
+
+    // 还没收到 end 的工具/模型调用保持 running——它们正在进行，不是丢了
+    groupConcurrent(projected, spans)
+
+    // 泳道挂到 supervisor 节点的顶层 Step 上。节点内部那些"第N轮交给谁""X：指令"
+    // 仍然留着——泳道给的是一眼看清的形状，那些步骤给的是内容，两者不重复
+    for (const [nodeId, team] of projectedTeams) {
+      if (!team.rounds.length) continue
+      const step = clonedNodeSteps.get(nodeId)
+      if (step) step.team = team
+    }
+
+    return projected
   }
 
-  // 还没收到 end 的工具/模型调用保持 running——它们正在进行，不是丢了
-  groupConcurrent(out, spans)
-
-  // 泳道挂到 supervisor 节点的顶层 Step 上。节点内部那些"第N轮交给谁""X：指令"
-  // 仍然留着——泳道给的是一眼看清的形状，那些步骤给的是内容，两者不重复
-  for (const [nodeId, team] of teams) {
-    if (!team.rounds.length) continue
-    const step = nodeSteps.get(nodeId)
-    if (step) step.team = team
+  const canAdvanceTo = (events: readonly RunEvent[], candidateExitLabelOf?: ExitLabelOf): boolean => {
+    if (exitLabelOf !== candidateExitLabelOf || events.length < processed.length) return false
+    if (events === lastEventsRef && events.length === processed.length) return true
+    for (let i = 0; i < processed.length; i += 1) {
+      if (events[i] !== processed[i]) return false
+    }
+    return true
   }
 
-  return out
+  const decode = (events: readonly RunEvent[], final?: RunFinal): Step[] => {
+    if (
+      lastSnapshot
+      && events === lastEventsRef
+      && events.length === lastSnapshot.count
+      && lastSnapshot.status === final?.status
+      && lastSnapshot.pending === final?.pending
+    ) {
+      return lastSnapshot.steps
+    }
+    if (!canAdvanceTo(events, exitLabelOf)) reset()
+    if (events.length > processed.length) ingestRange(events, processed.length)
+    const steps = project(final)
+    lastEventsRef = events
+    lastSnapshot = { count: events.length, status: final?.status, pending: final?.pending, steps }
+    return steps
+  }
+
+  return { decode, canAdvanceTo }
+}
+
+const prefixDecoders = new WeakMap<object, RunDecoder>()
+
+export function decodeRun(events: RunEvent[], final?: RunFinal, opts?: DecodeOptions): Step[] {
+  if (!events.length) return []
+  const first = events[0]
+  if (!first || typeof first !== 'object') {
+    return createRunDecoder(opts).decode(events, final)
+  }
+  let decoder = prefixDecoders.get(first)
+  if (!decoder || !decoder.canAdvanceTo(events, opts?.exitLabelOf)) {
+    decoder = createRunDecoder(opts)
+    prefixDecoders.set(first, decoder)
+  }
+  return decoder.decode(events, final).map(cloneStep)
 }
 
 // -------------------------------------------------------------------------

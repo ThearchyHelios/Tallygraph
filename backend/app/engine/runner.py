@@ -272,12 +272,13 @@ class RunManager:
             from app.cluster import requests, workers
 
             async with SessionLocal() as session:
-                row = (await session.execute(select(Run.status, Run.owner).where(Run.id == run_id))).first()
-            if row is not None and row.status in ("running", "queued") and row.owner \
-                    and row.owner != identity.owner() and await workers.alive(row.owner):
-                await requests.send(row.owner, "note", "run", run_id, payload={
-                    "type": str(event_type), "node_id": node_id, "data": data})
-                return
+                row = (await session.execute(select(Run.status, Run.owner, Run.last_seq).where(Run.id == run_id))).first()
+                if row is not None and row.status in ("running", "queued") and row.owner \
+                        and row.owner != identity.owner() and await workers.alive(row.owner):
+                    await requests.send(row.owner, "note", "run", run_id, payload={
+                        "type": str(event_type), "node_id": node_id, "data": data})
+                    return
+                bus.set_seq(run_id, await _seq_floor(session, run_id, row.last_seq if row is not None else 0))
         await self._emit(run_id, event_type, node_id=node_id, data=data)
 
     # ---------------- 启动 ----------------
@@ -372,6 +373,7 @@ class RunManager:
                 )
                 run.thread_id = run.id  # 一个 run 一条 checkpoint 线程
                 session.add(run)
+                bus.mark_active(run.id)
                 staged: list[RunEventModel] = []
                 if notes:
                     await session.flush()   # 事件要带上运行的 id
@@ -549,6 +551,7 @@ class RunManager:
                 .values(status="resolved")
             )
             run = await session.get(Run, run_id)
+            bus.mark_active(run_id)
             bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq))
             await session.commit()
             await session.refresh(run)
@@ -671,6 +674,7 @@ class RunManager:
                               lambda status: _cannot_continue(status, False),
                               **({"graph": spec.model_dump(mode="json")} if graph is not None else {}))
             run = await session.get(Run, run_id)
+            bus.mark_active(run_id)
             bus.set_seq(run_id, await _seq_floor(session, run_id, run.last_seq))
             await session.commit()
             await session.refresh(run)
@@ -805,6 +809,7 @@ class RunManager:
     ) -> None:
         from app.cluster import slots
 
+        bus.mark_active(run_id)
         started = time.perf_counter()
         status = "succeeded"
         error: str | None = None
@@ -1032,6 +1037,7 @@ class RunManager:
                     self._finalizing.discard(run_id)
                     self._tasks.pop(run_id, None)
                     self._stopped_by.pop(run_id, None)
+                    bus.mark_inactive(run_id)
                 # 运行到终态就把沙箱会话收掉。thread_id 每个 run 都是新的，
                 # 不收的话每跑一次带代码节点的图就多一台常驻 microVM（几百 MB），
                 # 而且没有任何自动回收路径会碰它——闲置回收只在"下次有人执行
@@ -1082,6 +1088,7 @@ class RunManager:
         finally:
             self._tasks.pop(run_id, None)
             self._stopped_by.pop(run_id, None)
+            bus.mark_inactive(run_id)
 
     async def _stopped_in_queue(self, run_id: str, *, queue_ms: int = 0) -> None:
         """还在等并发名额时被取消。关停：什么都不写（还是排队中 / 刚认领的样子），照「属主不在了」的规矩由下次启动或别的
@@ -1102,6 +1109,7 @@ class RunManager:
             self._finalizing.discard(run_id)
             self._tasks.pop(run_id, None)
             self._stopped_by.pop(run_id, None)
+            bus.mark_inactive(run_id)
 
     async def _handle_custom(self, run_id: str, chunk: Any) -> None:
         """节点通过 get_stream_writer 发来的事件。"""
@@ -1282,11 +1290,9 @@ class RunManager:
             # 那条宣布"跑完了、成果是什么"的事件——改它的成果，清单照样对得上。
             # 中断态不封：事件还会继续追加
             await self._seal(run_id)
-        if status in ("succeeded", "failed", "cancelled") or (
-            status == "interrupted" and self._closing
-        ):
-            # 关停时挂起的也要让在线的客户端收尾：进程马上就没了，不说一声，
-            # 界面会一直以为它还在跑
+        if status in ("succeeded", "failed", "cancelled", "interrupted", "awaiting_approval"):
+            # 本轮执行段结束（包括终态与停在审批/挂起断点）时关闭本轮流订阅，让 WebSocket 干净收尾不悬空；
+            # 后续 resume / continue_failed 会按库里的 last_seq 重新接上序号
             await bus.close(run_id)
         if app_id and (status in ("succeeded", "failed") or end_reason == END_REJECTED):
             # 应用实例结束、失败：按应用订阅推送（app/notify/service.py）。放到后台，接收端慢不拖着收尾。被驳回的走

@@ -1657,12 +1657,15 @@ export const useStudio = create<StudioState>((set, get) => {
   },
 
   save: (note, opts) => {
+    const callerId = get().workflow?.id
     // 同一时刻只跑一次保存（K02）：⌘S 连按、工具栏和助手同时点，都不会拿同一个基准版本并发发两次。排在后面的
     // 那一次等前面那次回来之后再发，用的是前面那次之后 store 里的基准版本；图没变时服务端也不新增版本
     const queued = (pendingSave ?? Promise.resolve()).then(async () => {
-      const { workflow, nodes, edges, pendingNote, dirty } = get()
-      if (!workflow) return
+      const { workflow: current, nodes, edges, pendingNote, dirty } = get()
+      if (!current || (callerId && current.id !== callerId)) return
+      const savingId = current.id
       const graph = toGraph(nodes, edges)
+      const payloadSig = JSON.stringify(graph)
       const text = (note ?? pendingNote).trim()
       // 没有未保存的修改（⌘S 连按的第二次、刚存完又按了一下）、也没有版本说明：没有要写的东西，不发这一趟请求。
       // 下面的收尾照旧做——画布现在这一份就是已经存着的那一份（dirty 为假），「升级没存上」这类状态该跟着清掉
@@ -1671,25 +1674,32 @@ export const useStudio = create<StudioState>((set, get) => {
         // 基准版本（K02 的乐观锁）：默认用读到的 Workflow.version；「用最新版本再保存」才用服务端刚回的当前版本。
         // 已接管的资产（文档起草的口径卡）服务端要求它，别的资产也照同一条走——两个页面先后保存旧图时，后一个
         // 被拒（409 stale_revision），而不是盖掉前一个
-        const base = opts?.expectedRevision ?? workflow.version
+        const base = opts?.expectedRevision ?? current.version
         try {
-          const updated = await api.workflows.update(workflow.id, {
+          const updated = await api.workflows.update(savingId, {
             graph, expected_revision: base, ...(text ? { note: text } : {}),
           })
-          savedSig = JSON.stringify(graph)
+          if (get().workflow?.id !== savingId) return
+          savedSig = payloadSig
+          const now = get()
           // 请求在途时又改了的话，那部分还没存：不能把「未保存」清掉
-          set({ workflow: updated, dirty: graphSig(get().nodes, get().edges) !== savedSig, pendingNote: '',
-                staleSave: null })
+          set({
+            workflow: updated,
+            dirty: graphSig(now.nodes, now.edges) !== savedSig,
+            ...(now.pendingNote === pendingNote ? { pendingNote: '' } : {}),
+            staleSave: null,
+          })
         } catch (e) {
           // 有人先改过同一张图：画布上的修改一个字不动（dirty 一直是 true），也不自动重发；只把服务端现在的版本
           // 记下来，页面上给两条明确的路让人选（用最新版本再保存 / 载入最新版本）
-          if (e instanceof ApiError && e.status === 409 && e.code === 'stale_revision') {
+          if (get().workflow?.id === savingId && e instanceof ApiError && e.status === 409 && e.code === 'stale_revision') {
             const told = Number((e.body as { current_version?: unknown } | undefined)?.current_version)
             set({ staleSave: { base, current: Number.isFinite(told) ? told : null }, dirty: true })
           }
           throw e
         }
       }
+      if (get().workflow?.id !== savingId) return
       // 升级落到画布上之后没存上（存失败、要存时锁着），这回平常的保存（⌘S、工具栏）存上了：画布上是什么就存了什么，
       // 升级要么跟着存进去了、要么已经撤销掉了，「草稿没保存上」都不再是真的。留着的话再点「重试保存」
       // 会多存一版，版本说明还写着「升级为可追溯结构」
@@ -2454,6 +2464,12 @@ export const useStudio = create<StudioState>((set, get) => {
         void reconcile(runId, set, get)
       },
       after,
+      {
+        onError: () => {
+          if (get().unsubscribe === stop) set({ unsubscribe: null })
+          set({ streaming: false })
+        },
+      },
     )
     set({ unsubscribe: stop, streaming: true })
   },

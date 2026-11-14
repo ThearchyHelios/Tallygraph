@@ -48,7 +48,7 @@ PAYLOAD_MAX = 7000
 LOOKBACK = 64
 #: 不落库的事件（同 engine/runner._EPHEMERAL）
 EPHEMERAL = {EventType.LLM_TOKEN, EventType.LLM_THINKING_DELTA}
-_TERMINAL = ("succeeded", "failed", "cancelled")
+_TERMINAL = ("succeeded", "failed", "cancelled", "interrupted", "awaiting_approval")
 
 
 class Relay:

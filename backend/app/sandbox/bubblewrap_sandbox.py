@@ -75,8 +75,16 @@ class BubblewrapSandbox(Sandbox):
     name = "bubblewrap"
 
     def __init__(self) -> None:
-        self._root = settings.workspace_dir / "bwrap"
+        self._custom_root: Path | None = None
         self._bwrap = shutil.which("bwrap")
+
+    @property
+    def _root(self) -> Path:
+        return self._custom_root if self._custom_root is not None else settings.workspace_dir
+
+    @_root.setter
+    def _root(self, value: Path) -> None:
+        self._custom_root = value
 
     @staticmethod
     def available() -> bool:
@@ -118,6 +126,9 @@ class BubblewrapSandbox(Sandbox):
         path = self._root / sanitize_session(session_id)
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def _workspace(self, session_id: str) -> Path:
+        return self._session_dir(session_id)
 
     @staticmethod
     def _preexec(limits: SandboxLimits):  # pragma: no cover - 子进程里执行
@@ -252,7 +263,7 @@ class BubblewrapSandbox(Sandbox):
             if ephemeral:
                 root_resolved = self._root.resolve()
                 if work_root != root_resolved and work_root.is_relative_to(root_resolved):
-                    shutil.rmtree(workdir, ignore_errors=True)
+                    await asyncio.to_thread(shutil.rmtree, workdir, True)
 
     @staticmethod
     def _kill(proc: asyncio.subprocess.Process) -> None:
@@ -262,4 +273,5 @@ class BubblewrapSandbox(Sandbox):
             proc.kill()
 
     async def cleanup(self, session_id: str) -> None:
-        await asyncio.to_thread(shutil.rmtree, self._session_dir(session_id), True)
+        path = self._root / sanitize_session(session_id)
+        await asyncio.to_thread(shutil.rmtree, path, True)

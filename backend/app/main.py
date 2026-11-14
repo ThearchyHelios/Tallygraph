@@ -244,8 +244,19 @@ def _register_cache_handlers() -> None:
 
         clear_cache()
 
+    def kb_vectors(key: str | None) -> None:
+        from app.memory.kb import invalidate_vector_cache
+
+        invalidate_vector_cache(key, broadcast=False)
+
+    async def custom_models(_key: str | None) -> None:
+        from app.providers.catalog import _reload_custom_models_from_db
+
+        await _reload_custom_models_from_db()
+
     for name, fn in (("auth_settings", auth_settings), ("public_url", public_address), ("embeddings", embeddings),
-                     ("capabilities", capabilities), ("datasource_engine", datasource_engine), ("app_pages", app_pages)):
+                     ("capabilities", capabilities), ("datasource_engine", datasource_engine), ("app_pages", app_pages),
+                     ("kb_vectors", kb_vectors), ("custom_models", custom_models)):
         caches.on(name, fn)
 
 

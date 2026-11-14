@@ -8,6 +8,7 @@ import math
 import re
 from collections.abc import Iterable, Mapping
 from datetime import date, timedelta
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from typing import Any
 
 from app.core import artifact_store
@@ -939,21 +940,111 @@ def _integer(raw: Any) -> int | None:
     return None
 
 
+def _quantize_half_up(value: Decimal, decimals: int) -> Decimal:
+    if abs(decimals) > 400:
+        return Decimal(str(round(float(value), decimals)))
+    with localcontext() as dctx:
+        dctx.prec = max(64, len(value.as_tuple().digits) + abs(decimals) + 16)
+        quantized = value.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP)
+        return Decimal(0) if quantized == 0 else quantized
+
+
+def _format_high_precision_decimal(value: Decimal, *, unit: str, decimals: int | None, fmt: str) -> str:
+    target = value * 100 if fmt == "percent_of_ratio" else value
+    eff_decimals = (decimals - 2 if decimals is not None else None) if fmt == "percent_of_ratio" else decimals
+    if eff_decimals is not None:
+        target = _quantize_half_up(target, eff_decimals)
+    sign = "-" if target < 0 else ""
+    mag = abs(target)
+    if eff_decimals is not None and eff_decimals > 0:
+        text = f"{mag:.{eff_decimals}f}"
+    elif eff_decimals is not None and eff_decimals <= 0:
+        text = str(int(_quantize_half_up(mag, eff_decimals)))
+    else:
+        text = format(mag.normalize(), "f") if mag != 0 else "0"
+    int_part, dot, frac_part = text.partition(".")
+    if fmt == "thousands":
+        int_part = f"{int(int_part):,}"
+    body = f"{sign}{int_part}{dot}{frac_part}"
+    if fmt == "percent_of_ratio":
+        suffix = "" if unit in ("%", "％") else unit
+        return f"{body}%{suffix}"
+    return f"{body}{unit}"
+
+
 def round_metric(value: Any, decimals: Any) -> Any:
-    """口径卡的取整：只取整浮点，按小数位 round（Python 的 round，负数取整到十位、百位）；整数、文本、空值原样，
-    小数位没写或不是整数（老卡上记着的 true、2.0 这类怪值）时也原样。
+    """口径卡的取整：按十进制 ROUND_HALF_UP（Decimal.quantize，负数取整到十位、百位）取整浮点与 Decimal；
+    整数、文本、空值原样，小数位没写或不是整数（老卡上记着的 true、2.0 这类怪值）时也原样。
 
     推演重算（engine/recompute.py）、双盲复算的盲值都按卡重算，取整规则只能有这一处：两边各写一行，口径卡哪天换了
     取整方式，推演就会对着同一张卡算出另一个数。"""
-    if isinstance(value, float) and isinstance(decimals, int) and not isinstance(decimals, bool):
-        return round(value, decimals)
+    if isinstance(value, bool):
+        return value
+    valid_decimals = isinstance(decimals, int) and not isinstance(decimals, bool)
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            return float(value)
+        if valid_decimals:
+            quantized = _quantize_half_up(value, decimals)
+            return 0.0 if quantized == 0 else float(quantized)
+        if value == value.to_integral_value() and value.as_tuple().exponent >= 0:
+            return int(value)
+        return float(value)
+    if isinstance(value, float) and valid_decimals:
+        if not math.isfinite(value):
+            return value
+        quantized = _quantize_half_up(Decimal(str(value)), decimals)
+        return 0.0 if quantized == 0 else float(quantized)
     return value
+
+
+def render_metric_value(
+    value: Any,
+    *,
+    unit: str = "",
+    decimals: Any = None,
+    fmt: Any = None,
+    parse_numeric_str: bool = False,
+) -> str:
+    """按口径卡同一套十进制 ROUND_HALF_UP 规则把数值渲染成展示文本（口径卡与召回原值展示共用）。"""
+    effective_fmt = fmt or DEFAULT_FORMAT
+    valid_decimals = isinstance(decimals, int) and not isinstance(decimals, bool)
+    dec_val: Decimal | None = None
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            return render_number(float(value), unit=unit, decimals=decimals, fmt=fmt)
+        dec_val = value
+    elif parse_numeric_str and isinstance(value, str):
+        coerced = cell_value(value)
+        if isinstance(coerced, (int, float)) and not isinstance(coerced, bool):
+            try:
+                candidate = Decimal(value.strip())
+                if candidate.is_finite():
+                    dec_val = candidate
+            except Exception:  # noqa: BLE001
+                dec_val = None
+    if dec_val is not None:
+        quantized = _quantize_half_up(dec_val, decimals) if valid_decimals else dec_val
+        as_num: int | float
+        if not valid_decimals and quantized == quantized.to_integral_value() and quantized.as_tuple().exponent >= 0:
+            as_num = int(quantized)
+            return render_number(as_num, unit=unit, decimals=decimals, fmt=fmt)
+        as_float = 0.0 if quantized == 0 else float(quantized)
+        if math.isfinite(as_float) and Decimal(str(as_float)) == quantized.normalize():
+            return render_number(as_float, unit=unit, decimals=decimals, fmt=fmt)
+        if effective_fmt in FORMATS and (decimals is None or valid_decimals):
+            return _format_high_precision_decimal(quantized, unit=unit, decimals=decimals if valid_decimals else None,
+                                                  fmt=effective_fmt)
+        return render_number(as_float, unit=unit, decimals=decimals, fmt=fmt)
+    if isinstance(value, float) and valid_decimals:
+        value = round_metric(value, decimals)
+    return render_number(value, unit=unit, decimals=decimals, fmt=fmt)
 
 
 def _rendered(value: Any, definition: dict[str, Any], display: dict[str, Any]) -> str:
     try:
-        return render_number(value, unit=str(definition.get("unit") or ""),
-                             decimals=display["decimals"], fmt=display["format"])
+        return render_metric_value(value, unit=str(definition.get("unit") or ""),
+                                   decimals=display["decimals"], fmt=display["format"])
     except RenderError:
         # 按规则渲染不出来的值显示「—」：inf / nan、不是 0 却会显示成 0 的（小数位不够）、
         # 位数大到不像话的。值本身照旧记着，报告里引用它会被判成解析不了，原因写清楚

@@ -1190,14 +1190,23 @@ const POLL_MS = 1500
 /** 不在进行中的状态：同服务端 api/runs._SETTLED，另加服务重启挂起的 suspended（轮询时没有后续事件会来） */
 const SETTLED_STATUS = new Set(['succeeded', 'failed', 'cancelled', 'interrupted', 'suspended'])
 
+export interface StreamRunHandlers {
+  onError?: (err: unknown) => void
+}
+
+const PERMANENT_POLL_STATUS = new Set([401, 403, 404])
+
 export function streamRun(
   runId: string,
   onEvent: (event: RunEvent) => void,
   // stream.end 带着运行的最终状态：连到一条已经不在进行中的运行（含 interrupted）
   // 时，客户端靠它知道不会再有事件，不能一直当它还在跑
   onClose?: (end?: { status?: RunStatus | string }) => void,
-  after = 0,
+  afterOrHandlers: number | StreamRunHandlers = 0,
+  maybeHandlers?: StreamRunHandlers,
 ): () => void {
+  const after = typeof afterOrHandlers === 'number' ? afterOrHandlers : 0
+  const handlers = typeof afterOrHandlers === 'object' && afterOrHandlers !== null ? afterOrHandlers : maybeHandlers
   let socket: WebSocket | null = null
   let closed = false
   let lastSeq = after
@@ -1239,7 +1248,20 @@ export function streamRun(
         }
       }
       retry = 0
-    } catch {
+    } catch (err) {
+      const status = err instanceof ApiError
+        ? err.status
+        : typeof (err as { status?: unknown })?.status === 'number'
+          ? (err as { status: number }).status
+          : undefined
+      if (status !== undefined && PERMANENT_POLL_STATUS.has(status)) {
+        closed = true
+        clearTimeout(pollTimer)
+        clearTimeout(wsRetryTimer)
+        handlers?.onError?.(err)
+        if (!handlers?.onError) onClose?.()
+        return
+      }
       // 断线、服务重启：退避重试，最多等 10 秒
       retry += 1
       delay = Math.min(POLL_MS * 2 ** retry, 10_000)

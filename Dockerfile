@@ -31,16 +31,60 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # 依赖装进独立的 venv：系统自带的 /usr/local/bin/python3 因此保持干净，
-# 沙箱跑用户代码时用的就是它，看不见 fastapi、cryptography 这些服务端的包
+# 沙箱跑用户代码时用的就是它，看不见 fastapi、cryptography 这些服务端的包。
+# 生产运行镜像不装 pytest；microsandbox wheel 仅在 WITH_MICROVM=1 时安装，且全程保持 --no-deps 锁定确定性
 ENV VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 COPY backend/requirements.lock /tmp/requirements.lock
-RUN python -m venv /opt/venv \
- && pip install --no-cache-dir -r /tmp/requirements.lock \
- && rm /tmp/requirements.lock
+RUN <<'SH'
+set -eu
+python -m venv /opt/venv
+python - <<'PY'
+import pathlib, re
+
+src = pathlib.Path('/tmp/requirements.lock').read_text(encoding='utf-8').splitlines(True)
+core, microvm = [], []
+target = core
+skip = False
+cont = False
+for line in src:
+    stripped = line.strip()
+    if cont:
+        if not skip:
+            target.append(line)
+        cont = stripped.endswith('\\')
+        continue
+    if not stripped or stripped.startswith('#'):
+        continue
+    if stripped.startswith('-'):
+        core.append(line)
+        microvm.append(line)
+        cont = stripped.endswith('\\')
+        skip = False
+        target = core
+        continue
+    if re.match(r'^pytest([-_.][A-Za-z0-9_.-]+)?\s*([=<>!~;@\[ ]|$)', stripped, re.I):
+        skip = True
+        target = core
+    elif re.match(r'^microsandbox\s*([=<>!~;@\[ ]|$)', stripped, re.I):
+        skip = False
+        target = microvm
+        target.append(line)
+    else:
+        skip = False
+        target = core
+        target.append(line)
+    cont = stripped.endswith('\\')
+
+pathlib.Path('/tmp/runtime.lock').write_text(''.join(core), encoding='utf-8')
+pathlib.Path('/tmp/microvm.lock').write_text(''.join(microvm), encoding='utf-8')
+PY
+pip install --no-cache-dir --no-deps -r /tmp/runtime.lock
+rm -f /tmp/requirements.lock /tmp/runtime.lock
+SH
 
 # 固定的 uid / gid：部署脚本按它把宿主机上的数据目录改成容器能写
 RUN groupadd --gid 10001 agentlab \
@@ -54,10 +98,17 @@ RUN groupadd --gid 10001 agentlab \
 # 放在拷源码之前：拉镜像要一分钟左右，源码改了这一层还能用缓存
 ARG WITH_MICROVM=1
 ARG MICROVM_IMAGE=python:3.12-slim
+RUN <<'SH'
+set -eu
+if [ "${WITH_MICROVM}" = "1" ] && [ -s /tmp/microvm.lock ]; then
+  pip install --no-cache-dir --no-deps -r /tmp/microvm.lock
+fi
+rm -f /tmp/microvm.lock
+SH
 USER 10001:10001
 RUN <<'SH'
 set -eu
-[ "$WITH_MICROVM" = 1 ] || exit 0
+[ "${WITH_MICROVM}" = "1" ] || exit 0
 python - <<'PY'
 import asyncio, microsandbox
 async def main():
@@ -66,11 +117,11 @@ asyncio.run(main())
 PY
 # install() 把 wheel 自带的 msb 和 libkrunfw 又拷了一份，换成指回原件的链接，省 55 MB
 bundled="$(python -c 'import microsandbox, os; print(os.path.dirname(microsandbox.__file__))')/_bundled"
-for f in "$HOME"/.microsandbox/bin/* "$HOME"/.microsandbox/lib/*; do
-  src="$bundled/$(basename "$(dirname "$f")")/$(basename "$f")"
-  if [ -f "$f" ] && [ ! -L "$f" ] && cmp -s "$f" "$src"; then ln -sf "$src" "$f"; fi
+for f in "${HOME}"/.microsandbox/bin/* "${HOME}"/.microsandbox/lib/*; do
+  src="${bundled}/$(basename "$(dirname "${f}")")/$(basename "${f}")"
+  if [ -f "${f}" ] && [ ! -L "${f}" ] && cmp -s "${f}" "${src}"; then ln -sf "${src}" "${f}"; fi
 done
-"$HOME/.microsandbox/bin/msb" pull "$MICROVM_IMAGE"
+"${HOME}/.microsandbox/bin/msb" pull "${MICROVM_IMAGE}"
 SH
 
 WORKDIR /app

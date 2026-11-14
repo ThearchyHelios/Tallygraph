@@ -33,6 +33,8 @@ CHANNEL = "agentlab"
 FLUSH_S = 0.02
 #: 重连的间隔（秒）
 RETRY_S = 2.0
+#: 连接断开期间最多保留多少条待发通知
+_MAX_PENDING = 1024
 
 Handler = Callable[[list[str]], Any]
 
@@ -57,10 +59,15 @@ class Signals:
         self._resync: list[Callable[[], Any]] = []
         self._pending: dict[tuple[str, ...], str] = {}
         self._conn: Any = None
+        self._conn_lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
         self._flusher: asyncio.Task[None] | None = None
         self._wake: asyncio.Event | None = None
         self._stopping = False
+
+    def _trim_pending(self) -> None:
+        while len(self._pending) > _MAX_PENDING:
+            self._pending.pop(next(iter(self._pending)), None)
 
     # ---------------- 登记 ----------------
 
@@ -95,7 +102,9 @@ class Signals:
             key: tuple[str, ...] = (kind, "#", str(self._seq))
         else:
             key = (kind, text[0]) if text else (kind,)
+            self._pending.pop(key, None)
         self._pending[key] = "|".join([kind, _tag(), *text])
+        self._trim_pending()
         if self._wake is not None:
             self._wake.set()
 
@@ -105,12 +114,29 @@ class Signals:
             await self._wake.wait()
             self._wake.clear()
             await asyncio.sleep(FLUSH_S)
-            batch, self._pending = list(self._pending.values()), {}
-            if not batch or self._conn is None:
+            if not self._pending:
                 continue
+            if self._conn is None:
+                self._trim_pending()
+                continue
+            snapshot = dict(self._pending)
+            self._pending.clear()
+            batch = list(snapshot.values())
             try:
-                await self._conn.execute(f"SELECT pg_notify('{CHANNEL}', p) FROM unnest($1::text[]) AS p", batch)
+                async with self._conn_lock:
+                    if self._conn is None:
+                        merged = snapshot
+                        merged.update(self._pending)
+                        self._pending = merged
+                        self._trim_pending()
+                        continue
+                    await self._conn.execute(f"SELECT pg_notify('{CHANNEL}', p) FROM unnest($1::text[]) AS p", batch)
             except Exception:  # noqa: BLE001 - 发不出去只是别的进程晚一拍知道（它们会回库里看）
+                if self._conn is None:
+                    merged = snapshot
+                    merged.update(self._pending)
+                    self._pending = merged
+                    self._trim_pending()
                 logger.debug("NOTIFY 没发出去", exc_info=True)
 
     # ---------------- 收 ----------------
@@ -147,8 +173,11 @@ class Signals:
                 continue
             try:
                 conn.add_termination_listener(lambda _c: lost.set())
-                await conn.add_listener(CHANNEL, self._received)
-                self._conn = conn
+                async with self._conn_lock:
+                    await conn.add_listener(CHANNEL, self._received)
+                    self._conn = conn
+                if self._pending and self._wake is not None:
+                    self._wake.set()
                 if not first:
                     logger.info("进程间通知的连接已重连")
                     self._fire_resync()
@@ -161,7 +190,8 @@ class Signals:
             finally:
                 self._conn = None
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(conn.close(), timeout=2.0)
+                    async with self._conn_lock:
+                        await asyncio.wait_for(conn.close(), timeout=2.0)
             if not self._stopping:
                 await asyncio.sleep(RETRY_S)
 
@@ -198,10 +228,16 @@ class Signals:
         tasks = [t for t in (self._flusher, self._task) if t is not None]
         # 停之前把攒着的发出去：关停时交班、删登记这几条别的进程要尽快知道
         if self._pending and self._conn is not None:
+            batch = list(self._pending.values())
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(self._conn.execute(
-                    f"SELECT pg_notify('{CHANNEL}', p) FROM unnest($1::text[]) AS p", list(self._pending.values())),
-                    timeout=1.0)
+                async def _final_flush() -> None:
+                    async with self._conn_lock:
+                        if self._conn is not None:
+                            await self._conn.execute(
+                                f"SELECT pg_notify('{CHANNEL}', p) FROM unnest($1::text[]) AS p", batch
+                            )
+
+                await asyncio.wait_for(_final_flush(), timeout=1.0)
         self._pending = {}
         for task in tasks:
             task.cancel()

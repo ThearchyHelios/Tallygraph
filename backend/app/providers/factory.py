@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -488,7 +489,7 @@ def _reasoning_aware_openai() -> type:
 
         async def _agenerate(self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any):
             hint_key = (_endpoint_key(self), str(getattr(self, "model_name", "") or ""))
-            use_hint = bool(self._reasoning_hint) and hint_key not in _NO_REASONING_HINT
+            use_hint = bool(self._reasoning_hint) and not _has_no_reasoning_hint(hint_key)
             if not use_hint:
                 return await super()._agenerate(messages, stop, run_manager, **kwargs)
             try:
@@ -501,7 +502,7 @@ def _reasoning_aware_openai() -> type:
                 first = e
             try:
                 res = await super()._agenerate(messages, stop, run_manager, **kwargs)
-                _NO_REASONING_HINT.add(hint_key)
+                _record_no_reasoning_hint(hint_key)
                 logger.warning("模型接入 %s/%s 不支持思考控制参数（%s），已自动剥离", hint_key[0], hint_key[1], str(first)[:200])
                 return res
             except Exception as e:
@@ -515,12 +516,12 @@ def _reasoning_aware_openai() -> type:
                 and self._should_stream_usage(kwargs.get("stream_usage"), **kwargs)
             endpoint = _endpoint_key(self)
             model_key = (endpoint, str(getattr(self, "model_name", "") or ""))
-            use_hint = bool(self._reasoning_hint) and model_key not in _NO_REASONING_HINT
+            use_hint = bool(self._reasoning_hint) and not _has_no_reasoning_hint(model_key)
 
             if use_hint:
                 started = False
                 hint_kwargs = _merge_reasoning_hint(kwargs, self._reasoning_hint)
-                if not usage or model_key in _NO_STREAM_USAGE:
+                if not usage or _has_no_stream_usage(model_key):
                     hint_kwargs = {k: v for k, v in hint_kwargs.items() if k != "stream_options"} | {"stream_usage": False}
                 try:
                     async for chunk in super()._astream(messages, stop, run_manager, **hint_kwargs):
@@ -530,15 +531,15 @@ def _reasoning_aware_openai() -> type:
                 except Exception as e:  # noqa: BLE001
                     if started:
                         raise
-                    if _rejects_stream_options_specifically(e) and usage and model_key not in _NO_STREAM_USAGE:
+                    if _rejects_stream_options_specifically(e) and usage and not _has_no_stream_usage(model_key):
                         # 明确点名拒绝 stream_options：剥离 stream_options 但保留思考控制参数再试
                         no_usage_hint_kwargs = {
                             k: v for k, v in hint_kwargs.items() if k != "stream_options"
                         } | {"stream_usage": False}
                         try:
                             async for chunk in super()._astream(messages, stop, run_manager, **no_usage_hint_kwargs):
-                                if model_key not in _NO_STREAM_USAGE:
-                                    _NO_STREAM_USAGE.add(model_key)
+                                if not _has_no_stream_usage(model_key):
+                                    _record_no_stream_usage(model_key)
                                     logger.warning(
                                         "模型接入 %s/%s 不支持流式用量回传（%s），已改为不请求用量",
                                         model_key[0], model_key[1], str(e)[:200],
@@ -552,8 +553,8 @@ def _reasoning_aware_openai() -> type:
                     # 剥离思考控制参数后走下方常规流式逻辑；若成则记入 _NO_REASONING_HINT
                     yielded_after_strip = False
                     async for chunk in self._astream_without_hint(messages, stop, run_manager, usage=usage, key=model_key, **kwargs):
-                        if not yielded_after_strip and model_key not in _NO_REASONING_HINT:
-                            _NO_REASONING_HINT.add(model_key)
+                        if not yielded_after_strip and not _has_no_reasoning_hint(model_key):
+                            _record_no_reasoning_hint(model_key)
                             logger.warning(
                                 "模型接入 %s/%s 不支持思考控制参数（%s），已自动剥离",
                                 model_key[0],
@@ -571,7 +572,7 @@ def _reasoning_aware_openai() -> type:
             self, messages: Any, stop: Any = None, run_manager: Any = None, *, usage: bool, key: tuple[str, str], **kwargs: Any
         ):
             first: Exception | None = None
-            if usage and key not in _NO_STREAM_USAGE:
+            if usage and not _has_no_stream_usage(key):
                 started = False
                 try:
                     async for chunk in super()._astream(messages, stop, run_manager, **dict(kwargs)):
@@ -586,9 +587,9 @@ def _reasoning_aware_openai() -> type:
                 kwargs = {k: v for k, v in kwargs.items() if k != "stream_options"} | {"stream_usage": False}
             try:
                 async for chunk in super()._astream(messages, stop, run_manager, **kwargs):
-                    if first is not None and key not in _NO_STREAM_USAGE:
+                    if first is not None and not _has_no_stream_usage(key):
                         # 去掉它就成了：记下这个接口+模型不认，之后不再每次先失败一次
-                        _NO_STREAM_USAGE.add(key)
+                        _record_no_stream_usage(key)
                         logger.warning(
                             "模型接入 %s/%s 不支持流式用量回传（%s），已改为不请求用量",
                             key[0], key[1], str(first)[:200],
@@ -602,10 +603,72 @@ def _reasoning_aware_openai() -> type:
     return ReasoningAwareChatOpenAI
 
 
-#: 认定不支持 stream_options 的 (base_url, model)。按接口+模型记忆，避免统一网关下单个旧模型连坐其它模型
-_NO_STREAM_USAGE: set[tuple[str, str]] = set()
+_NO_STREAM_USAGE_TTL_S = 3600.0
+_NO_STREAM_USAGE_MAX = 512
+#: 认定不支持 stream_options 的 {(base_url, model): timestamp}。带 TTL 与容量上限，防止偶发错误永久污染或无限增长
+_NO_STREAM_USAGE: dict[tuple[str, str], float] = {}
+_NO_REASONING_HINT_MAX = 512
 #: 认定不支持思考控制参数（reasoning_effort / enable_thinking / thinking）的 (base_url, model)
 _NO_REASONING_HINT: set[tuple[str, str]] = set()
+
+
+def _has_no_stream_usage(key: tuple[str, str]) -> bool:
+    if isinstance(_NO_STREAM_USAGE, set):
+        return key in _NO_STREAM_USAGE
+    ts = _NO_STREAM_USAGE.get(key)
+    if ts is None:
+        return False
+    now = time.time() if ts > 1_000_000_000.0 else time.monotonic()
+    if (now - ts) >= _NO_STREAM_USAGE_TTL_S:
+        _NO_STREAM_USAGE.pop(key, None)
+        return False
+    return True
+
+
+def _record_no_stream_usage(key: tuple[str, str]) -> None:
+    if isinstance(_NO_STREAM_USAGE, set):
+        _NO_STREAM_USAGE.add(key)
+        return
+    now = time.monotonic()
+    _NO_STREAM_USAGE.pop(key, None)
+    if len(_NO_STREAM_USAGE) >= _NO_STREAM_USAGE_MAX:
+        expired = [
+            k
+            for k, ts in _NO_STREAM_USAGE.items()
+            if ((time.time() if ts > 1_000_000_000.0 else now) - ts) >= _NO_STREAM_USAGE_TTL_S
+        ]
+        for k in expired:
+            _NO_STREAM_USAGE.pop(k, None)
+        while len(_NO_STREAM_USAGE) >= _NO_STREAM_USAGE_MAX:
+            oldest = next(iter(_NO_STREAM_USAGE))
+            _NO_STREAM_USAGE.pop(oldest, None)
+    _NO_STREAM_USAGE[key] = now
+
+
+def _has_no_reasoning_hint(key: tuple[str, str]) -> bool:
+    if isinstance(_NO_REASONING_HINT, dict):
+        ts = _NO_REASONING_HINT.get(key)
+        if ts is None:
+            return False
+        now = time.time() if ts > 1_000_000_000.0 else time.monotonic()
+        if (now - ts) >= _NO_STREAM_USAGE_TTL_S:
+            _NO_REASONING_HINT.pop(key, None)
+            return False
+        return True
+    return key in _NO_REASONING_HINT
+
+
+def _record_no_reasoning_hint(key: tuple[str, str]) -> None:
+    if isinstance(_NO_REASONING_HINT, dict):
+        _NO_REASONING_HINT.pop(key, None)
+        while len(_NO_REASONING_HINT) >= _NO_REASONING_HINT_MAX:
+            oldest = next(iter(_NO_REASONING_HINT))
+            _NO_REASONING_HINT.pop(oldest, None)
+        _NO_REASONING_HINT[key] = time.monotonic()
+        return
+    while len(_NO_REASONING_HINT) >= _NO_REASONING_HINT_MAX:
+        _NO_REASONING_HINT.pop()
+    _NO_REASONING_HINT.add(key)
 
 
 def _endpoint_key(model: Any) -> str:
@@ -617,25 +680,80 @@ def _rejects_stream_options_specifically(exc: Exception) -> bool:
     return "stream_options" in text or "include_usage" in text
 
 
+_REASONING_PARAM_NAMES = (
+    "reasoning",
+    "reasoning_effort",
+    "thinking",
+    "enable_thinking",
+    "thinking_budget",
+    "chat_template_kwargs",
+    "unsupportedparams",
+)
+_SCHEMA_REJECTION_PHRASES = (
+    "unknown parameter",
+    "unknown field",
+    "unrecognized",
+    "extra_forbidden",
+    "extra inputs are not permitted",
+    "extra fields not permitted",
+    "unexpected keyword",
+    "unsupported parameter",
+    "invalid parameter",
+)
+_NON_REASONING_400_INDICATORS = (
+    "context_length",
+    "maximum context",
+    "context window",
+    "too long",
+    "content_filter",
+    "content management policy",
+    "moderation",
+    "safety",
+    "tool_calls",
+    "tool_choice",
+    "function_call",
+    "stream_options",
+    "include_usage",
+)
+
+
 def _rejects_reasoning_hint(exc: Exception) -> bool:
-    """报错是否是服务方拒绝了思考开关或 reasoning_effort 参数（排除上下文超长与 max_tokens 额度拒绝）。"""
+    """报错是否是服务方拒绝了思考开关或 reasoning_effort 参数（排除上下文超长、内容审查与工具参数错误）。"""
     from langchain_core.exceptions import ContextOverflowError
     from app.providers.budget import budget_refused
 
     if isinstance(exc, ContextOverflowError) or budget_refused(exc):
         return False
+    status = getattr(exc, "status_code", None)
+    if status is not None and status not in (400, 422):
+        return False
     text = str(exc).lower()
-    if any(w in text for w in ("reasoning_effort", "enable_thinking", "chat_template_kwargs", "thinking", "unsupportedparams")):
+    if any(w in text for w in _REASONING_PARAM_NAMES):
         return True
-    return getattr(exc, "status_code", None) in (400, 422)
+    if status in (400, 422) and any(p in text for p in _SCHEMA_REJECTION_PHRASES):
+        if not any(bad in text for bad in _NON_REASONING_400_INDICATORS):
+            return True
+    return False
+
+
+_DEFINITE_NON_STREAM_OPT_400 = (
+    "context_length",
+    "maximum context",
+    "context window",
+    "prompt is too long",
+    "content_filter",
+    "content management policy",
+    "moderation",
+    "safety",
+    "tool_calls",
+    "tool_choice",
+    "function_call",
+    "messages[",
+)
 
 
 def _rejects_stream_options(exc: Exception) -> bool:
-    """这个报错是不是服务方不认 stream_options。
-
-    点名了 stream_options / include_usage 的一定是；只回 400 / 422、说不清哪个参数的（有的网关只回一句
-    Bad Request）也去掉它试一次——重发也失败就说明不是它的事，原样报重发的错。上下文超长同样是 400，
-    重发也没用，不算。"""
+    """这个报错是不是服务方可能不认 stream_options（排除明确的上下文超长、内容审查与工具消息结构错误）。"""
     from langchain_core.exceptions import ContextOverflowError
 
     if isinstance(exc, ContextOverflowError):
@@ -643,7 +761,14 @@ def _rejects_stream_options(exc: Exception) -> bool:
     text = str(exc).lower()
     if "stream_options" in text or "include_usage" in text:
         return True
-    return getattr(exc, "status_code", None) in (400, 422)
+    status = getattr(exc, "status_code", None)
+    if status not in (400, 422):
+        return False
+    if any(bad in text for bad in _DEFINITE_NON_STREAM_OPT_400):
+        return False
+    if any(w in text for w in ("reasoning_effort", "enable_thinking", "thinking_budget")):
+        return False
+    return True
 
 
 class _LazyReasoningChatOpenAI:

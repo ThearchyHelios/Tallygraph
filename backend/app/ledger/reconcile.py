@@ -273,12 +273,22 @@ def _equals(alias: str, column: str, value: Any) -> str:
     return f"{alias}.{_ident(column)} IS NULL" if value is None else f"{alias}.{_ident(column)} = {_lit(value)}"
 
 
+def _join_key(ours: str, theirs: str, *, nullable: bool) -> str:
+    left, right = f"o.{_ident(ours)}", f"c.{_ident(theirs)}"
+    if nullable:
+        return f"({left} = {right} OR ({left} IS NULL AND {right} IS NULL))"
+    return f"{left} = {right}"
+
+
 def align_sql(keys: list[tuple[str, str]], pairs: list[Pair], values: list[tuple[Any, ...]]) -> str:
     """多行对账的合并查询：这次（o）LEFT JOIN 口径（c）按维度列对齐，只留被引用的那几行，按引用的先后排。"""
     select_ = [f"o.{_ident(ours)} AS {_ident(ours)}" for ours, _ in keys]
     select_ += [f"o.{_ident(p.ours)} AS {_ident(f'ours_{j}')}, c.{_ident(p.column or '')} AS {_ident(f'cal_{j}')}"
                 for j, p in enumerate(pairs)]
-    on = " AND ".join(f"o.{_ident(ours)} = c.{_ident(theirs)}" for ours, theirs in keys)
+    on = " AND ".join(
+        _join_key(ours, theirs, nullable=(not values or any(idx >= len(r) or r[idx] is None for r in values)))
+        for idx, (ours, theirs) in enumerate(keys)
+    )
     rows = ["(" + " AND ".join(_equals("o", ours, v) for (ours, _), v in zip(keys, row)) + ")" for row in values]
     order = " ".join(f"WHEN {cond} THEN {i}" for i, cond in enumerate(rows))
     return (f"SELECT {', '.join(select_)} FROM o LEFT JOIN c ON {on} WHERE {' OR '.join(rows)} "
@@ -296,13 +306,13 @@ def _metric(mid: str, name: str, expression: str, *, unit: str = "", decimals: A
 
 
 def _four(n: str, label: str, ours: str, theirs: str, pair: Pair) -> list[dict[str, Any]]:
-    """一组对照的四个对账指标：这次、口径、差值（这次 − 口径）、相对差（差值 ÷ 口径，口径是 0 时没有值）。"""
+    """一组对照的四个对账指标：这次、口径、差值（这次 − 口径）、相对差（差值 ÷ |口径|，口径是 0 时没有值）。"""
     diff = f"({ours}) - ({theirs})"
     return [
         _metric(f"ours_{n}", f"{label} · 这次", ours, unit=pair.unit, decimals=pair.decimals),
         _metric(f"cal_{n}", f"{label} · 口径", theirs, unit=pair.unit, decimals=pair.decimals),
         _metric(f"diff_{n}", f"{label} · 差值", diff, unit=pair.unit, decimals=pair.decimals),
-        _metric(f"rel_{n}", f"{label} · 相对差", f"({diff}) / ({theirs}) if ({theirs}) else None", decimals=4,
+        _metric(f"rel_{n}", f"{label} · 相对差", f"({diff}) / abs({theirs}) if ({theirs}) else None", decimals=4,
                 fmt="percent_of_ratio"),
     ]
 

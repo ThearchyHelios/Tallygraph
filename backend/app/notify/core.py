@@ -294,7 +294,12 @@ class Outcome:
 
 
 def _client(transport: httpx.AsyncBaseTransport | None = None) -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=TIMEOUT_S, transport=transport or _transport, follow_redirects=False)
+    return httpx.AsyncClient(
+        timeout=TIMEOUT_S,
+        transport=transport or _transport,
+        follow_redirects=False,
+        trust_env=False,
+    )
 
 
 async def post(fmt: str, url: str, secret: str | None, build: Callable[[], tuple[str, dict[str, str], bytes]], *,
@@ -305,12 +310,13 @@ async def post(fmt: str, url: str, secret: str | None, build: Callable[[], tuple
     host = host_of(url)
     waits = (RETRY_DELAYS if delays is None else delays) if retry else ()
     last = Outcome(False, None, 0, "没有发出请求")
+    real_network = transport is None and _transport is None
     async with _client(transport) as client:
         for attempt in range(len(waits) + 1):
             if attempt:
                 await asyncio.sleep(waits[attempt - 1])
             target, headers, body = build()
-            last = await _post_once(client, fmt, target, headers, body, url, secret)
+            last = await _post_once(client, fmt, target, headers, body, url, secret, real_network=real_network)
             last.attempts = attempt + 1
             if last.ok:
                 return last
@@ -321,8 +327,20 @@ async def post(fmt: str, url: str, secret: str | None, build: Callable[[], tuple
 
 
 async def _post_once(client: httpx.AsyncClient, fmt: str, target: str, headers: dict[str, str], body: bytes,
-                     url: str, secret: str | None) -> Outcome:
+                     url: str, secret: str | None, *, real_network: bool = False) -> Outcome:
     host = host_of(url)
+    if real_network:
+        from app.tools.net import UnsafeUrlError, assert_safe_url
+
+        try:
+            check_url(target)
+        except ValueError:
+            pass
+        else:
+            try:
+                await assert_safe_url(target, allow_intranet=True)
+            except UnsafeUrlError:
+                return Outcome(False, None, 1, f"发往 {host} 的请求被安全策略拦截")
     token = _SENDING.set((url, secret))
     try:
         response = await client.post(target, content=body, headers=headers)

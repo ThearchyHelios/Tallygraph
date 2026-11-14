@@ -17,16 +17,23 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
 import re
 import sqlite3
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
 
 from app.core.config import settings
 from app.data.engine import open_checked_sqlite
@@ -156,6 +163,28 @@ def archive_path(table_key: str) -> Path:
     if not _KEY.match(table_key or ""):
         raise ValueError("记录表的键格式不对")
     return records_root() / f"{table_key}.archive.db"
+
+
+@contextlib.contextmanager
+def archive_lock(table_key: str) -> Iterator[None]:
+    """跨进程归档文件锁（data/records/<table_key>.archive.lock）：多 worker 并发触发 sync_archive 时用 flock 串行化，
+    与 write_lock 分离以避免同调用链重入死锁。"""
+    if not _KEY.match(table_key or ""):
+        raise ValueError("记录表的键格式不对")
+    lock_path = records_root() / f"{table_key}.archive.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _path_lock(lock_path):
+        fd = os.open(os.fspath(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def archive_table_name(version: int) -> str:
@@ -515,7 +544,7 @@ def sync_archive(table_key: str, specs: list[ArchiveSpec] | tuple[ArchiveSpec, .
     if not specs:
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with _path_lock(dest):
+    with archive_lock(table_key), _path_lock(dest):
         arch = open_checked_sqlite(str(dest), readonly=False)
         try:
             _enable_wal(arch)

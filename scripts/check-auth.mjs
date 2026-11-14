@@ -24,9 +24,10 @@
 //   node scripts/check-auth.mjs
 // 对别的实例跑时带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-auth.mjs
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
+import { resolveChrome } from './lib/env.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
-const CHROME = process.env.CHROME_PATH ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+const CHROME = resolveChrome()
 
 let failed = 0
 const check = (name, cond, detail = '') => {

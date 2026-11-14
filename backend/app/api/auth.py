@@ -25,6 +25,7 @@ from app.auth import (
 from app.auth import oidc, sessions
 from app.auth.audit import record
 from app.auth.passwords import hash_password, password_problem, verify_password
+from app.cluster import mutex
 from app.core import crypto
 from app.db.base import get_session
 from app.db.models import Setting, User
@@ -62,7 +63,7 @@ async def me(x_actor: str | None = Header(default=None), session: AsyncSession =
         actor = decode_actor(x_actor)
         return await principal_full(session, Principal(username=actor, display_name=actor, role="admin", mode="off"))
     if not principal.username:
-        can_bootstrap = principal.mode == "local" and not await _local_admin_exists(session)
+        can_bootstrap = principal.mode == "local" and await _can_bootstrap(session)
         return JSONResponse(status_code=401, content={"detail": "请先登录", "code": AUTH_REQUIRED,
                                                       "mode": principal.mode, "can_bootstrap": can_bootstrap})
     if principal.via == "key":
@@ -251,7 +252,25 @@ async def _local_admin_exists(session: AsyncSession) -> bool:
         User.role == "admin", User.disabled.is_(False), User.password_hash.is_not(None)).limit(1))).first() is not None
 
 
+async def _active_admin_exists(session: AsyncSession) -> bool:
+    return (await session.execute(select(User.id).where(
+        User.role == "admin", User.disabled.is_(False)).limit(1))).first() is not None
+
+
+async def _can_bootstrap(session: AsyncSession, *, force_settings: bool = False) -> bool:
+    if await _local_admin_exists(session):
+        return False
+    cfg = await load_settings(force=force_settings)
+    if cfg.get("bootstrapped"):
+        return False
+    if await _active_admin_exists(session):
+        return False
+    return True
+
+
 async def _create_admin(session: AsyncSession, payload: BootstrapIn) -> User:
+    if payload.username.lower().startswith("svc-"):
+        raise HTTPException(422, "svc- 开头的用户名留给服务账号，请换一个用户名")
     if problem := password_problem(payload.password):
         raise HTTPException(422, problem)
     if (await session.execute(select(User.id).where(User.username == payload.username))).first():
@@ -271,6 +290,8 @@ def _merge_oidc(given: dict[str, Any] | None, before: dict[str, Any]) -> dict[st
         if key not in _OIDC_FIELDS:
             continue
         if key == "client_secret":
+            if isinstance(value, str) and crypto.is_ciphertext(value) and value != before.get(key):
+                raise HTTPException(400, "不允许直接提交密文前缀")
             # 提交掩码值表示保持原值
             if value and before.get(key) and value == crypto.mask(before[key]):
                 continue
@@ -303,10 +324,16 @@ async def put_settings(payload: SettingsIn, request: Request, response: Response
     created: User | None = None
     effective = env_mode() or target
     if effective == "local" and current_mode() != "local":
-        if payload.bootstrap is not None:
-            created = await _create_admin(session, payload.bootstrap)
-        elif not await _local_admin_exists(session):
-            raise HTTPException(422, "开启账号密码登录前，需要同时创建第一个管理员账号")
+        async with mutex.lock("auth:bootstrap"):
+            if payload.bootstrap is not None:
+                if await _local_admin_exists(session):
+                    raise HTTPException(409, "已经有管理员了，请用管理员账号登录")
+                created = await _create_admin(session, payload.bootstrap)
+                value["bootstrapped"] = True
+            elif not await _local_admin_exists(session):
+                raise HTTPException(422, "开启账号密码登录前，需要同时创建第一个管理员账号")
+            else:
+                value["bootstrapped"] = True
     if effective == "oidc":
         config = value.get("oidc") or {}
         if not config.get("issuer") or not config.get("client_id"):
@@ -348,14 +375,26 @@ async def put_settings(payload: SettingsIn, request: Request, response: Response
 @router.post("/bootstrap")
 async def bootstrap(payload: BootstrapIn, request: Request, response: Response,
                     session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """建第一个管理员并登录。只在账号密码登录模式下、库里还没有能登录的管理员时可用（环境变量直接指定了 local 的新部署）。"""
-    if current_mode() != "local":
-        raise HTTPException(409, "只有在账号密码登录模式下才能创建第一个管理员")
-    if await _local_admin_exists(session):
-        raise HTTPException(409, "已经有管理员了，请用管理员账号登录")
-    user = await _create_admin(session, payload)
-    token = await sessions.create_session(session, user, ip=_client_ip(request),
-                                          user_agent=request.headers.get("user-agent"))
-    await session.commit()
+    """建第一个管理员并登录。只在账号密码登录模式下、库里还没有管理员且从未完成过初始化引导时可用。"""
+    async with mutex.lock("auth:bootstrap"):
+        if current_mode() != "local":
+            raise HTTPException(409, "只有在账号密码登录模式下才能创建第一个管理员")
+        if not await _can_bootstrap(session, force_settings=True):
+            raise HTTPException(409, "已经有管理员了，请用管理员账号登录")
+        user = await _create_admin(session, payload)
+        cfg = dict(await load_settings(force=True))
+        cfg["bootstrapped"] = True
+        row = await session.get(Setting, SETTING_KEY)
+        if row is None:
+            session.add(Setting(key=SETTING_KEY, value=cfg))
+        else:
+            row.value = cfg
+        token = await sessions.create_session(session, user, ip=_client_ip(request),
+                                              user_agent=request.headers.get("user-agent"))
+        await session.commit()
+        remember_settings(cfg)
+        from app.cluster import caches
+
+        await caches.broadcast("auth_settings")
     _login_response(request, response, token)
     return await principal_full(session, await sessions.principal_of(session, user, "local"))

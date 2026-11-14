@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass
 import heapq
@@ -10,6 +11,7 @@ import numpy as np
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cluster import caches
 from app.db.models import Chunk, Document
 from app.memory import inverted
 from app.memory.embeddings import (
@@ -26,25 +28,47 @@ _ID_FETCH_BATCH = 500
 _VEC_SCAN_BATCH = 512
 _VEC_CACHE_MAX_COLLECTIONS = 16
 _VEC_CACHE_MAX_CHUNKS = 200_000
+_VEC_CACHE_MAX_TOTAL_VECS = 200_000
+_NON_READY_DOC_STATUSES = ("processing", "pending", "error", "failed")
 
 
 @dataclass
 class _VectorCacheEntry:
-    stamp: tuple[int, str, str, int]
+    stamp: tuple[Any, ...]
     chunk_ids: list[str]
     matrix: np.ndarray
 
 
 _VEC_CACHE: OrderedDict[str, _VectorCacheEntry] = OrderedDict()
+_VEC_LOCKS: dict[str, asyncio.Lock] = {}
 
 
-def invalidate_vector_cache(collection: str | None = None) -> None:
-    """文档增删或重建索引后失效进程内归一化向量矩阵缓存。"""
-    if collection is None:
+def _ready_chunk_condition() -> Any:
+    return or_(
+        Chunk.document_id.is_(None),
+        Document.id.is_(None),
+        Document.status.is_(None),
+        Document.status.notin_(_NON_READY_DOC_STATUSES),
+    )
+
+
+def invalidate_vector_cache(kb_id: str | None = None, *, broadcast: bool = True) -> None:
+    """文档增删或重建索引后失效进程内归一化向量矩阵缓存，并在多进程下广播同步。"""
+    if kb_id is None:
         _VEC_CACHE.clear()
-        return
-    _VEC_CACHE.pop(collection, None)
-    _VEC_CACHE.pop("__all__", None)
+    else:
+        _VEC_CACHE.pop(kb_id, None)
+        _VEC_CACHE.pop("__all__", None)
+    if broadcast:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None and not loop.is_closed():
+            loop.create_task(caches.broadcast("kb_vectors", kb_id))
+
+
+caches.on("kb_vectors", lambda key: invalidate_vector_cache(key, broadcast=False))
 
 
 def chunk_text(text: str, target: int = _TARGET, overlap: int = _OVERLAP) -> list[str]:
@@ -155,7 +179,17 @@ async def ingest_document(
         session, collection=collection, title=title, content=content,
         source=source, mime=mime, meta=meta, status="ready",
     )
-    await process_document(session, doc, on_progress=on_progress)
+    try:
+        await process_document(session, doc, on_progress=on_progress)
+    except Exception:
+        await session.rollback()
+        await cleanup_failed_document_chunks(session, doc.id)
+        stale_doc = await session.get(Document, doc.id)
+        if stale_doc is not None:
+            await session.delete(stale_doc)
+        await session.commit()
+        invalidate_vector_cache(collection)
+        raise
     return doc
 
 
@@ -248,13 +282,30 @@ async def process_document(
     return doc
 
 
+async def cleanup_failed_document_chunks(session: AsyncSession, doc_id: str) -> None:
+    """清理处理失败文档残留的半截分块与倒排词项。"""
+    from sqlalchemy import delete as sa_delete
+
+    partial_ids = list(
+        (await session.execute(select(Chunk.id).where(Chunk.document_id == doc_id))).scalars()
+    )
+    if partial_ids:
+        await inverted.drop_chunk_terms(session, partial_ids)
+    await session.execute(sa_delete(Chunk).where(Chunk.document_id == doc_id))
+
+
 async def _fetch_chunks_by_ids(session: AsyncSession, chunk_ids: list[str]) -> dict[str, Chunk]:
     found: dict[str, Chunk] = {}
     for i in range(0, len(chunk_ids), _ID_FETCH_BATCH):
         part = chunk_ids[i:i + _ID_FETCH_BATCH]
         if not part:
             continue
-        for row in (await session.execute(select(Chunk).where(Chunk.id.in_(part)))).scalars():
+        stmt = (
+            select(Chunk)
+            .outerjoin(Document, Document.id == Chunk.document_id)
+            .where(Chunk.id.in_(part), _ready_chunk_condition())
+        )
+        for row in (await session.execute(stmt)).scalars():
             found[row.id] = row
     return found
 
@@ -263,6 +314,111 @@ def _unit_vector(vec: np.ndarray) -> np.ndarray:
     arr = np.asarray(vec, dtype=np.float32)
     norm = float(np.linalg.norm(arr))
     return arr / norm if norm > 0 else np.zeros_like(arr, dtype=np.float32)
+
+
+async def _kb_stamp(
+    session: AsyncSession,
+    *,
+    collection: str | None,
+    model_id: str,
+    dim: int,
+) -> tuple[int, tuple[Any, ...]]:
+    stat_stmt = (
+        select(
+            func.count(Chunk.id),
+            func.max(Document.created_at),
+            func.coalesce(func.sum(Chunk.ordinal), 0),
+            func.coalesce(func.sum(Chunk.token_len), 0),
+            func.min(Chunk.id),
+            func.max(Chunk.id),
+            func.min(Chunk.document_id),
+            func.max(Chunk.document_id),
+        )
+        .select_from(Chunk)
+        .outerjoin(Document, Document.id == Chunk.document_id)
+        .where(_ready_chunk_condition())
+    )
+    if collection:
+        stat_stmt = stat_stmt.where(Chunk.collection == collection)
+    (
+        total_raw,
+        max_doc_created,
+        sum_ordinal,
+        sum_token_len,
+        min_id,
+        max_id,
+        min_doc_id,
+        max_doc_id,
+    ) = (await session.execute(stat_stmt)).one()
+    total = int(total_raw or 0)
+    stamp = (
+        total,
+        str(max_doc_created or ""),
+        int(sum_ordinal or 0),
+        int(sum_token_len or 0),
+        str(min_id or ""),
+        str(max_id or ""),
+        str(min_doc_id or ""),
+        str(max_doc_id or ""),
+        model_id,
+        dim,
+    )
+    return total, stamp
+
+
+async def _load_kb_matrix(
+    session: AsyncSession,
+    *,
+    collection: str | None,
+    stamp: tuple[Any, ...],
+    dim: int,
+) -> _VectorCacheEntry:
+    cache_key = collection or "__all__"
+    entry = _VEC_CACHE.get(cache_key)
+    if entry is not None and entry.stamp == stamp:
+        _VEC_CACHE.move_to_end(cache_key)
+        return entry
+
+    lock = _VEC_LOCKS.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        entry = _VEC_CACHE.get(cache_key)
+        if entry is not None and entry.stamp == stamp:
+            _VEC_CACHE.move_to_end(cache_key)
+            return entry
+
+        ids: list[str] = []
+        vecs: list[np.ndarray] = []
+        last_id = ""
+        while True:
+            stmt = (
+                select(Chunk.id, Chunk.embedding)
+                .outerjoin(Document, Document.id == Chunk.document_id)
+                .where(Chunk.id > last_id, _ready_chunk_condition())
+                .order_by(Chunk.id.asc())
+                .limit(_VEC_SCAN_BATCH)
+            )
+            if collection:
+                stmt = stmt.where(Chunk.collection == collection)
+            batch = (await session.execute(stmt)).all()
+            if not batch:
+                break
+            last_id = str(batch[-1][0])
+            for cid, blob in batch:
+                v = from_blob(blob, dim)
+                ids.append(str(cid))
+                vecs.append(_unit_vector(v) if v is not None else np.zeros(dim, dtype=np.float32))
+        matrix = np.vstack(vecs).astype(np.float32, copy=False) if vecs else np.zeros((0, dim), dtype=np.float32)
+        entry = _VectorCacheEntry(stamp=stamp, chunk_ids=ids, matrix=matrix)
+        _VEC_CACHE[cache_key] = entry
+        _VEC_CACHE.move_to_end(cache_key)
+        while len(_VEC_CACHE) > _VEC_CACHE_MAX_COLLECTIONS or (
+            len(_VEC_CACHE) > 1
+            and sum(item.matrix.shape[0] for item in _VEC_CACHE.values()) > _VEC_CACHE_MAX_TOTAL_VECS
+        ):
+            evicted_key, _ = _VEC_CACHE.popitem(last=False)
+            if evicted_key != cache_key and not _VEC_LOCKS.get(evicted_key, asyncio.Lock()).locked():
+                _VEC_LOCKS.pop(evicted_key, None)
+        return entry
 
 
 async def _vector_top_ids(
@@ -280,52 +436,15 @@ async def _vector_top_ids(
     if limit <= 0:
         return []
     model_id, dim = embedder_id(), embedder_dim()
-    stat_stmt = select(func.count(Chunk.id), func.max(Chunk.id))
-    if collection:
-        stat_stmt = stat_stmt.where(Chunk.collection == collection)
-    total_raw, max_id_raw = (await session.execute(stat_stmt)).one()
-    total = int(total_raw or 0)
+    total, stamp = await _kb_stamp(session, collection=collection, model_id=model_id, dim=dim)
     if total == 0:
         return []
     q_unit = _unit_vector(query_vec)
     if q_unit.shape[0] != dim:
         return []
 
-    cache_key = collection or "__all__"
-    stamp = (total, str(max_id_raw or ""), model_id, dim)
-
     if total <= _VEC_CACHE_MAX_CHUNKS:
-        entry = _VEC_CACHE.get(cache_key)
-        if entry is None or entry.stamp != stamp:
-            ids: list[str] = []
-            vecs: list[np.ndarray] = []
-            last_id = ""
-            while True:
-                stmt = (
-                    select(Chunk.id, Chunk.embedding)
-                    .where(Chunk.id > last_id)
-                    .order_by(Chunk.id.asc())
-                    .limit(_VEC_SCAN_BATCH)
-                )
-                if collection:
-                    stmt = stmt.where(Chunk.collection == collection)
-                batch = (await session.execute(stmt)).all()
-                if not batch:
-                    break
-                last_id = str(batch[-1][0])
-                for cid, blob in batch:
-                    v = from_blob(blob, dim)
-                    ids.append(str(cid))
-                    vecs.append(_unit_vector(v) if v is not None else np.zeros(dim, dtype=np.float32))
-            matrix = np.vstack(vecs).astype(np.float32, copy=False) if vecs else np.zeros((0, dim), dtype=np.float32)
-            entry = _VectorCacheEntry(stamp=stamp, chunk_ids=ids, matrix=matrix)
-            _VEC_CACHE[cache_key] = entry
-            _VEC_CACHE.move_to_end(cache_key)
-            while len(_VEC_CACHE) > _VEC_CACHE_MAX_COLLECTIONS:
-                _VEC_CACHE.popitem(last=False)
-        else:
-            _VEC_CACHE.move_to_end(cache_key)
-
+        entry = await _load_kb_matrix(session, collection=collection, stamp=stamp, dim=dim)
         if entry.matrix.shape[0] == 0:
             return []
         scores = entry.matrix @ q_unit
@@ -343,7 +462,8 @@ async def _vector_top_ids(
     while True:
         stmt = (
             select(Chunk.id, Chunk.embedding)
-            .where(Chunk.id > last_id)
+            .outerjoin(Document, Document.id == Chunk.document_id)
+            .where(Chunk.id > last_id, _ready_chunk_condition())
             .order_by(Chunk.id.asc())
             .limit(_VEC_SCAN_BATCH)
         )
@@ -433,14 +553,25 @@ async def search(
     else:
         if await inverted.has_terms(session, collection):
             # 倒排已就绪但没有任何查询词命中且 alpha == 0：所有片段词面分均为 0，只需按 id 定序取前 limit 条
-            stmt = select(Chunk).order_by(Chunk.id.asc()).limit(limit)
+            stmt = (
+                select(Chunk)
+                .outerjoin(Document, Document.id == Chunk.document_id)
+                .where(_ready_chunk_condition())
+                .order_by(Chunk.id.asc())
+                .limit(limit)
+            )
             if collection:
                 stmt = stmt.where(Chunk.collection == collection)
             rows = list((await session.execute(stmt)).scalars())
             kw_scores = [0.0] * len(rows)
         else:
             # 存量数据升级尚未建倒排：退回全表扫现算 BM25，保证不漏检
-            stmt = select(Chunk).order_by(Chunk.id.asc())
+            stmt = (
+                select(Chunk)
+                .outerjoin(Document, Document.id == Chunk.document_id)
+                .where(_ready_chunk_condition())
+                .order_by(Chunk.id.asc())
+            )
             if collection:
                 stmt = stmt.where(Chunk.collection == collection)
             rows = list((await session.execute(stmt)).scalars())

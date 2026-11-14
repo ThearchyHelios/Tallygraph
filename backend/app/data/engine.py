@@ -83,6 +83,17 @@ CATALOG_DRAFT_GUIDANCE_OPTION = "catalog_draft_guidance"
 # app/data 下所有 *_OPTION 常量扫出来核对，新加的配置项忘了进这份名单，那条测试先报
 _NON_DRIVER_OPTIONS = frozenset({"schema", QUERY_TIMEOUT_OPTION, MASK_COLUMNS_OPTION, CATALOG_PROFILE_OPTION,
                                  CATALOG_DRAFT_GUIDANCE_OPTION, "introspect_scope", "catalog_maintenance"})
+_FORBIDDEN_DRIVER_OPTIONS = frozenset({
+    "local_infile",
+    "allow_local_infile",
+    "allowloadlocalinfile",
+    "read_default_file",
+    "read_default_group",
+    "init_command",
+    "server_public_key_path",
+    "load_extension",
+    "options",
+})
 
 _MASK_SPLIT = re.compile(r"[,，、;；\n]+")
 
@@ -133,12 +144,23 @@ def build_url(source: Any, *, reveal: bool = False) -> str:
     for key in _NON_DRIVER_OPTIONS:
         options.pop(key, None)
 
+    for raw_key, raw_val in list(options.items()):
+        key_str = str(raw_key).strip()
+        norm_key = key_str.lower().replace("-", "_")
+        if not key_str or key_str.lower() in _FORBIDDEN_DRIVER_OPTIONS or norm_key in _FORBIDDEN_DRIVER_OPTIONS:
+            raise ValueError(f"不允许使用高危驱动连接参数：{raw_key}")
+        if isinstance(raw_val, (dict, list, tuple, set)):
+            raise ValueError(f"连接参数 {raw_key} 不能是复合结构")
+        val_str = "" if raw_val is None else str(raw_val)
+        if "\x00" in key_str or "\x00" in val_str:
+            raise ValueError(f"连接参数 {raw_key} 含有非法空字节")
+
     if kind == "sqlite":
         # SQLite 没有主机和账号，database 就是文件路径
         return f"{driver}:///{source.database or ':memory:'}"
 
     password = decrypt(source.password) or "" if reveal else "***"
-    from urllib.parse import quote_plus
+    from urllib.parse import quote, quote_plus, urlencode
 
     user = quote_plus(source.username or "")
     pw = quote_plus(password) if reveal else password
@@ -153,12 +175,15 @@ def build_url(source: Any, *, reveal: bool = False) -> str:
         sid = options.pop("sid", None)
         if not service and not sid:
             raise ValueError("Oracle 需要填写 service_name 或 SID（也可填在「数据库」中）")
-        tail = f"?service_name={service}" if service else f"?sid={sid}"
-        query = "&".join(f"{k}={v}" for k, v in options.items())
-        return f"{driver}://{auth}{host}/{tail}{('&' + query) if query else ''}"
+        params_list: list[tuple[str, str]] = (
+            [("service_name", str(service))] if service else [("sid", str(sid))]
+        )
+        params_list.extend((str(k).strip(), "" if v is None else str(v)) for k, v in options.items())
+        return f"{driver}://{auth}{host}/?{urlencode(params_list)}"
 
-    query = "&".join(f"{k}={v}" for k, v in options.items())
-    return f"{driver}://{auth}{host}/{source.database or ''}{('?' + query) if query else ''}"
+    db_name = quote(str(source.database or ""), safe="")
+    query = urlencode([(str(k).strip(), "" if v is None else str(v)) for k, v in options.items()])
+    return f"{driver}://{auth}{host}/{db_name}{('?' + query) if query else ''}"
 
 
 class SqliteHardeningError(sqlite3.OperationalError):
@@ -1026,23 +1051,37 @@ async def run_query(
         return await _run_write(engine, kind, statement, limits, started)
 
     async def _read(conn: AsyncConnection) -> tuple[list[str], list[list[Any]], bool, dict[str, str]]:
+        if kind == "oracle" and source.readonly:
+            with suppress(Exception):
+                await conn.exec_driver_sql("SET TRANSACTION READ ONLY")
         # 记录表跨版本汇总：旧版本先只读挂到这条连接上（prelude 里的临时视图要引用它们）
         if prelude or attach:
             await _attach_readonly(conn, attach)
-        # 连接上先执行的语句（记录表的同名临时视图）。按驱动原样执行，不经 text()：视图里拼着看的人的名字，
-        # 名字里的冒号不能被当成绑定参数
-        for stmt in prelude:
-            await conn.exec_driver_sql(stmt)
-        cursor = await conn.stream(text(statement))
-        columns = list(cursor.keys())
-        collected = RowCollector(limits)
-        seen = _TypeTally(len(columns))
-        # 逐行累加，边收边判上限：一次性 fetchall 一个亿级表就晚了
-        async for row in cursor:
-            if not collected.take([_jsonable(v) for v in row]):
-                break
-            seen.add(row)
-        return columns, collected.rows, collected.truncated, seen.types(columns)
+        created_temp_records_view = False
+        try:
+            # 连接上先执行的语句（记录表的同名临时视图）。按驱动原样执行，不经 text()：视图里拼着看的人的名字，
+            # 名字里的冒号不能被当成绑定参数
+            for stmt in prelude:
+                await conn.exec_driver_sql(stmt)
+                if _TEMP_RECORDS_VIEW_RE.search(stmt):
+                    created_temp_records_view = True
+            cursor = await conn.stream(text(statement))
+            try:
+                columns = list(cursor.keys())
+                collected = RowCollector(limits)
+                seen = _TypeTally(len(columns))
+                # 逐行累加，边收边判上限：一次性 fetchall 一个亿级表就晚了
+                async for row in cursor:
+                    if not collected.take([_jsonable(v) for v in row]):
+                        break
+                    seen.add(row)
+                return columns, collected.rows, collected.truncated, seen.types(columns)
+            finally:
+                await cursor.close()
+        finally:
+            if created_temp_records_view:
+                with suppress(Exception):
+                    await conn.exec_driver_sql('DROP VIEW IF EXISTS temp."records"')
 
     columns, rows, truncated, types = await _bounded(
         engine.connect, kind, limits,
@@ -1062,6 +1101,7 @@ async def run_query(
 
 #: 平台挂到查询连接上的库名只许这个样子（records/views.py 的 records_v<版本>）：拼进 ATTACH / DETACH 语句
 _ATTACH_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_TEMP_RECORDS_VIEW_RE = re.compile(r"\bCREATE\s+TEMP(?:ORARY)?\s+VIEW\b.*?\brecords\b", re.I | re.S)
 
 
 def _same_file(a: str, b: str) -> bool:

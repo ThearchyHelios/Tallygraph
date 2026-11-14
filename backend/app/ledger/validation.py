@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -231,14 +232,66 @@ def actual_of(*, metrics: Sequence[Mapping[str, Any]], queries: Sequence[Mapping
 # ==========================================================================
 
 
+_DECIMAL_TEXT = re.compile(r"^\s*[+-]?(?:\d+\.\d+|\d+(?:\.\d+)?[eE][+-]?\d+)\s*$")
+_NUMERIC_TEXT = re.compile(r"^\s*[+-]?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?\s*$")
+
+
+def _as_exact_decimal(value: Any, *, allow_int_str: bool = False) -> Any:
+    from decimal import Decimal, InvalidOperation
+    import math
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else None
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, float):
+        return Decimal(str(value)) if math.isfinite(value) else None
+    if isinstance(value, str):
+        pattern = _NUMERIC_TEXT if allow_int_str else _DECIMAL_TEXT
+        if not pattern.match(value):
+            return None
+        try:
+            parsed = Decimal(value.strip())
+        except InvalidOperation:
+            return None
+        return parsed if parsed.is_finite() else None
+    return None
+
+
 def same_value(expected: Any, actual: Any) -> bool:
-    """原值比较，不做隐式舍入（R06）：数字按数值相等（2 与 2.0 同），布尔与数字不混，其余按规范化 JSON 逐字比。"""
+    """原值比较，不做隐式舍入（R06）：数字按数值相等（2 与 2.0 同），支持与 Decimal 及 DECIMAL 小数文本精确比对，
+    布尔与数字不混，纯整数文本（如 "2"）不隐式当成数字，其余按规范化 JSON 逐字比。"""
+    from decimal import Decimal
+    import math
+
     from app.core.artifact_store import canonical_json
 
-    if isinstance(expected, bool) != isinstance(actual, bool):
-        return False
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return isinstance(expected, bool) and isinstance(actual, bool) and expected is actual
     if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
         return bool(expected == actual)
+    has_decimal_obj = isinstance(expected, Decimal) or isinstance(actual, Decimal)
+    has_numeric = has_decimal_obj or isinstance(expected, (int, float)) or isinstance(actual, (int, float))
+    if has_numeric:
+        left = _as_exact_decimal(expected, allow_int_str=has_decimal_obj)
+        right = _as_exact_decimal(actual, allow_int_str=has_decimal_obj)
+        if left is not None and right is not None:
+            if left == right:
+                return True
+            if isinstance(expected, float) or isinstance(actual, float):
+                diff = abs(left - right)
+                scale = max(abs(left), abs(right))
+                return bool(
+                    diff < Decimal("1e-9")
+                    and scale > 0
+                    and diff <= Decimal("1e-12") * scale
+                    and math.isclose(float(left), float(right), rel_tol=1e-12, abs_tol=0.0)
+                )
+            return False
+        if has_decimal_obj:
+            return False
     return canonical_json(expected) == canonical_json(actual)
 
 

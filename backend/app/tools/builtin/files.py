@@ -7,20 +7,52 @@ from pydantic import BaseModel, Field
 
 from app.core import atomic
 from app.core.config import settings
+from app.sandbox.bubblewrap_sandbox import BubblewrapSandbox
+from app.sandbox.local_sandbox import LocalSandbox
+from app.sandbox.manager import sandbox_manager
+from app.sandbox.seatbelt_sandbox import SeatbeltSandbox
 from app.tools.registry import ToolContext, register
 
 _MAX_READ = 200_000
 
 
+def _session_dir(session: str) -> Path:
+    """与当前沙箱后端共用同一个会话工作目录，确保 file_write/file_read 与代码沙箱读写同一份文件。"""
+    backend = sandbox_manager._backend
+    if isinstance(backend, (SeatbeltSandbox, BubblewrapSandbox, LocalSandbox)):
+        root = backend._workspace(session)
+    elif backend is not None and callable(getattr(backend, "_workspace", None)):
+        root = backend._workspace(session)
+    else:
+        choice = (settings.sandbox_backend or "auto").lower()
+        named = {
+            "seatbelt": SeatbeltSandbox,
+            "bubblewrap": BubblewrapSandbox,
+            "local": LocalSandbox,
+        }
+        if choice in named:
+            root = named[choice]()._workspace(session)
+        elif choice == "auto":
+            for impl in (SeatbeltSandbox, BubblewrapSandbox, LocalSandbox):
+                if getattr(impl, "available", lambda: True)():
+                    root = impl()._workspace(session)
+                    break
+            else:
+                root = settings.session_dir(session)
+        else:
+            root = settings.session_dir(session)
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
+
+
 def _resolve(rel: str, ctx: ToolContext) -> Path:
     """把相对路径锁死在这次运行自己的工作目录里。
 
-    两道关都要过：session_dir() 先净化 session_id 再定根目录，然后 rel
+    两道关都要过：_session_dir() 先净化 session_id 再定根目录，然后 rel
     先 resolve 再比对根。少了第一道，`../../etc/passwd` 里的越界检查就是
     在一个被挪到 /etc 的"根"下面做的，检查照样通过——这正是之前的漏洞。
     """
-    root = settings.session_dir(ctx.sandbox_session)
-    root.mkdir(parents=True, exist_ok=True)
+    root = _session_dir(ctx.sandbox_session)
     target = (root / rel.lstrip("/")).resolve()
     if target != root and root not in target.parents:
         raise ValueError(f"路径越界：{rel}")

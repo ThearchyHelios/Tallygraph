@@ -12,11 +12,11 @@
 // 跑之前前端得起着（./scripts/dev.sh），默认连 5273。对别的实例（比如一份沙箱拷贝）跑时
 // 带上地址：AGENTLAB_WEB=http://localhost:<前端端口> node scripts/check-guards.mjs
 import { chromium } from '../frontend/node_modules/playwright-core/index.mjs'
+import { resolveChrome } from './lib/env.mjs'
 
 const WEB = process.env.AGENTLAB_WEB ?? 'http://localhost:5273'
 // 不用 playwright install：它既下不动也会动到已有缓存。系统 Chrome 就够了。
-const CHROME = process.env.CHROME_PATH
-  ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+const CHROME = resolveChrome()
 
 let failed = 0
 const check = (name, cond, detail = '') => {

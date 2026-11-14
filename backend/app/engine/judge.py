@@ -1087,7 +1087,7 @@ async def judge_model_spec(session: Any, node_judge: dict[str, Any] | None = Non
 
     建议和写作模型不同，否则等于自己审自己（报告节点发现相同会发 judge_same_model 警告）。
     """
-    from app.api.copilot import COPILOT_SETTING_KEY
+    from app.core.json_extract import COPILOT_SETTING_KEY
 
     node = node_judge if isinstance(node_judge, dict) else {}
     provider, model = _text(node.get("provider")), _text(node.get("model"))
@@ -1199,8 +1199,34 @@ def _quiet(*_args: Any, **_data: Any) -> None:
     return None
 
 
+def _cache_tokens_of(msg: BaseMessage, usage: dict[str, Any]) -> tuple[int, int]:
+    """提取单次回复的提示缓存命中与建缓存 token 数（兼容 _usage_of 返回值与原始 usage_metadata）。"""
+    read_val = int(usage.get("cache_read_tokens") or usage.get("cache_read") or 0)
+    write_val = int(usage.get("cache_creation_tokens") or usage.get("cache_write") or 0)
+    if read_val or write_val:
+        return max(0, read_val), max(0, write_val)
+    um = getattr(msg, "usage_metadata", None)
+    if isinstance(um, dict):
+        details = um.get("input_token_details")
+        if isinstance(details, dict):
+            read_val = int(details.get("cache_read") or details.get("cached_tokens") or 0)
+            write_val = int(details.get("cache_creation") or details.get("ephemeral_5m_input_tokens") or 0)
+    if not (read_val or write_val):
+        rm = getattr(msg, "response_metadata", None)
+        if isinstance(rm, dict):
+            raw_u = rm.get("usage") or rm.get("token_usage")
+            if isinstance(raw_u, dict):
+                read_val = int(
+                    raw_u.get("cache_read_input_tokens")
+                    or (raw_u.get("prompt_tokens_details") or {}).get("cached_tokens")
+                    or 0
+                )
+                write_val = int(raw_u.get("cache_creation_input_tokens") or 0)
+    return max(0, read_val), max(0, write_val)
+
+
 def _json_in(text: str) -> Any:
-    from app.api.copilot import _extract_json
+    from app.core.json_extract import _extract_json
 
     try:
         return json.loads(text)
@@ -1459,8 +1485,20 @@ async def run_request(request: JudgeRequest, *, spec: ModelSpec, budget: Budget,
                 problem = "timeout_s"
             tokens = [_usage_of(r, model_id) for r in raws]
             inp, out = sum(t["input_tokens"] for t in tokens), sum(t["output_tokens"] for t in tokens)
+            cache_read = sum(_cache_tokens_of(r, t)[0] for r, t in zip(raws, tokens))
+            cache_write = sum(_cache_tokens_of(r, t)[1] for r, t in zip(raws, tokens))
             # 回复没带用量（有的网关不给、调用超时）就按估算记：宁可多记，不能让每日上限漏掉
-            actual = (pricing.estimate_cost(model_id, inp, out) if inp or out else charged) if priced else 0.0
+            actual = (
+                (
+                    pricing.estimate_cost(
+                        model_id, inp, out, cache_read=cache_read, cache_write=cache_write
+                    )
+                    if inp or out
+                    else charged
+                )
+                if priced
+                else 0.0
+            )
             await ledger.settle(day, actual - charged)
             spent += actual
             usage["input_tokens"] += inp

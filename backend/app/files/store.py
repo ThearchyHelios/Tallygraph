@@ -170,15 +170,18 @@ def as_ref(value: Any) -> dict[str, Any] | None:
 async def save(session: AsyncSession, raw: bytes, filename: str, *, uploaded_by: str | None,
                context: dict[str, Any]) -> StoredFile:
     """存内容、登记一行。类型按扩展名和内容核对（type_of）。"""
+    from app.cluster.mutex import lock
     from app.data import raw_store
 
     name = (Path(filename or "").name or "附件").strip()[:NAME_MAX]
     mime = type_of(name, raw)
-    sha, _ = await asyncio.to_thread(raw_store.put_addressed, raw, files_root())
-    row = StoredFile(sha256=sha, name=name, size=len(raw), mime=mime, uploaded_by=uploaded_by,
-                     context={k: v for k, v in context.items() if k in CONTEXT_KEYS})
-    session.add(row)
-    await session.commit()
+    digest = hashlib.sha256(raw).hexdigest()
+    async with lock(f"file_bucket:{digest[:2]}"):
+        sha, _ = await asyncio.to_thread(raw_store.put_addressed, raw, files_root())
+        row = StoredFile(sha256=sha, name=name, size=len(raw), mime=mime, uploaded_by=uploaded_by,
+                         context={k: v for k, v in context.items() if k in CONTEXT_KEYS})
+        session.add(row)
+        await session.commit()
     return row
 
 
@@ -525,21 +528,35 @@ async def drop_unreferenced(shas: set[str]) -> int:
 
 async def _drop_unreferenced(session: AsyncSession, shas: set[str]) -> int:
     """这些内容没有任何登记引用了就删文件（连同抽出的文字缓存）。返回删了几个。"""
+    from app.cluster.mutex import lock
+    from app.files.text import drop_cache
+
     if not shas:
         return 0
-    used = set((await session.execute(select(StoredFile.sha256).where(StoredFile.sha256.in_(list(shas))))).scalars())
+    by_bucket: dict[str, list[str]] = {}
+    for sha in sorted(s for s in shas if isinstance(s, str) and len(s) >= 2):
+        by_bucket.setdefault(sha[:2], []).append(sha)
     gone = 0
-    for sha in shas - used:
-        from app.files.text import drop_cache
-
-        try:
-            blob_path(sha).unlink()
-            gone += 1
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError):
-            logger.warning("文件 %s 删不掉，下次清理再试", sha, exc_info=True)
-        drop_cache(sha)
+    for bucket in sorted(by_bucket):
+        bucket_shas = by_bucket[bucket]
+        async with lock(f"file_bucket:{bucket}"):
+            used: set[str] = set()
+            for start in range(0, len(bucket_shas), 500):
+                chunk = bucket_shas[start:start + 500]
+                used |= set((await session.execute(
+                    select(StoredFile.sha256).where(StoredFile.sha256.in_(chunk))
+                )).scalars())
+            for sha in bucket_shas:
+                if sha in used:
+                    continue
+                try:
+                    blob_path(sha).unlink()
+                    gone += 1
+                except FileNotFoundError:
+                    pass
+                except (OSError, ValueError):
+                    logger.warning("文件 %s 删不掉，下次清理再试", sha, exc_info=True)
+                drop_cache(sha)
     return gone
 
 

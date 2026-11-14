@@ -30,6 +30,11 @@ def _load_key() -> bytes:
 _fernet = Fernet(_load_key())
 
 
+def is_ciphertext(value: str | None) -> bool:
+    """判断字符串是否带有平台密文前缀。"""
+    return bool(value and value.startswith(_PREFIX))
+
+
 def encrypt(value: str | None) -> str | None:
     """加密明文。已经是密文的原样返回，方便重复保存同一条记录。"""
     if not value:

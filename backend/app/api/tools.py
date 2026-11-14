@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -287,6 +288,21 @@ def _refuse_bad_schema(parameters: Any) -> None:
         raise HTTPException(422, problem)
 
 
+def _url_origin(url: Any) -> tuple[str, str, int | None] | None:
+    text = str(url or "").strip()
+    if not text:
+        return None
+    try:
+        parts = urlsplit(text)
+        port = parts.port
+    except ValueError:
+        return (text, "", None)
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    default_port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    return (scheme, host, port or default_port)
+
+
 def _seal_config(config: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
     """请求头的值加密；提交的是原值的掩码时保持原值。名字不合法（空的、带空格、冒号、中文）的不让存：存进去之后每次
     调用都在发出之前失败。值里可以写 {{ 参数 }} 模板，不查。"""
@@ -297,7 +313,19 @@ def _seal_config(config: dict[str, Any], previous: dict[str, Any] | None) -> dic
         raise HTTPException(422, "请求头需要写成 JSON 对象，每个请求头名称对应一个值")
     if problem := vault.header_problem(headers, check_values=False):
         raise HTTPException(422, problem)
-    return {**config, "headers": vault.seal(headers, (previous or {}).get("headers"))}
+    target_changed = False
+    if previous is not None:
+        prev_ep = previous.get("endpoint") or None
+        cur_ep = config.get("endpoint") or None
+        if cur_ep != prev_ep:
+            target_changed = True
+        elif not cur_ep and _url_origin(config.get("url")) != _url_origin(previous.get("url")):
+            target_changed = True
+    try:
+        sealed_headers = vault.seal(headers, (previous or {}).get("headers"), target_changed=target_changed)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {**config, "headers": sealed_headers}
 
 
 async def _refuse_bad_binding(session: AsyncSession, kind: str, config: dict[str, Any]) -> None:
@@ -537,12 +565,29 @@ async def _guard_mcp(payload: McpIn, row: McpServer, session: AsyncSession) -> N
         raise HTTPException(422, f"MCP 服务的地址未通过安全检查：{e}") from e
 
 
-def _apply_mcp(row: McpServer, payload: McpIn) -> None:
+def _apply_mcp(row: McpServer, payload: McpIn, *, is_update: bool = False) -> None:
     previous_env, previous_headers = dict(row.env or {}), dict(row.headers or {})
+    target_changed = False
+    if is_update:
+        prev_ep = row.endpoint_id or None
+        cur_ep = payload.endpoint_id or None
+        if payload.transport != row.transport or cur_ep != prev_ep:
+            target_changed = True
+        elif payload.transport == "http" and not cur_ep:
+            if _url_origin(payload.url) != _url_origin(row.url):
+                target_changed = True
+        elif payload.transport != "http":
+            if (payload.command, list(payload.args or [])) != (row.command, list(row.args or [])):
+                target_changed = True
+    try:
+        sealed_env = vault.seal(payload.env, previous_env, target_changed=target_changed)
+        sealed_headers = vault.seal(payload.headers, previous_headers, target_changed=target_changed)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     for key, value in payload.model_dump().items():
         setattr(row, key, value)
-    row.env = vault.seal(payload.env, previous_env)
-    row.headers = vault.seal(payload.headers, previous_headers)
+    row.env = sealed_env
+    row.headers = sealed_headers
 
 
 @mcp_router.get("/servers", response_model=list[McpOut])
@@ -557,7 +602,7 @@ async def create_server(
     if (await session.execute(select(McpServer).where(McpServer.name == payload.name))).scalar_one_or_none():
         raise HTTPException(409, f"已存在名为「{payload.name}」的 MCP 服务，请换一个名称")
     row = McpServer()
-    _apply_mcp(row, payload)
+    _apply_mcp(row, payload, is_update=False)
     await _guard_mcp(payload, row, session)
     session.add(row)
     await session.commit()
@@ -575,7 +620,7 @@ async def update_server(
     if row.transport != "http":
         ensure_role("admin")
     before, old_name, was_enabled = _mcp_connection(row), row.name, row.enabled
-    _apply_mcp(row, payload)
+    _apply_mcp(row, payload, is_update=True)
     if _mcp_connection(row) != before:
         await _guard_mcp(payload, row, session)
     if _mcp_connection(row) != before:

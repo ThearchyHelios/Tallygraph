@@ -48,19 +48,24 @@ _ALWAYS_DENIED = frozenset({
 #   EXPLAIN ANALYZE DELETE …                  PG 的 ANALYZE 会真的执行
 # 关键字后面紧跟 ( 的不算：那是同名函数（MySQL 的 INSERT()、TRUNCATE()）。
 _HIDDEN_WRITE = re.compile(
-    r"\b(insert|update|delete|merge|upsert|truncate|drop|alter|create|grant|revoke|"
-    r"call|copy|into|attach|detach|vacuum|reindex|lock\s+tables?|replace\s+into)\b(?!\s*\()",
+    r"\b((?:insert|truncate)\b(?!\s*\()|(?:update|delete|merge|upsert|drop|alter|create|grant|revoke|"
+    r"call|copy|into|attach|detach|vacuum|reindex|lock\s+tables?|replace\s+into|autonomous_transaction)\b)",
     re.I,
 )
 
 # 查询里一调用就有副作用的函数。函数没法白名单，这里只收一小撮要命的：
 # set_config 能把 PG 连接层的只读关掉（真库实测：关掉后同一连接的下一个事务
 # 就能写），dblink 另开一条不受只读约束的连接，nextval/setval 推进序列，其余是
-# 杀连接、读写服务器文件、加载本地扩展。函数名可以加引号写（"set_config"(…)），
-# 所以名字两边允许引号，扫描时也只抹字符串、不抹标识符。
+# 杀连接、读写服务器文件、发起网络/系统调用或加载本地扩展。函数名可以加引号写（"set_config"(…)），
+# Oracle 包函数形如 utl_http.request(…)，所以名字两边允许引号，扫描时也只抹字符串、不抹标识符。
+_ORACLE_SIDE_EFFECT_PKGS = (
+    r"utl_http|utl_file|utl_tcp|utl_smtp|utl_inaddr|"
+    r"dbms_scheduler|dbms_job|dbms_pipe|dbms_ldap"
+)
 _SIDE_EFFECT_CALL = re.compile(
-    r"[\"`]?\b(set_config|nextval|setval|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|"
-    r"lo_import|lo_export|lo_unlink|dblink\w*|load_extension)\b[\"`]?\s*\(",
+    rf"(?:[\"`]?\b((?:{_ORACLE_SIDE_EFFECT_PKGS})\b[\"`]?\s*\.\s*[\"`]?\w+)\b[\"`]?|"
+    rf"[\"`]?\b(set_config|nextval|setval|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|"
+    rf"lo_import|lo_export|lo_unlink|dblink\w*|load_extension|xp_cmdshell|{_ORACLE_SIDE_EFFECT_PKGS})\b[\"`]?)\s*\(",
     re.I,
 )
 
@@ -366,7 +371,7 @@ def _write_reason(stmt: str, reading: _Reading = _GENERIC) -> str | None:
     """这条语句会不会写。会写就返回一句说给模型听的原因，不会写返回 None。
 
     首关键字只是第一道：以查询开头的语句正文照样能写（见 _HIDDEN_WRITE），
-    所以 SELECT / WITH / EXPLAIN 还要把正文扫一遍。SHOW / DESCRIBE / VALUES
+    所以 SELECT / WITH / EXPLAIN / VALUES 还要把正文扫一遍。SHOW / DESCRIBE
     结构上写不了，不扫——`SHOW CREATE TABLE` 里的 CREATE 不是在建表。
     """
     tokens = _tokens(stmt, reading)
@@ -377,14 +382,15 @@ def _write_reason(stmt: str, reading: _Reading = _GENERIC) -> str | None:
         return f"{verb.upper()} 会修改数据"
     if verb == "pragma":
         return _pragma_write_reason(stmt, reading)
-    if verb in ("select", "with", "explain"):
+    if verb in ("select", "with", "explain", "values"):
         hidden = _HIDDEN_WRITE.search(_blanked(tokens, identifiers=True))
         if hidden:
             word = " ".join(hidden.group(1).split()).upper()
             return f"语句中包含 {word}：以查询开头的语句也可能写入数据"
         call = _SIDE_EFFECT_CALL.search(_blanked(tokens, identifiers=False))
         if call:
-            return f"{call.group(1)}() 有副作用"
+            fn_name = re.sub(r'[\"`\s]+', "", call.group(1) or call.group(2) or "")
+            return f"{fn_name}() 有副作用"
     return None
 
 

@@ -19,7 +19,7 @@ import json
 import logging
 import re
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 from sqlalchemy import select
@@ -63,6 +63,20 @@ def endpoint_out(row: Endpoint) -> dict[str, Any]:
             "updated_by": row.updated_by}
 
 
+def _normalized_origin(url: str | None) -> tuple[str, str, int | None] | None:
+    if not url or not url.strip():
+        return None
+    try:
+        parts = urlsplit(url.strip())
+        port = parts.port
+    except ValueError:
+        return (url.strip(), "", None)
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    default_port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    return (scheme, host, port or default_port)
+
+
 def seal_environments(given: dict[str, Any] | None, previous: dict[str, Any] | None) -> dict[str, Any]:
     """提交上来的 environments → 存库的样子。只认 test、prod；base_url 必须是 http(s)；头的值加密，提交掩码值保持原值。
     只配了测试环境的也收（接入阶段先在测试环境上试）：正式运行要用的写入能力由发布检查 action.prod_missing 拦。"""
@@ -78,7 +92,13 @@ def seal_environments(given: dict[str, Any] | None, previous: dict[str, Any] | N
             raise EndpointError(f"{_ENV_LABEL[key]}的地址需要以 http:// 或 https:// 开头")
         if "?" in base or "#" in base:
             raise EndpointError(f"{_ENV_LABEL[key]}的地址不能带查询参数，参数请写在能力的配置里")
-        headers = vault.seal(env.get("headers"), (before.get(key) or {}).get("headers"))
+        prev_env = before.get(key) or {}
+        prev_base = str(prev_env.get("base_url") or "").strip().rstrip("/")
+        target_changed = bool(prev_base) and _normalized_origin(base) != _normalized_origin(prev_base)
+        try:
+            headers = vault.seal(env.get("headers"), prev_env.get("headers"), target_changed=target_changed)
+        except ValueError as e:
+            raise EndpointError(f"{_ENV_LABEL[key]}的认证头有误：{e}") from e
         # 按掩码换回原值之后再查：界面提交的是掩码，查的是真正要发出去的那一份
         if problem := vault.header_problem(vault.reveal(headers)):
             raise EndpointError(f"{_ENV_LABEL[key]}的认证头有误：{problem}")
@@ -216,13 +236,38 @@ def _client(**kwargs: Any) -> httpx.AsyncClient:
     return httpx.AsyncClient(**kwargs)
 
 
-def _parse(resp: httpx.Response) -> Any:
-    content = resp.content[: settings.http_tool_max_bytes]
-    text = content.decode(resp.encoding or "utf-8", errors="replace")
+def _decode_and_parse(raw_bytes: bytes, encoding: str | None) -> Any:
+    try:
+        text = raw_bytes.decode(encoding or "utf-8", errors="replace")
+    except (LookupError, UnicodeDecodeError):
+        text = raw_bytes.decode("utf-8", errors="replace")
     try:
         return json.loads(text)
     except ValueError:
         return text
+
+
+async def _read_bounded_bytes(resp: httpx.Response, max_bytes: int | None = None) -> bytes:
+    """流式读取响应体并限制最大字节数，避免超大响应先把整块内容缓存在内存里。"""
+    limit = max_bytes if max_bytes is not None else settings.http_tool_max_bytes
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in resp.aiter_bytes():
+        if not chunk:
+            continue
+        remaining = limit - total
+        if len(chunk) > remaining:
+            if remaining > 0:
+                chunks.append(chunk[:remaining])
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+def _parse(resp: httpx.Response) -> Any:
+    content = resp.content[: settings.http_tool_max_bytes]
+    return _decode_and_parse(content, resp.encoding)
 
 
 async def _resolve(session: AsyncSession, capability: Any, tool: CustomTool | None = None
@@ -360,8 +405,19 @@ async def endpoint_request(session: AsyncSession, capability: Any, args: dict[st
     try:
         async with _client(timeout=endpoint.timeout_s or settings.http_tool_timeout, follow_redirects=False,
                            trust_env=False, verify=env.get("verify_tls", True) is not False) as client:
-            resp = await client.request(req["method"], req["url"], params=req["query"] or None, headers=headers,
-                                        json=req["body"] if req["body"] is not None else None)
+            http_req = client.build_request(
+                req["method"], req["url"],
+                params=req["query"] or None,
+                headers=headers,
+                json=req["body"] if req["body"] is not None else None,
+            )
+            resp = await client.send(http_req, stream=True)
+            try:
+                raw_body = await _read_bounded_bytes(resp)
+                status_code = resp.status_code
+                encoding = resp.encoding
+            finally:
+                await resp.aclose()
     except (httpx.ConnectError, httpx.ConnectTimeout) as e:
         # 连接没建立：请求没发出去，是确定的失败
         return EndpointResult(status=None, body=None, error=f"无法连接端点「{endpoint.name}」：{e}",
@@ -376,15 +432,15 @@ async def endpoint_request(session: AsyncSession, capability: Any, args: dict[st
         return EndpointResult(status=None, body=None, unknown=True, environment=environment,
                               error=f"端点「{endpoint.name}」没有返回确定的结果：{type(e).__name__}")
 
-    body = _parse(resp)
+    body = _decode_and_parse(raw_body, encoding)
     snapshot: str | None = None
-    if (cap is not None and cap.tabular and effective_effect(cap) == "read" and 200 <= resp.status_code < 300):
+    if (cap is not None and cap.tabular and effective_effect(cap) == "read" and 200 <= status_code < 300):
         try:
-            snapshot = await _store_snapshot(cap, endpoint, environment, shown, resp.status_code, body,
+            snapshot = await _store_snapshot(cap, endpoint, environment, shown, status_code, body,
                                              run_id=run_id, node_id=node_id)
         except EndpointError as e:
-            return EndpointResult(status=resp.status_code, body=body, error=str(e), environment=environment)
-    return EndpointResult(status=resp.status_code, body=body, snapshot_artifact=snapshot, environment=environment)
+            return EndpointResult(status=status_code, body=body, error=str(e), environment=environment)
+    return EndpointResult(status=status_code, body=body, snapshot_artifact=snapshot, environment=environment)
 
 
 async def _store_snapshot(cap: Capability, endpoint: Endpoint, environment: str, request: dict[str, Any],
@@ -434,12 +490,17 @@ async def probe(endpoint: Endpoint, environment: str) -> dict[str, Any]:
         await assert_safe_url(env["base_url"], allow_intranet=bool(env.get("allow_intranet")))
         async with _client(timeout=timeout, follow_redirects=False, trust_env=False,
                            verify=env.get("verify_tls", True) is not False) as client:
-            resp = await client.get(env["base_url"], headers=headers)
+            probe_req = client.build_request("GET", env["base_url"], headers=headers)
+            resp = await client.send(probe_req, stream=True)
+            try:
+                await _read_bounded_bytes(resp, min(settings.http_tool_max_bytes, 65536))
+                status = resp.status_code
+            finally:
+                await resp.aclose()
     except UnsafeUrlError as e:
         return {"ok": False, "reachable": False, "status": None, "message": str(e)}
     except httpx.HTTPError as e:
         return {"ok": False, "reachable": False, "status": None, "message": not_sent_reason(e, timeout)}
-    status = resp.status_code
     if 200 <= status < 300:
         return {"ok": True, "reachable": True, "status": status, "message": f"连接成功：基础地址返回 HTTP {status}"}
     message = f"能连上，但{describe_status(status)}"

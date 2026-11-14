@@ -10,7 +10,7 @@ import { ApiError, api } from '../api/client'
 import { ApprovalCard } from '../run/RunPanel'
 import { AssistantStream, type StreamTurn, type TurnFailure } from '../run/AssistantStream'
 import { PromptBox } from '../run/Composer'
-import { decodeCopilot, decodeRun, exitLabels } from '../run/decode'
+import { createRunDecoder, decodeCopilot, exitLabels, type ExitLabelOf, type RunDecoder, type Step } from '../run/decode'
 import { catalogPatchesOf } from '../run/catalogPatch'
 import { LedgerTurn } from '../run/LedgerTurn'
 import { sourceHandles } from '../canvas/nodeDefs'
@@ -406,12 +406,133 @@ export function ChatPage() {
  * 按轮次对象缓存：store 只替换变了的那一轮，其余轮次引用不变，于是一条事件
  * 只重解码它自己那一轮，而不是整个会话的每一轮。
  */
+interface TurnStreamMemo {
+  ops: ChatTurn['ops']
+  events: ChatTurn['events']
+  visible: boolean
+  finalStatus?: string
+  finalPending?: boolean
+  graph: ChatTurn['graph']
+  steps: Step[]
+  catalogPatches: ReturnType<typeof catalogPatchesOf>
+  status: StreamTurn['status']
+  phase: ChatTurn['phase']
+  rejected: ChatTurn['rejected']
+  asked: ChatTurn['asked']
+  thinking: ChatTurn['thinking']
+  output: ChatTurn['output']
+  failure: ChatTurn['failure']
+  errorText: ChatTurn['error']
+  queries: number | undefined
+  runId: string | undefined
+  runClass: NonNullable<ChatTurn['run']>['run_class'] | undefined
+  explanation: ChatTurn['explanation']
+  noQuery: ChatTurn['noQuery']
+  review: ChatTurn['review']
+  rawOutput: ChatTurn['rawOutput']
+  startedAt: ChatTurn['startedAt']
+  endedAt: ChatTurn['endedAt']
+  metaMs: number | undefined
+  usage: ReturnType<typeof usageOfTurn>
+  streamTurn: StreamTurn
+}
+
 const streamCache = new WeakMap<ChatTurn, StreamTurn>()
+const opsDecodeCache = new WeakMap<ChatTurn['ops'], {
+  copilotSteps: Step[]
+  catalogPatches: ReturnType<typeof catalogPatchesOf>
+}>()
+const eventsMemoCache = new WeakMap<ChatTurn['events'], TurnStreamMemo>()
+const turnDecoders = new Map<string, {
+  graph: ChatTurn['graph']
+  exitLabelOf?: ExitLabelOf
+  decoder: RunDecoder
+}>()
+const MAX_TURN_DECODERS = 64
+
+function decoderForTurn(turn: ChatTurn): RunDecoder {
+  const cur = turnDecoders.get(turn.id)
+  if (cur && cur.graph === turn.graph) return cur.decoder
+  const exitLabelOf = turn.graph?.nodes?.length
+    ? exitLabels(turn.graph.nodes.map((n) => ({ id: n.id, type: n.type, config: n.data?.config })), sourceHandles)
+    : undefined
+  const decoder = createRunDecoder({ exitLabelOf })
+  if (!cur && turnDecoders.size >= MAX_TURN_DECODERS) {
+    const oldest = turnDecoders.keys().next().value
+    if (oldest !== undefined) turnDecoders.delete(oldest)
+  }
+  turnDecoders.set(turn.id, { graph: turn.graph, exitLabelOf, decoder })
+  return decoder
+}
 
 function toStreamTurn(turn: ChatTurn): StreamTurn {
-  const hit = streamCache.get(turn)
-  if (hit) return hit
+  const directHit = streamCache.get(turn)
+  if (directHit) return directHit
+
   const live = turn.phase === 'planning' || turn.phase === 'building' || turn.phase === 'running'
+  const status = live ? liveLine(turn)
+    : turn.asked && (turn.phase === 'done' || turn.phase === 'ready') ? CHAT_BLUEPRINT_TEXT.asked
+    : turn.phase === 'checking' || turn.phase === 'suspended' || turn.phase === 'ready' || turn.phase === 'unknown'
+      ? turn.status
+      : undefined
+  const visible = stepsVisible(turn)
+  const finalStatus = turn.final?.status
+  const finalPending = turn.final?.pending
+  const usage = usageOfTurn(turn)
+
+  // 流式阶段 patchTurn 每秒多次克隆外层 ChatTurn（writing / status 跳动），但 turn.ops 和 turn.events 引用未变：
+  // 按 ops / events 引用命中缓存，避免每次 token 增量把整轮轨迹从头重算
+  const prevMemo = eventsMemoCache.get(turn.events)
+  const traceUnchanged = !!prevMemo
+    && prevMemo.ops === turn.ops
+    && prevMemo.events === turn.events
+    && prevMemo.visible === visible
+    && prevMemo.finalStatus === finalStatus
+    && prevMemo.finalPending === finalPending
+    && prevMemo.graph === turn.graph
+
+  if (
+    traceUnchanged
+    && prevMemo.status === status
+    && prevMemo.phase === turn.phase
+    && prevMemo.rejected === turn.rejected
+    && prevMemo.asked === turn.asked
+    && prevMemo.thinking === turn.thinking
+    && prevMemo.output === turn.output
+    && prevMemo.failure === turn.failure
+    && prevMemo.errorText === turn.error
+    && prevMemo.queries === turn.meta?.queries
+    && prevMemo.runId === turn.run?.id
+    && prevMemo.runClass === turn.run?.run_class
+    && prevMemo.explanation === turn.explanation
+    && prevMemo.noQuery === turn.noQuery
+    && prevMemo.review === turn.review
+    && prevMemo.rawOutput === turn.rawOutput
+    && prevMemo.startedAt === turn.startedAt
+    && prevMemo.endedAt === turn.endedAt
+    && prevMemo.metaMs === turn.meta?.ms
+    && prevMemo.usage === usage
+  ) {
+    streamCache.set(turn, prevMemo.streamTurn)
+    return prevMemo.streamTurn
+  }
+
+  let opsDecoded = opsDecodeCache.get(turn.ops)
+  if (!opsDecoded) {
+    opsDecoded = {
+      copilotSteps: decodeCopilot(turn.ops),
+      catalogPatches: catalogPatchesOf(turn.ops),
+    }
+    opsDecodeCache.set(turn.ops, opsDecoded)
+  }
+
+  // 从库里恢复、还没点开「执行过程」的轮次只有问题和答案；点开后又收起的，步骤留在内存里但不画
+  const steps = traceUnchanged
+    ? prevMemo.steps
+    : visible
+      ? [...opsDecoded.copilotSteps, ...decoderForTurn(turn).decode(turn.events, turn.final)]
+      : []
+
   const f = turn.failure
   const out: StreamTurn = {
     id: turn.id,
@@ -431,19 +552,8 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
       : undefined,
     tone: turn.phase === 'suspended' || turn.phase === 'unknown' ? 'warn' : undefined,
     // 进行中的写此刻在做什么；结束了的用全站统一的状态词
-    status: live ? liveLine(turn)
-      : turn.asked && (turn.phase === 'done' || turn.phase === 'ready') ? CHAT_BLUEPRINT_TEXT.asked
-      : turn.phase === 'checking' || turn.phase === 'suspended' || turn.phase === 'ready' || turn.phase === 'unknown'
-        ? turn.status
-        : undefined,
-    // 从库里恢复、还没点开「执行过程」的轮次只有问题和答案；点开后又收起的，
-    // 步骤留在内存里但不画
-    steps: stepsVisible(turn) ? [...decodeCopilot(turn.ops), ...decodeRun(turn.events, turn.final, {
-      // 分支、循环那一行写这一轮工作流里出口的说明，不写 case 的 key
-      exitLabelOf: turn.graph?.nodes?.length
-        ? exitLabels(turn.graph.nodes.map((n) => ({ id: n.id, type: n.type, config: n.data?.config })), sourceHandles)
-        : undefined,
-    })] : [],
+    status,
+    steps,
     thinking: turn.thinking,
     output: turn.output,
     error: turn.phase === 'error' && f ? streamError(turn, f) : turn.error || undefined,
@@ -454,7 +564,7 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
     graph: turn.graph,
     graphNote: turn.explanation,
     // 助手提出的数据目录修改：每条一张卡片，人点保存才写入。不随「执行过程」收起——要人拿主意的事不能藏着
-    catalogPatches: catalogPatchesOf(turn.ops),
+    catalogPatches: opsDecoded.catalogPatches,
     noQuery: turn.noQuery,
     review: turn.review,
     rawOutput: turn.rawOutput,
@@ -464,7 +574,38 @@ function toStreamTurn(turn: ChatTurn): StreamTurn {
     elapsedMs: !live && turn.endedAt ? turn.endedAt - turn.startedAt : turn.meta?.ms ?? undefined,
     cost: costOf(turn),
   }
+
   streamCache.set(turn, out)
+  eventsMemoCache.set(turn.events, {
+    ops: turn.ops,
+    events: turn.events,
+    visible,
+    finalStatus,
+    finalPending,
+    graph: turn.graph,
+    steps,
+    catalogPatches: opsDecoded.catalogPatches,
+    status,
+    phase: turn.phase,
+    rejected: turn.rejected,
+    asked: turn.asked,
+    thinking: turn.thinking,
+    output: turn.output,
+    failure: turn.failure,
+    errorText: turn.error,
+    queries: turn.meta?.queries,
+    runId: turn.run?.id,
+    runClass: turn.run?.run_class,
+    explanation: turn.explanation,
+    noQuery: turn.noQuery,
+    review: turn.review,
+    rawOutput: turn.rawOutput,
+    startedAt: turn.startedAt,
+    endedAt: turn.endedAt,
+    metaMs: turn.meta?.ms,
+    usage,
+    streamTurn: out,
+  })
   return out
 }
 

@@ -166,7 +166,8 @@ fill "$ROOT/deploy/deploy.sh" "$STAGE/deploy.sh"
 fill "$ROOT/deploy/README.md" "$STAGE/README.md"
 cp "$ROOT/deploy/agentlab.env" "$STAGE/agentlab.env"
 chmod 755 "$STAGE/deploy.sh"
-chmod 644 "$STAGE/README.md" "$STAGE/agentlab.env"
+chmod 644 "$STAGE/README.md"
+chmod 600 "$STAGE/agentlab.env"
 for f in "${PAYLOAD[@]}"; do chmod 644 "$STAGE/$f"; done
 if grep -q '__AGENTLAB_' "$STAGE/deploy.sh" "$STAGE/README.md"; then
   echo "模板里还有没填上的占位符"; exit 1

@@ -16,14 +16,14 @@ import { formatCost, formatLapse, formatOffset, formatSpan, formatTokens, shortI
 import { statusLabel } from '../lib/status'
 import { CHAT_BLUEPRINT_TEXT, runClassLabel, SQL_CHECK_TEXT } from '../lib/terms'
 import { sortSqlChecks } from '../lib/sqlcheck'
-import type { ConversationTurn, RunUsage, ToolChange } from '../types'
+import type { ConversationTurn, RunEvent, RunUsage, ToolChange } from '../types'
 import { AssistantStream, type StreamTurn } from './AssistantStream'
 import { Composer } from './Composer'
 import { SqlCheckBody } from './SqlChecks'
 import { EvidenceHostContext, type EvidenceHost } from './evidenceHost'
 import {
-  COPILOT_PHASE_TEXT, copilotOutcome, decodeCopilot, decodeRun, exitLabels, issueLine, issueSqlCheck, SELF_CHECK_ROUNDS, type CopilotIssue,
-  type CopilotOutcome,
+  COPILOT_PHASE_TEXT, copilotOutcome, createRunDecoder, decodeCopilot, exitLabels, issueLine, issueSqlCheck, SELF_CHECK_ROUNDS, type CopilotIssue,
+  type CopilotOutcome, type RunDecoder, type Step,
 } from './decode'
 import { catalogPatchesOf } from './catalogPatch'
 import { ApprovalCard } from './RunPanel'
@@ -123,6 +123,19 @@ interface Reveal {
 // 对话：和 Copilot 说话的地方
 // -------------------------------------------------------------------------
 
+interface CopilotOpsMemo {
+  running: boolean
+  unchanged: boolean
+  out: CopilotOutcome
+  foundN: number
+  hasAsk: boolean
+  steps: Step[]
+  catalogPatches: ReturnType<typeof catalogPatchesOf>
+}
+
+const copilotOpsCache = new WeakMap<CopilotTurn['ops'], CopilotOpsMemo>()
+const settledCopilotCache = new WeakMap<CopilotTurn, StreamTurn>()
+
 /**
  * 一轮 Copilot 的卡片标题。只看 phase 的话，只回了一句话、自查没修好、少放了
  * 一步，全都写「流程已更新到画布」——而这几种的下一步完全不同
@@ -132,13 +145,29 @@ function copilotTurn(
   labelOf: (id: string) => string | undefined,
 ): StreamTurn {
   const running = t.phase === 'running'
-  const out = copilotOutcome(t.ops, running)
-  const found = t.ops.find((o) => o.op === 'check' && o.status === 'repairing')
-  const foundN = Array.isArray(found?.issues) ? found!.issues.length : 0
+  if (!running) {
+    const settled = settledCopilotCache.get(t)
+    if (settled) return settled
+  }
+  const unchanged = t.outcome === 'unchanged'
+  let memo = copilotOpsCache.get(t.ops)
+  if (!memo || memo.running !== running || memo.unchanged !== unchanged) {
+    const out = copilotOutcome(t.ops, running)
+    const found = t.ops.find((o) => o.op === 'check' && o.status === 'repairing')
+    memo = {
+      running,
+      unchanged,
+      out,
+      foundN: Array.isArray(found?.issues) ? found!.issues.length : 0,
+      hasAsk: t.ops.some((o) => o.op === 'ask'),
+      steps: decodeCopilot(t.ops, { context: 'canvas', unchanged, labelOf }),
+      catalogPatches: catalogPatchesOf(t.ops),
+    }
+    copilotOpsCache.set(t.ops, memo)
+  }
+  const { out, foundN, hasAsk, steps, catalogPatches } = memo
   const reply = out.reply ?? t.reply
   const errorOp = out.error
-  const unchanged = t.outcome === 'unchanged'
-  const steps = decodeCopilot(t.ops, { context: 'canvas', unchanged, labelOf })
   // 模型改提示词时漏写了 tools、把节点的工具抹掉了：图照样能跑，只是什么都查不到。
   // 按要求删的不算：只有这一轮没让删的才在卡头上提醒
   const { unasked } = toolLossOf(out)
@@ -164,7 +193,7 @@ function copilotTurn(
     statusCode = 'cancelled'
   } else if (t.phase === 'error' || errorOp) {
     status = '本轮未能完成'
-  } else if (out.kind !== 'built' && t.ops.some((o) => o.op === 'ask')) {
+  } else if (out.kind !== 'built' && hasAsk) {
     // 助手问回来一句、画布没动（N11）：这一轮在等你回答，不是「未修改画布」那种没下文
     status = CHAT_BLUEPRINT_TEXT.asked
     statusCode = 'waiting'
@@ -203,7 +232,7 @@ function copilotTurn(
     statusCode = 'cancelled'
   }
 
-  return {
+  const streamTurn: StreamTurn = {
     id: t.id,
     question: t.instruction,
     phase: running ? 'running' : t.phase === 'error' || errorOp ? 'error' : 'done',
@@ -212,12 +241,14 @@ function copilotTurn(
     statusCode,
     steps,
     output: reply ? { 回答: reply } : t.explanation ? { 说明: t.explanation } : null,
-    catalogPatches: catalogPatchesOf(t.ops),
+    catalogPatches,
     error: errorOp
       ? { error: errorOp.message, hint: errorOp.hint, detail: errorOp.raw }
       : t.error || undefined,
     startedAt: t.startedAt,
   }
+  if (!running) settledCopilotCache.set(t, streamTurn)
+  return streamTurn
 }
 
 /**
@@ -632,12 +663,51 @@ function RunView({ onBack, reveal, onRevealed }: {
   const exitLabelOf = useExitLabels()
   const evidenceHost = useCanvasEvidenceHost()
 
-  const turns = useMemo<StreamTurn[]>(() => {
-    const finished = [...events].reverse().find((e) => e.type === 'run.finished')
-    const failedEvent = [...events].reverse().find((e) => e.type === 'run.failed')
+  const runDecoderRef = useRef<{
+    runId: string
+    exitLabelOf: typeof exitLabelOf
+    decoder: RunDecoder
+    scanned: number
+    firstEvent: RunEvent | undefined
+    finished: RunEvent | undefined
+    failedEvent: RunEvent | undefined
+  } | null>(null)
+
+  const decoded = useMemo(() => {
+    let state = runDecoderRef.current
+    if (!state || state.runId !== run.id || state.exitLabelOf !== exitLabelOf) {
+      state = {
+        runId: run.id,
+        exitLabelOf,
+        decoder: createRunDecoder({ exitLabelOf }),
+        scanned: 0,
+        firstEvent: events[0],
+        finished: undefined,
+        failedEvent: undefined,
+      }
+      runDecoderRef.current = state
+    } else if (events.length < state.scanned || (state.scanned > 0 && events[0] !== state.firstEvent)) {
+      state.scanned = 0
+      state.firstEvent = events[0]
+      state.finished = undefined
+      state.failedEvent = undefined
+    } else if (state.scanned === 0) {
+      state.firstEvent = events[0]
+    }
+    for (let i = state.scanned; i < events.length; i++) {
+      const ev = events[i]
+      if (ev.type === 'run.finished') state.finished = ev
+      else if (ev.type === 'run.failed') state.failedEvent = ev
+    }
+    state.scanned = events.length
     // 结局以 runPhase 为准，连同对账查到的状态一起喂给解码器：服务被强杀、
     // 事件停在半路的运行，右栏的行也得收住，不能一直转
-    const steps = decodeRun(events, { status: run.status }, { exitLabelOf })
+    const steps = state.decoder.decode(events, { status: run.status })
+    return { steps, finished: state.finished, failedEvent: state.failedEvent }
+  }, [run.id, run.status, events, exitLabelOf])
+
+  const turns = useMemo<StreamTurn[]>(() => {
+    const { steps, finished, failedEvent } = decoded
     const output = run.output && Object.keys(run.output).length ? run.output : finished?.data?.output
     return [{
       id: run.id,
@@ -662,7 +732,7 @@ function RunView({ onBack, reveal, onRevealed }: {
       // 栏头只在不跑的时候写它；跑着的时候耗时细条按各步自己的耗时比
       elapsedMs: phase === 'waiting' || isSettled(phase) ? stoppedActiveMs(run.usage, trace) : undefined,
     }]
-  }, [run, events, phase, trace, exitLabelOf])
+  }, [decoded, run, phase, trace])
 
   // 停下来等人的那一刻就去取审批卡。列表 4 秒才轮询一次：头上已经写着「等待审批」，
   // 通过/驳回却要晚几秒才出来

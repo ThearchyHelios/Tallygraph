@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import sys
+from pathlib import Path
 from typing import Any
 
-from app.core.config import settings
+from app.core.config import sanitize_session, settings
 from app.sandbox.base import ExecResult, Sandbox, SandboxLimits
 from app.sandbox.bubblewrap_sandbox import BubblewrapSandbox
 from app.sandbox.local_sandbox import LocalSandbox
@@ -24,6 +26,28 @@ class DisabledSandbox(Sandbox):
 
     async def health(self) -> dict[str, Any]:
         return {"backend": self.name, "available": False, "isolated": False, "reason": "已关闭"}
+
+
+class UnavailableSandbox(Sandbox):
+    def __init__(self, name: str, reason: str) -> None:
+        self.name = name
+        self.reason = reason
+
+    async def run(self, code: str, **kwargs: Any) -> ExecResult:  # type: ignore[override]
+        return ExecResult(
+            ok=False,
+            backend=self.name,
+            error=self.reason,
+        )
+
+    async def health(self) -> dict[str, Any]:
+        return {
+            "backend": self.name,
+            "available": False,
+            "isolated": True,
+            "error": self.reason,
+            "reason": self.reason,
+        }
 
 
 # 按隔离强度从高到低排，auto 模式挑第一个能用的。
@@ -59,7 +83,7 @@ class SandboxManager:
         self._reaper: asyncio.Task[None] | None = None
 
     async def get(self, prefer: str | None = None) -> Sandbox:
-        """取后端。prefer 指定档位时给那一档，拿不到就退回默认那台。
+        """取后端。prefer 指定档位时给那一档；strict 拿不到时拒绝降级，其余退回默认后端。
 
         节点级的"隔离档位"走这条路：strict 要硬件隔离、fast 要低延迟，
         而整机默认仍由 auto 决定。
@@ -68,6 +92,14 @@ class SandboxManager:
             resolved = self._resolve_named(prefer)
             if resolved is not None:
                 return resolved
+            if prefer == "strict" and (settings.sandbox_backend or "auto").lower() != "off":
+                detail = MicroVMSandbox.unavailable_reason()
+                reason = (
+                    f"当前环境不支持 strict 硬件隔离（{detail}），已拒绝降级执行"
+                    if detail
+                    else "当前环境不支持 strict 硬件隔离（microVM 不可用），已拒绝降级执行"
+                )
+                return UnavailableSandbox("strict", reason)
         if self._backend is not None:
             return self._backend
         async with self._lock:
@@ -204,10 +236,24 @@ class SandboxManager:
         ]
         return info
 
+    async def workspace_for(self, session_id: str) -> Path:
+        impl = await self.get()
+        ws_fn = getattr(impl, "_workspace", None)
+        if callable(ws_fn):
+            return ws_fn(session_id)
+        safe_sid = sanitize_session(session_id)
+        fallback = settings.data_dir / "workspace" / safe_sid
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
     async def cleanup(self, session_id: str) -> None:
         # 会话可能落在任意一档上（节点各自选了档位），全部清一遍
         for impl in {id(b): b for b in [*self._named.values(), self._backend] if b}.values():
             await impl.cleanup(session_id)
+        safe_sid = sanitize_session(session_id)
+        shared_ws = settings.data_dir / "workspace" / safe_sid
+        if shared_ws.exists():
+            await asyncio.to_thread(shutil.rmtree, shared_ws, True)
 
     async def close(self) -> None:
         if self._reaper is not None:

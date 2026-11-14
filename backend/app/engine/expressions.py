@@ -239,7 +239,11 @@ class ExpressionError(ValueError):
 # 一条画布上的分支条件就能把整个后端冻死。
 _MAX_POW_EXPONENT = 1024
 _MAX_POW_BASE = 1e15
+_MAX_POW_DIGITS = 300
 _MAX_SEQ_REPEAT = 1_000_000
+_MAX_REGEX_LEN = 512
+_MAX_MATCH_INPUT = 65536
+_REDOS_NESTED_QUANT = re.compile(r"(?:\+|\*|\{[0-9,]+\})\??\s*\)\s*(?:\+|\*|\{[0-9,]+\}|\?)")
 
 
 def _safe_pow(base: Any, exponent: Any) -> Any:
@@ -249,9 +253,22 @@ def _safe_pow(base: Any, exponent: Any) -> Any:
             raise ExpressionError(f"指数超过上限 {_MAX_POW_EXPONENT}")
         if abs(base) > _MAX_POW_BASE and exponent > 1:
             raise ExpressionError(f"底数超过上限 {_MAX_POW_BASE:g}")
+        if (
+            isinstance(base, int)
+            and not isinstance(base, bool)
+            and isinstance(exponent, int)
+            and not isinstance(exponent, bool)
+            and exponent > 0
+            and abs(base) > 1
+            and exponent * math.log10(abs(base)) > _MAX_POW_DIGITS
+        ):
+            raise ExpressionError("幂运算结果超出安全位数上限")
     except TypeError as e:  # 非数值类型交给 operator.pow 自己报
         raise ExpressionError(f"幂运算的操作数必须是数值：{e}") from e
-    return operator.pow(base, exponent)
+    try:
+        return operator.pow(base, exponent)
+    except OverflowError as e:
+        raise ExpressionError("幂运算结果超出安全位数上限") from e
 
 
 def _safe_mul(a: Any, b: Any) -> Any:
@@ -304,6 +321,7 @@ _UNARY_OPS = {ast.Not: operator.not_, ast.USub: operator.neg, ast.UAdd: operator
 #: 带前导零的 "00123" 是编号，照文本。快照里没有列类型：文本列里的值恰好全是不带前导零的数字时，
 #: 同样会被当成数，要文本就写 str(cell(...))
 _NUMERIC_TEXT = re.compile(r"^\s*-?(?:0|[1-9]\d*)(?:\.\d+)?(?:E[+-]?\d+)?\s*$")
+_DECIMAL_TEXT = _NUMERIC_TEXT
 #: 字段声明成数时，前导零、正号、小写 e 也按数读：写 schema 的人说了它是数
 _LOOSE_NUMERIC_TEXT = re.compile(r"^\s*[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\s*$")
 _INTEGER_TEXT = re.compile(r"^\s*[+-]?\d+\s*$")
@@ -556,6 +574,88 @@ def _settle(value: Any) -> Any:
     return value
 
 
+def _has_nested_quantifier(pattern: str) -> bool:
+    if _REDOS_NESTED_QUANT.search(pattern):
+        return True
+    group_has_quant: list[bool] = []
+    escaped = False
+    in_char_class = False
+    n = len(pattern)
+    i = 0
+    while i < n:
+        ch = pattern[i]
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\":
+            escaped = True
+            i += 1
+            continue
+        if in_char_class:
+            if ch == "]":
+                in_char_class = False
+            i += 1
+            continue
+        if ch == "[":
+            in_char_class = True
+            i += 1
+            continue
+        if ch == "(":
+            group_has_quant.append(False)
+            i += 1
+            continue
+        if ch == ")":
+            inner_quant = group_has_quant.pop() if group_has_quant else False
+            j = i + 1
+            while j < n and pattern[j].isspace():
+                j += 1
+            outer_quant = False
+            if j < n and pattern[j] in ("+", "*"):
+                outer_quant = True
+            elif j < n and pattern[j] == "{":
+                end_brace = pattern.find("}", j + 1)
+                if end_brace > j + 1 and all(c.isdigit() or c == "," for c in pattern[j + 1 : end_brace]):
+                    outer_quant = True
+            if inner_quant and outer_quant:
+                return True
+            if (inner_quant or outer_quant) and group_has_quant:
+                group_has_quant[-1] = True
+            i += 1
+            continue
+        if ch in ("+", "*") and group_has_quant:
+            if not (i >= 2 and pattern[i - 2 : i] == "(?"):
+                group_has_quant[-1] = True
+        elif ch == "{" and group_has_quant:
+            end_brace = pattern.find("}", i + 1)
+            if end_brace > i + 1 and all(c.isdigit() or c == "," for c in pattern[i + 1 : end_brace]):
+                group_has_quant[-1] = True
+        i += 1
+    return False
+
+
+def _validate_regex_pattern(pattern: Any) -> str:
+    if not isinstance(pattern, str):
+        raise ExpressionError("matches() 的正则表达式必须是字符串")
+    if len(pattern) > _MAX_REGEX_LEN:
+        raise ExpressionError(f"正则表达式长度超过上限 {_MAX_REGEX_LEN}")
+    if _has_nested_quantifier(pattern):
+        raise ExpressionError("正则表达式包含嵌套量词，存在回溯风险，已拒绝执行")
+    try:
+        re.compile(pattern)
+    except re.error as e:
+        raise ExpressionError(f"正则表达式语法错误：{e}") from e
+    return pattern
+
+
+def _fn_matches(s: Any, p: Any) -> bool:
+    pat = _validate_regex_pattern(p)
+    text = str(s)
+    if len(text) > _MAX_MATCH_INPUT:
+        text = text[:_MAX_MATCH_INPUT]
+    return bool(re.search(pat, text))
+
+
 _SAFE_FUNCS: dict[str, Any] = {
     "len": len,
     "str": str,
@@ -575,7 +675,7 @@ _SAFE_FUNCS: dict[str, Any] = {
     "contains": lambda hay, needle: needle in hay if hay is not None else False,
     "startswith": lambda s, p: str(s).startswith(p),
     "endswith": lambda s, p: str(s).endswith(p),
-    "matches": lambda s, p: bool(re.search(p, str(s))),
+    "matches": _fn_matches,
     "get": lambda obj, key, default=None: (obj or {}).get(key, default),
     "cell": table_cell,
 }
@@ -690,6 +790,13 @@ def _check_static(tree: ast.Expression, roots: frozenset[str] = EXPRESSION_ROOTS
             if not isinstance(node.func, ast.Name) or node.func.id not in _SAFE_FUNCS:
                 called = node.func.id if isinstance(node.func, ast.Name) else ast.unparse(node.func)
                 raise ExpressionError(f"不支持函数 {called}()，可用的函数：{'、'.join(_SAFE_FUNCS)}")
+            if (
+                node.func.id == "matches"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                _validate_regex_pattern(node.args[1].value)
         elif isinstance(node, ast.Attribute) and node.attr.startswith("_"):
             raise ExpressionError("不允许访问私有属性")
         elif (isinstance(node, ast.Constant) and isinstance(node.value, str)

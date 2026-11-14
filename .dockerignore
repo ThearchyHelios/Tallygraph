@@ -30,12 +30,16 @@ backend/.venv
 **/.vite-*
 
 # 打包产物和不进镜像的东西
+release
 release/
 docs/
 scripts/
 deploy/
 backend/tests/
+.claude
 .claude/
+.worktrees
+.worktrees/
 .DS_Store
 **/.DS_Store
 .idea/

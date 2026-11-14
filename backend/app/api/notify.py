@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 
 from app.api.deps import current_principal
-from app.core.crypto import encrypt
+from app.core.crypto import encrypt, is_ciphertext
 from app.db.base import SessionLocal
 from app.db.models import NotifyChannel, NotifyDelivery
 from app.notify import core, mail
@@ -64,6 +64,21 @@ async def _safe_personal(scope: str, url: str) -> None:
 
     if scope == "user" and (problem := await personal_url_problem(url)):
         raise HTTPException(422, problem)
+
+
+async def _safe_webhook_url(scope: str, url: str) -> None:
+    """校验 Webhook 目标地址：个人渠道禁一切非公网地址；全局/应用渠道仅管理员可指向内网，且任何人都不能指向云元数据地址。"""
+    await _safe_personal(scope, url)
+    if scope == "user":
+        return
+    from app.tools.net import UnsafeUrlError, assert_safe_url
+
+    allow_intranet = current_principal().at_least("admin")
+    try:
+        await assert_safe_url(url, allow_intranet=allow_intranet)
+    except UnsafeUrlError as e:
+        msg = "Webhook 地址不能指向云元数据或受限地址" if allow_intranet else "非管理员配置的 Webhook 地址需要是公网地址"
+        raise HTTPException(422, msg) from e
 
 
 def _validated(payload: ChannelIn, *, url: str | None, saved: list[str] | None = None) -> None:
@@ -162,7 +177,9 @@ async def create_channel(payload: ChannelIn) -> dict[str, Any]:
         except ValueError as e:
             raise HTTPException(422, str(e)) from e
         _validated(payload, url=url)
-        await _safe_personal(payload.scope, url)
+        await _safe_webhook_url(payload.scope, url)
+        if payload.secret and is_ciphertext(payload.secret):
+            raise HTTPException(400, "不允许直接提交密文前缀")
         secret = encrypt(payload.secret) if payload.secret else None
     row = NotifyChannel(name=payload.name.strip(), scope=payload.scope, owner_id=owner, format=payload.format,
                         url=encrypt(url), secret=secret, events=list(dict.fromkeys(payload.events)),
@@ -230,9 +247,11 @@ async def update_channel(channel_id: str, payload: ChannelIn) -> dict[str, Any]:
                 _validated(payload, url=current or None, saved=list(row.events or []))
             else:
                 _validated(payload, url=url, saved=list(row.events or []))
-                await _safe_personal(row.scope, url)
+                await _safe_webhook_url(row.scope, url)
                 row.url = encrypt(url)
             if payload.secret is not None:
+                if is_ciphertext(payload.secret) and payload.secret != row.secret:
+                    raise HTTPException(400, "不允许直接提交密文前缀")
                 row.secret = encrypt(payload.secret) if payload.secret else None
         row.name, row.format = payload.name.strip(), payload.format
         row.events, row.enabled = list(dict.fromkeys(payload.events)), payload.enabled
@@ -263,6 +282,28 @@ async def test_channel(channel_id: str) -> dict[str, Any]:
         if row is None:
             raise HTTPException(404, "通知渠道不存在，可能已被删除")
         _can_edit(row.scope, row.owner_id)
+    if row.format != "email" and row.scope != "user":
+        from app.core.crypto import decrypt
+        from app.tools.net import UnsafeUrlError, assert_safe_url
+
+        plain_url = decrypt(row.url) or ""
+        if plain_url:
+            try:
+                core.check_url(plain_url)
+            except ValueError:
+                pass
+            else:
+                allow_intranet = current_principal().at_least("admin")
+                try:
+                    await assert_safe_url(plain_url, allow_intranet=allow_intranet)
+                except UnsafeUrlError:
+                    msg = "Webhook 地址不能指向云元数据或受限地址" if allow_intranet else "非管理员测试的 Webhook 地址需要是公网地址"
+                    async with SessionLocal() as session:
+                        session.add(NotifyDelivery(channel_id=row.id, subject_kind="channel", subject_id=row.id,
+                                                   event="test", status="failed", http_status=None, attempts=0,
+                                                   error=msg))
+                        await session.commit()
+                    return {"ok": False, "http_status": None, "message": msg}
     message = {"event": "test", "title": f"通知渠道「{row.name}」测试", "ok": True, "retry": False,
                "lines": [("说明", ("这是一封测试邮件。收到即表示邮件服务和收件地址配置正确" if row.format == "email" else
                                    "这是一条测试消息。收到即表示渠道地址配置正确")

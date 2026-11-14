@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from typing import Any, Awaitable, Callable
 
-from langgraph.errors import GraphBubbleUp
+from langgraph.errors import GraphBubbleUp, GraphInterrupt
 from langgraph.graph import END, START, StateGraph
 
 from app.core.errors import describe_exception, raw_detail
@@ -139,7 +139,7 @@ def _wrap(
                 }
                 # 节点自己交回的 trail（子工作流里走了驳回出口的那几步，multi._rejected_steps）排在这一步前面
                 return {**updates, "trail": [*(updates.get("trail") or []), trail]}
-            except GraphBubbleUp:
+            except (GraphBubbleUp, GraphInterrupt):
                 # interrupt() / Command 靠异常向上传递控制流，不是执行失败：
                 # 必须原样放行，否则人工介入会被当成节点报错吞掉。
                 raise

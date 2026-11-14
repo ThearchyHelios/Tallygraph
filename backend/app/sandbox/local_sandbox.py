@@ -39,8 +39,16 @@ class LocalSandbox(Sandbox):
     name = "local"
 
     def __init__(self) -> None:
-        self._root = settings.workspace_dir / "local"
-        self._root.mkdir(parents=True, exist_ok=True)
+        self._custom_root: Path | None = None
+        settings.workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def _root(self) -> Path:
+        return self._custom_root if self._custom_root is not None else settings.workspace_dir
+
+    @_root.setter
+    def _root(self, value: Path) -> None:
+        self._custom_root = value
 
     async def health(self) -> dict[str, object]:
         return {
@@ -60,6 +68,9 @@ class LocalSandbox(Sandbox):
         path = self._root / sanitize_session(session_id)
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def _workspace(self, session_id: str) -> Path:
+        return self._session_dir(session_id)
 
     @staticmethod
     def _preexec(limits: SandboxLimits):  # pragma: no cover - 只在子进程里跑
@@ -183,7 +194,7 @@ class LocalSandbox(Sandbox):
             if ephemeral:
                 root_resolved = self._root.resolve()
                 if work_root != root_resolved and work_root.is_relative_to(root_resolved):
-                    shutil.rmtree(workdir, ignore_errors=True)
+                    await asyncio.to_thread(shutil.rmtree, workdir, True)
 
     @staticmethod
     def _kill(proc: asyncio.subprocess.Process) -> None:
@@ -193,5 +204,5 @@ class LocalSandbox(Sandbox):
             proc.kill()
 
     async def cleanup(self, session_id: str) -> None:
-        path = self._session_dir(session_id)
+        path = self._root / sanitize_session(session_id)
         await asyncio.to_thread(shutil.rmtree, path, True)
